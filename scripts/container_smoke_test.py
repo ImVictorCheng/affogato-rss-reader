@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -122,6 +123,23 @@ def run_call_log_test(image: str) -> None:
                 'status="success", duration_ms=0)'
             ),
         )
+        # The chown above transfers host ownership of the bind mount to UID
+        # 10001. Restore it to the invoking user so TemporaryDirectory can
+        # clean up on native Linux, where chown is real. Docker Desktop
+        # ignores chown, so the restore is a no-op there.
+        if os.name == "posix":
+            docker(
+                "run",
+                "--rm",
+                "--user",
+                "0:0",
+                "--mount",
+                mount,
+                image,
+                "sh",
+                "-c",
+                f"chown -R {os.getuid()}:{os.getgid()} /app/logs",
+            )
         log_path = Path(directory) / "llm-translation.jsonl"
         if not log_path.is_file() or log_path.stat().st_size == 0:
             raise RuntimeError("The Linux call-log bind mount smoke test produced no data")
