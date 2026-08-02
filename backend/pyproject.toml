@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "affogato-rss-reader"
+version = "0.3.0"
+description = "A self-hosted bilingual RSS/Atom reader with domain spaces and briefs."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+  "alembic>=1.14,<2",
+  "beautifulsoup4>=4.12,<5",
+  "cryptography>=45,<50",
+  "defusedxml>=0.7.1,<1",
+  "fastapi>=0.115,<1",
+  "feedparser>=6.0.11,<7",
+  "httpx[socks]>=0.27,<1",
+  "lxml>=6.1.1,<7",
+  "pydantic-settings>=2.7,<3",
+  "python-dotenv>=1.2,<2",
+  "python-multipart>=0.0.18,<1",
+  "PyYAML>=6,<7",
+  "sqlalchemy>=2.0.36,<3",
+  "typer>=0.15,<1",
+  "tzdata>=2025.1",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=9.0.3,<10",
+  "pytest-cov>=6,<7",
+  "respx>=0.22,<1",
+]
+
+[project.scripts]
+affogato-rss-reader = "backend.app.cli:main"
+
+[tool.setuptools]
+packages = ["backend", "backend.app", "backend.alembic", "backend.alembic.versions"]
+package-dir = {backend = ".", "backend.app" = "app", "backend.alembic" = "alembic", "backend.alembic.versions" = "alembic/versions"}
+include-package-data = true
+
+[tool.setuptools.package-data]
+backend = ["alembic.ini", "static/**/*"]
+"backend.app" = ["defaults/*.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:asyncio"
+filterwarnings = [
+  "error",
+  "ignore:Using `httpx` with `starlette.testclient` is deprecated:starlette.exceptions.StarletteDeprecationWarning",
+]

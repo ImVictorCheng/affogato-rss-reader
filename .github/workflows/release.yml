@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      image-name: ${{ steps.image-name.outputs.name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify tag and version
+        shell: bash
+        run: |
+          python scripts/check_version.py
+          version="$(cat VERSION)"
+          test "$GITHUB_REF_NAME" = "v${version}"
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Release tags must point to a commit contained in main." >&2
+            exit 1
+          fi
+      - name: Resolve lowercase image name
+        id: image-name
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          if [[ ! "$owner" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "Invalid lowercase container registry owner: $owner" >&2
+            exit 1
+          fi
+          echo "name=ghcr.io/${owner}/affogato-rss-reader" >> "$GITHUB_OUTPUT"
+
+  quality-gate:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: [validate, quality-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      reader-digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ needs.validate.outputs.image-name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
+            VCS_REF=${{ github.sha }}
+            SOURCE_URL=https://github.com/${{ github.repository }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ${{ needs.validate.outputs.image-name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  package:
+    runs-on: ubuntu-latest
+    needs: [validate, image]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Create Compose release bundle
+        shell: bash
+        run: |
+          version="$(cat VERSION)"
+          image_name="${{ needs.validate.outputs.image-name }}"
+          reader_digest="${{ needs.image.outputs.reader-digest }}"
+          mkdir -p "dist/affogato-rss-reader-${version}/docs" "dist/affogato-rss-reader-${version}/logs"
+          sed "s#ghcr.io/OWNER/affogato-rss-reader#${image_name}#g" compose.yaml > "dist/affogato-rss-reader-${version}/compose.yaml"
+          sed -i "s#READER_DIGEST#${reader_digest}#g" "dist/affogato-rss-reader-${version}/compose.yaml"
+          cp "dist/affogato-rss-reader-${version}/compose.yaml" "dist/affogato-rss-reader-compose-${version}.yaml"
+          grep --fixed-strings --quiet "${image_name}:${version}" "dist/affogato-rss-reader-${version}/compose.yaml"
+          if grep --fixed-strings --quiet "ghcr.io/OWNER/" "dist/affogato-rss-reader-${version}/compose.yaml"; then
+            echo "Release bundle still contains the image placeholder." >&2
+            exit 1
+          fi
+          if grep --fixed-strings --quiet 'READER_DIGEST' "dist/affogato-rss-reader-${version}/compose.yaml"; then
+            echo "Release bundle still contains a digest placeholder." >&2
+            exit 1
+          fi
+          grep --fixed-strings --quiet "reader-digest: ${reader_digest}" "dist/affogato-rss-reader-${version}/compose.yaml"
+          docker compose -f "dist/affogato-rss-reader-${version}/compose.yaml" config --quiet
+          cp .env.example README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "dist/affogato-rss-reader-${version}/"
+          cp docs/BACKUP_AND_RESTORE.md docs/ARCHITECTURE.md docs/REVERSE_PROXY.md docs/ROADMAP.md "dist/affogato-rss-reader-${version}/docs/"
+          tar -C dist -czf "dist/affogato-rss-reader-${version}.tar.gz" "affogato-rss-reader-${version}"
+          (cd dist && sha256sum "affogato-rss-reader-${version}.tar.gz" "affogato-rss-reader-compose-${version}.yaml" > SHA256SUMS)
+      - uses: anchore/sbom-action@a930d0ac434e3182448fe678398ba5713717112a # v0.21.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/affogato-rss-reader-source.spdx.json
+      - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.yaml
+            dist/SHA256SUMS
+            dist/*.spdx.json

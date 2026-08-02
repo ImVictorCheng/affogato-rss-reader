@@ -1,0 +1,17 @@
+services:
+  log-init:
+    image: affogato-rss-reader:dev
+
+  reader:
+    image: affogato-rss-reader:dev
+    build:
+      context: .
+      args:
+        VERSION: 0.3.0
+    environment:
+      AFFOGATO_RSS_READER_UPDATE_CHECK_ENABLED: "false"
+    volumes:
+      - ./data:/app/data
+
+  updater:
+    profiles: ["release-updates"]

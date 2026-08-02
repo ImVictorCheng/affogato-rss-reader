@@ -1,0 +1,34 @@
+# These exceptions apply only to NVD's fallback CPE match for the exact CPython
+# binary in the pinned base image. A distro/package match or Python update is not
+# suppressed and must be reviewed independently.
+ignore:
+  # The service neither accepts tar archives nor calls tarfile extraction APIs.
+  - vulnerability: CVE-2026-11940
+    namespace: nvd:cpe
+    match-type: cpe-match
+    reason: The vulnerable tarfile.extractall path is absent from the application.
+    package:
+      name: python
+      version: 3.14.6
+      type: binary
+
+  # The service does not open tar archives in streaming mode.
+  - vulnerability: CVE-2026-11972
+    namespace: nvd:cpe
+    match-type: cpe-match
+    reason: The vulnerable tarfile streaming path is absent from the application.
+    package:
+      name: python
+      version: 3.14.6
+      type: binary
+
+  # External markup is routed through the lxml BeautifulSoup backend; a
+  # regression test asserts that the stdlib HTMLParser backend is not selected.
+  - vulnerability: CVE-2026-15308
+    namespace: nvd:cpe
+    match-type: cpe-match
+    reason: The vulnerable stdlib html.parser backend is not used by the application.
+    package:
+      name: python
+      version: 3.14.6
+      type: binary
