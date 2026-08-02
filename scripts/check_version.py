@@ -1,6 +1,7 @@
 from pathlib import Path
 import json
 import re
+import runpy
 
 root = Path(__file__).resolve().parents[1]
 version = (root / "VERSION").read_text(encoding="utf-8").strip()
@@ -47,8 +48,7 @@ heads = revisions - parents
 assert len(heads) == 1, heads
 migration_head = next(iter(heads))
 ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-assert re.search(
-    rf"select version_num from alembic_version.*= \"{re.escape(migration_head)}\"",
-    ci,
-)
+assert "python scripts/container_smoke_test.py" in ci
+smoke = runpy.run_path(str(root / "scripts/container_smoke_test.py"))
+assert smoke["expected_revision"]() == migration_head
 print(version)

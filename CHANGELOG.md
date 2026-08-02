@@ -9,6 +9,9 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Automatic owner bootstrap with a random one-time initial password and an
   activation flow that replaces and removes the bootstrap credential
 - Configurable backup count/byte limits and SQLite WAL/log rotation controls
+- A local release preflight covering the Python matrix, Web suite,
+  multi-architecture images, vulnerability scan, container smoke tests,
+  release bundle generation, and source SBOM generation
 
 ### Changed
 
@@ -19,6 +22,13 @@ All notable changes are documented here. This project follows Semantic Versionin
 - Backups are written atomically, integrity-checked, and pruned by age, count,
   and total size
 - Pytest rejects temporary roots placed inside application data directories
+- CI and local preflight now share the same container smoke test and release
+  bundle implementation
+
+### Fixed
+
+- Use BusyBox-compatible license verification in Alpine release images instead
+  of the unsupported GNU `grep --quiet` spelling
 
 ## [0.3.0] - 2026-08-01
 

@@ -106,25 +106,7 @@ jobs:
           output-format: table
           grype-version: v0.116.1
           config: .grype.yaml
-      - name: Update helper smoke test
-        run: docker run --rm "$CI_IMAGE" python -c 'import backend.app.update_runner; print("update helper import ok")'
-      - name: Empty-library smoke test
-        run: |
-          docker run -d --name "$CI_CONTAINER" -p 18787:8787 -e AFFOGATO_RSS_READER_AUTH_MODE=none "$CI_IMAGE"
-          for attempt in $(seq 1 30); do
-            curl --fail --silent http://127.0.0.1:18787/api/v1/health && break
-            sleep 2
-          done
-          test "$(curl --fail --silent http://127.0.0.1:18787/api/v1/feeds | python -c 'import json,sys; print(len(json.load(sys.stdin)["items"]))')" = "0"
-          test "$(docker exec "$CI_CONTAINER" python -c 'import sqlite3; print(sqlite3.connect("/app/data/affogato-rss-reader.db").execute("select version_num from alembic_version").fetchone()[0])')" = "0012"
-          test "$(docker exec "$CI_CONTAINER" python -c 'import sqlite3; print(sqlite3.connect("/app/data/affogato-rss-reader.db").execute("pragma foreign_key_check").fetchall())')" = "[]"
-          docker exec "$CI_CONTAINER" grep --quiet "MIT License" /usr/share/licenses/affogato-rss-reader/LICENSE
-          docker logs "$CI_CONTAINER"
+      - name: Release container smoke tests
+        run: python scripts/container_smoke_test.py --image "$CI_IMAGE" --container "$CI_CONTAINER" --port 18787
       - if: always()
-        run: docker rm -f "$CI_CONTAINER" || true
-      - name: Linux call-log bind mount smoke test
-        run: |
-          log_dir="$(mktemp -d)"
-          docker run --rm --user 0:0 -v "${log_dir}:/app/logs" "$CI_IMAGE" sh -c 'chown 10001:10001 /app/logs && chmod 0755 /app/logs'
-          docker run --rm -e AFFOGATO_RSS_READER_CALL_LOG_FILE=/app/logs/llm-translation.jsonl -v "${log_dir}:/app/logs" "$CI_IMAGE" python -c 'from backend.app.call_logging import write_call_log; write_call_log(category="llm", operation="ci-smoke", status="success", duration_ms=0)'
-          test -s "${log_dir}/llm-translation.jsonl"
+        run: docker rm -f -v "$CI_CONTAINER" || true

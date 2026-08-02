@@ -112,28 +112,12 @@ jobs:
       - name: Create Compose release bundle
         shell: bash
         run: |
-          version="$(cat VERSION)"
           image_name="${{ needs.validate.outputs.image-name }}"
           reader_digest="${{ needs.image.outputs.reader-digest }}"
-          mkdir -p "dist/affogato-rss-reader-${version}/docs" "dist/affogato-rss-reader-${version}/logs"
-          sed "s#ghcr.io/OWNER/affogato-rss-reader#${image_name}#g" compose.yaml > "dist/affogato-rss-reader-${version}/compose.yaml"
-          sed -i "s#READER_DIGEST#${reader_digest}#g" "dist/affogato-rss-reader-${version}/compose.yaml"
-          cp "dist/affogato-rss-reader-${version}/compose.yaml" "dist/affogato-rss-reader-compose-${version}.yaml"
-          grep --fixed-strings --quiet "${image_name}:${version}" "dist/affogato-rss-reader-${version}/compose.yaml"
-          if grep --fixed-strings --quiet "ghcr.io/OWNER/" "dist/affogato-rss-reader-${version}/compose.yaml"; then
-            echo "Release bundle still contains the image placeholder." >&2
-            exit 1
-          fi
-          if grep --fixed-strings --quiet 'READER_DIGEST' "dist/affogato-rss-reader-${version}/compose.yaml"; then
-            echo "Release bundle still contains a digest placeholder." >&2
-            exit 1
-          fi
-          grep --fixed-strings --quiet "reader-digest: ${reader_digest}" "dist/affogato-rss-reader-${version}/compose.yaml"
-          docker compose -f "dist/affogato-rss-reader-${version}/compose.yaml" config --quiet
-          cp .env.example README.md LICENSE CHANGELOG.md SECURITY.md THIRD_PARTY_NOTICES.md "dist/affogato-rss-reader-${version}/"
-          cp docs/BACKUP_AND_RESTORE.md docs/ARCHITECTURE.md docs/REVERSE_PROXY.md docs/ROADMAP.md "dist/affogato-rss-reader-${version}/docs/"
-          tar -C dist -czf "dist/affogato-rss-reader-${version}.tar.gz" "affogato-rss-reader-${version}"
-          (cd dist && sha256sum "affogato-rss-reader-${version}.tar.gz" "affogato-rss-reader-compose-${version}.yaml" > SHA256SUMS)
+          python scripts/build_release_bundle.py \
+            --image-name "${image_name}" \
+            --reader-digest "${reader_digest}" \
+            --output-dir dist
       - uses: anchore/sbom-action@a930d0ac434e3182448fe678398ba5713717112a # v0.21.0
         with:
           path: .

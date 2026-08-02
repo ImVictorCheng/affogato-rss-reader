@@ -105,6 +105,27 @@ docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 
 Windows PowerShell、Linux 和 macOS 的命令相同；无需 `Copy-Item` 或手动复制配置文件。
 
+### 本地发布前检查
+
+推送版本标签前，Windows 开发环境可以运行 CI 共用的容器冒烟测试和 Release
+打包器，并同时检查 Python 3.12/3.14、前端、AMD64/ARM64 镜像、High/Critical
+漏洞、Playwright 与源码 SBOM：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/release_preflight.ps1
+```
+
+完整检查需要 Docker Desktop 的 Linux 容器模拟能力，并需要联网拉取固定版本的
+Python 与 Grype 镜像。开发过程中可添加 `-AllowDirty`；仅快速定位问题时可添加
+以下参数：
+
+```powershell
+-Platforms linux/amd64 -SkipVulnerabilityScan -SkipE2E -SkipPythonMatrix
+```
+
+正式发布前应在干净工作区运行不带跳过参数的完整命令。测试生成的发布包位于已忽略的
+`.local-backups/`，不得代替 GitHub Actions 生成的正式附件上传。
+
 ### 配置
 
 全部环境变量使用 `AFFOGATO_RSS_READER_*`。常用项见 [.env.example](.env.example)：
@@ -196,6 +217,29 @@ host. To build from a Git checkout before a GHCR owner has been configured:
 ```console
 docker compose -f compose.yaml -f compose.dev.yaml up -d --build
 ```
+
+### Local release preflight
+
+Before pushing a version tag on Windows, run the same container smoke test and
+release-bundle builder used by CI, together with the Python 3.12/3.14 matrix,
+web checks, AMD64/ARM64 builds, High/Critical vulnerability scan, Playwright
+suite, and source SBOM generation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/release_preflight.ps1
+```
+
+The full check requires Docker Desktop Linux-container emulation and network
+access for the pinned Python and Grype images. Use `-AllowDirty` while
+developing. A quicker diagnostic run can add:
+
+```powershell
+-Platforms linux/amd64 -SkipVulnerabilityScan -SkipE2E -SkipPythonMatrix
+```
+
+A formal release should run the default command from a clean worktree. Test
+bundles are written below the ignored `.local-backups/` directory and must not
+replace artifacts produced by GitHub Actions.
 
 Never expose authentication-free mode directly to the public internet.
 
