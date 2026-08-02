@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-02
+
 ### Added
 
 - Automatic owner bootstrap with a random one-time initial password and an

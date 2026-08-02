@@ -20,7 +20,7 @@ COPY --from=web-builder /src/web/dist/ ./backend/static/
 RUN python -m build --wheel --outdir /wheels ./backend
 
 FROM python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS runtime
-ARG VERSION=0.3.0
+ARG VERSION=0.3.1
 ARG VCS_REF=unknown
 ARG SOURCE_URL=https://github.com/OWNER/affogato-rss-reader
 LABEL org.opencontainers.image.title="Affogato RSS Reader" \

@@ -1,8 +1,8 @@
 name: affogato-rss-reader
 
-x-reader-image: &reader-image ghcr.io/OWNER/affogato-rss-reader:0.3.0
+x-reader-image: &reader-image ghcr.io/OWNER/affogato-rss-reader:0.3.1
 x-affogato-release:
-  version: "0.3.0"
+  version: "0.3.1"
   reader-digest: READER_DIGEST
 
 services:

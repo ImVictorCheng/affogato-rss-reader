@@ -62,7 +62,7 @@ try {
         Invoke-Section "Backend matrix (Python 3.12 and 3.14)" {
             $SourceMount = "type=bind,source=$ProjectRoot,target=/workspace,readonly"
             foreach ($PythonVersion in @("3.12", "3.14")) {
-                $Script = @'
+        $Script = @'
 set -eu
 mkdir -p /tmp/project
 cp /workspace/README.md /workspace/LICENSE /tmp/project/
@@ -72,14 +72,23 @@ python -m pip install --no-deps -e /tmp/project/backend
 cd /tmp/project
 pytest /workspace/backend/tests --cov=backend.app --cov-report=term-missing --basetemp=/tmp/pytest -p no:cacheprovider
 '@
-                Invoke-Native "docker" @(
-                    "run", "--rm",
-                    "--mount", $SourceMount,
-                    "--mount", "type=volume,source=affogato-preflight-pip-cache,target=/root/.cache/pip",
-                    "-w", "/workspace",
-                    "python:$PythonVersion-slim",
-                    "sh", "-c", $Script
-                )
+                # Windows PowerShell 5.1 can corrupt multi-line native arguments,
+                # so deliver the matrix script to the container as a file instead.
+                $MatrixScript = Join-Path $env:TEMP ("affogato-matrix-{0}.sh" -f (Get-Random))
+                $Script.Replace("`r`n", "`n") | Set-Content -LiteralPath $MatrixScript -Encoding Ascii
+                try {
+                    Invoke-Native "docker" @(
+                        "run", "--rm",
+                        "--mount", $SourceMount,
+                        "--mount", "type=volume,source=affogato-preflight-pip-cache,target=/root/.cache/pip",
+                        "--mount", "type=bind,source=$MatrixScript,target=/tmp/matrix.sh,readonly",
+                        "-w", "/workspace",
+                        "python:$PythonVersion-slim",
+                        "sh", "/tmp/matrix.sh"
+                    )
+                } finally {
+                    Remove-Item -LiteralPath $MatrixScript -ErrorAction SilentlyContinue
+                }
             }
         }
     }

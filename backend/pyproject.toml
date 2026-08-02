@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "affogato-rss-reader"
-version = "0.3.0"
+version = "0.3.1"
 description = "A self-hosted bilingual RSS/Atom reader with domain spaces and briefs."
 readme = "README.md"
 license = "MIT"

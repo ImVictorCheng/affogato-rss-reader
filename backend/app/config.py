@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Affogato RSS Reader"
-    version: str = "0.3.0"
+    version: str = "0.3.1"
     api_prefix: str = "/api/v1"
     data_dir: Path = Field(default=BACKEND_DIR / "data")
     database_url: str | None = None

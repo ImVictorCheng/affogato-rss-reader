@@ -37,7 +37,7 @@ Affogato RSS Reader 是一个可独立发布的通用阅读器。空数据库不
 ### 快速启动
 
 需要 Docker Desktop 或 Docker Engine + Compose。下载 GitHub Release 中的
-`affogato-rss-reader-0.3.0.tar.gz` 并解压后：
+`affogato-rss-reader-0.3.1.tar.gz` 并解压后：
 
 ```console
 docker compose up -d
@@ -330,7 +330,7 @@ npm test
 npm run build
 ```
 
-On Linux/macOS use `.venv/bin/python`. API documentation is available at `/docs`. This project does not publish a standalone PyPI application in v0.3.0.
+On Linux/macOS use `.venv/bin/python`. API documentation is available at `/docs`. This project does not publish a standalone PyPI application in v0.3.1.
 
 ### Source-specific behavior
 
