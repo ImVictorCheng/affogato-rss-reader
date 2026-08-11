@@ -211,15 +211,16 @@ def check_release_promotion() -> list[str]:
         "staging-image-name",
         "affogato-rss-reader-staging",
         'outputs: type=image,name=${{ needs.validate.outputs.staging-image-name }}',
-        '--metadata-file "$metadata_file"',
-        'imagetools inspect --raw "$candidate"',
-        'docker pull --platform linux/amd64 "$candidate"',
-        'docker pull --platform linux/arm64 "$candidate"',
+        'reader_digest="$(docker buildx imagetools inspect "$candidate"',
+        'immutable_candidate="${STAGING_IMAGE_NAME}@${reader_digest}"',
+        'imagetools inspect --raw "$immutable_candidate"',
+        'docker pull --platform linux/amd64 "$immutable_candidate"',
+        'docker pull --platform linux/arm64 "$immutable_candidate"',
         'vnd.docker.reference.type',
         'vnd.docker.reference.digest',
         'Refusing to overwrite existing immutable version tag',
         '"${STAGING_IMAGE_NAME}@${EXPECTED_DIGEST}"',
-        'copied_digest="$(jq -er',
+        'published_digest="$(docker buildx imagetools inspect',
     )
     for requirement in requirements:
         if requirement not in text:
@@ -230,8 +231,10 @@ def check_release_promotion() -> list[str]:
     )
     if unsafe_formal_build in text:
         errors.append(f"{workflow}: unverified platform images must be pushed only to staging")
-    if text.count("--metadata-file") < 2:
-        errors.append(f"{workflow}: candidate creation and final promotion must record metadata")
+    if "--metadata-file" in text:
+        errors.append(
+            f"{workflow}: imagetools create metadata files are not portable across buildx versions"
+        )
     license_label = "org.opencontainers.image.licenses=MIT AND Apache-2.0"
     if text.count(license_label) < 2:
         errors.append(

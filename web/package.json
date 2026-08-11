@@ -1,7 +1,7 @@
 {
   "name": "affogato-rss-reader-web",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "scripts": {
     "prepare:mathjax": "node scripts/prepare-mathjax.mjs",

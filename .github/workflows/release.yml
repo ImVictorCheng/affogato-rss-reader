@@ -185,24 +185,18 @@ jobs:
             sources+=("${STAGING_IMAGE_NAME}@sha256:${digest}")
           done
           candidate="${STAGING_IMAGE_NAME}:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          metadata_file="$(mktemp)"
           manifest_file="$(mktemp)"
-          trap 'rm -f "$metadata_file" "$manifest_file"' EXIT
+          trap 'rm -f "$manifest_file"' EXIT
           docker buildx imagetools create \
-            --metadata-file "$metadata_file" \
             --tag "$candidate" \
             "${sources[@]}"
-          reader_digest="$(jq -er '."containerimage.digest"' "$metadata_file")"
+          reader_digest="$(docker buildx imagetools inspect "$candidate" --format '{{.Manifest.Digest}}')"
           if [[ ! "$reader_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "Candidate manifest has no immutable digest: $reader_digest" >&2
             exit 1
           fi
-          resolved_digest="$(docker buildx imagetools inspect "$candidate" --format '{{.Manifest.Digest}}')"
-          if [[ "$resolved_digest" != "$reader_digest" ]]; then
-            echo "Candidate tag resolved to $resolved_digest instead of $reader_digest." >&2
-            exit 1
-          fi
-          docker buildx imagetools inspect --raw "$candidate" > "$manifest_file"
+          immutable_candidate="${STAGING_IMAGE_NAME}@${reader_digest}"
+          docker buildx imagetools inspect --raw "$immutable_candidate" > "$manifest_file"
           jq -e '
             (.manifests // []) as $all
             | ([$all[] | select(
@@ -226,8 +220,8 @@ jobs:
                     .annotations["vnd.docker.reference.digest"] == $image_digest
                   )] | length) == 1)
           ' "$manifest_file"
-          docker pull --platform linux/amd64 "$candidate"
-          docker pull --platform linux/arm64 "$candidate"
+          docker pull --platform linux/amd64 "$immutable_candidate"
+          docker pull --platform linux/arm64 "$immutable_candidate"
           echo "reader-digest=$reader_digest" >> "$GITHUB_OUTPUT"
 
   package:
@@ -320,17 +314,9 @@ jobs:
           for tag in "${tags[@]}"; do
             tag_args+=(--tag "$tag")
           done
-          metadata_file="$(mktemp)"
-          trap 'rm -f "$metadata_file"' EXIT
           docker buildx imagetools create \
-            --metadata-file "$metadata_file" \
             "${tag_args[@]}" \
             "${STAGING_IMAGE_NAME}@${EXPECTED_DIGEST}"
-          copied_digest="$(jq -er '."containerimage.digest"' "$metadata_file")"
-          if [[ "$copied_digest" != "$EXPECTED_DIGEST" ]]; then
-            echo "Registry copy changed the manifest digest: $copied_digest" >&2
-            exit 1
-          fi
           published_digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" --format '{{.Manifest.Digest}}')"
           if [[ "$published_digest" != "$EXPECTED_DIGEST" ]]; then
             echo "Published manifest digest changed: $published_digest" >&2

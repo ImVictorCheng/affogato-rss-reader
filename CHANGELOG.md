@@ -4,6 +4,13 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-11
+
+### Fixed
+
+- Resolve candidate and published manifest digests from immutable registry references
+  instead of relying on unsupported `imagetools create` metadata files
+
 ## [0.4.1] - 2026-08-11
 
 ### Security

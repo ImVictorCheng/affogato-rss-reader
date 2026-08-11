@@ -1,6 +1,6 @@
 export const BRAND = {
   name: "Affogato RSS Reader",
-  version: "0.4.1",
+  version: "0.4.2",
   storagePrefix: "affogato-rss-reader",
   description: "A private, self-hosted RSS and Atom reader.",
 } as const;
