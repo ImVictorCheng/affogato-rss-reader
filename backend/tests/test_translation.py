@@ -15,7 +15,9 @@ from backend.app.translation import (
     FallbackProvider,
     GoogleCloudProvider,
     TRANSLATION_RECORD_PROVIDER,
+    TranslationConfigurationError,
     TranslationError,
+    build_selected_translation_provider,
     build_translation_provider,
     cached_translate,
     configure_translation,
@@ -24,6 +26,7 @@ from backend.app.translation import (
     split_text,
     translate_with_log,
     translate_one,
+    translation_configuration,
     translation_status,
 )
 
@@ -257,6 +260,83 @@ def test_deepl_and_google_cloud_provider_response_parsing(settings):
         )
         assert deepl.translate("Original", "zh-CN") == "深度翻译"
         assert google.translate("Original", "en") == "A & B"
+
+
+def test_deepl_key_is_bound_to_its_configured_endpoint(db_factory, settings):
+    with db_factory() as db:
+        configure_translation(
+            db,
+            enabled=False,
+            provider="deepl",
+            deepl_endpoint="https://saved-deepl.test/v2/translate",
+            deepl_api_key="saved-deepl-secret",
+            settings=settings,
+        )
+
+        with pytest.raises(
+            TranslationConfigurationError,
+            match="different DeepL endpoint requires a new API key",
+        ):
+            build_selected_translation_provider(
+                db,
+                settings,
+                provider="deepl",
+                deepl_endpoint="https://attacker.test/v2/translate",
+            )
+
+        draft = build_selected_translation_provider(
+            db,
+            settings,
+            provider="deepl",
+            deepl_endpoint="https://draft-deepl.test/v2/translate",
+            deepl_api_key="draft-deepl-secret",
+        )
+        assert isinstance(draft, DeepLProvider)
+        assert draft.endpoint == "https://draft-deepl.test/v2/translate"
+        assert draft.api_key == "draft-deepl-secret"
+
+        with pytest.raises(
+            ValueError,
+            match="Changing the DeepL endpoint requires a new API key",
+        ):
+            configure_translation(
+                db,
+                enabled=False,
+                deepl_endpoint="https://new-deepl.test/v2/translate",
+                settings=settings,
+            )
+        db.rollback()
+        unchanged = translation_configuration(db, settings, include_secrets=True)
+        assert unchanged["deepl_endpoint"] == "https://saved-deepl.test/v2/translate"
+        assert unchanged["deepl_api_key"] == "saved-deepl-secret"
+
+        configure_translation(
+            db,
+            enabled=False,
+            deepl_endpoint="https://cleared-deepl.test/v2/translate",
+            clear_deepl_api_key=True,
+            settings=settings,
+        )
+        cleared = translation_configuration(db, settings, include_secrets=True)
+        assert cleared["deepl_endpoint"] == "https://cleared-deepl.test/v2/translate"
+        assert cleared["deepl_api_key"] is None
+
+        configure_translation(
+            db,
+            enabled=False,
+            deepl_api_key="rebound-deepl-secret",
+            settings=settings,
+        )
+        configure_translation(
+            db,
+            enabled=False,
+            deepl_endpoint="https://replacement-deepl.test/v2/translate",
+            deepl_api_key="replacement-deepl-secret",
+            settings=settings,
+        )
+        replaced = translation_configuration(db, settings, include_secrets=True)
+        assert replaced["deepl_endpoint"] == "https://replacement-deepl.test/v2/translate"
+        assert replaced["deepl_api_key"] == "replacement-deepl-secret"
 
 
 def test_fallback_provider_uses_next_provider_and_caches_result(db_factory, settings):

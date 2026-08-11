@@ -56,20 +56,23 @@ docker compose up -d
 The Compose project and all persistent resources use the `affogato-rss-reader`
 prefix. The SQLite database path is `/app/data/affogato-rss-reader.db`.
 
-Release Compose deployments can instead use the in-app update prompt. The
-application checks on startup and daily at 05:00, downloads and verifies the
-new release Compose asset, then waits for the owner to choose **Install and
-restart**. A fresh SQLite backup is mandatory before the install request is
-handed to the isolated update helper. If the new container does not become
-healthy, the helper restores the previous Compose file and attempts to recreate
-the prior reader image.
+Automatic installation and rollback are disabled in 0.4.0. Updates are
+performed manually from the verified Release assets. For a migration from
+0.3.1 or earlier, remove the old privileged updater before replacing Compose:
+
+```console
+docker compose stop updater
+docker compose rm -f updater
+docker compose ps -a updater
+```
+
+The new updater profile is opt-in; omitting it does not remove an existing
+container. Keep the prior image and backup until the health check and database
+are verified.
 
 The helper intentionally updates the reader first and does not replace its own
-running container. The new Compose file is written to the release directory, so
-the helper image is refreshed the next time `docker compose up -d` is run or the
-Compose project is recreated. Stop the `updater` service if the deployment does
-not permit Docker Socket access; update checks and downloads continue, while
-installation falls back to the manual commands above.
+Update checks and downloads remain available, but installation always follows
+the manual commands above.
 
 Database migrations run during application initialization. Keep the prior image
 and backup until the health check and library are verified.

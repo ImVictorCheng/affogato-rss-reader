@@ -20,14 +20,14 @@ COPY --from=web-builder /src/web/dist/ ./backend/static/
 RUN python -m build --wheel --outdir /wheels ./backend
 
 FROM python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS runtime
-ARG VERSION=0.3.1
+ARG VERSION=0.4.0
 ARG VCS_REF=unknown
 ARG SOURCE_URL=https://github.com/OWNER/affogato-rss-reader
 LABEL org.opencontainers.image.title="Affogato RSS Reader" \
       org.opencontainers.image.description="Private self-hosted RSS and Atom reader" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.licenses="MIT AND Apache-2.0" \
       org.opencontainers.image.source="${SOURCE_URL}"
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -43,7 +43,7 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.lock
 COPY --from=wheel-builder /wheels/*.whl /tmp/
 RUN python -m pip install --no-cache-dir --no-deps /tmp/*.whl \
     && rm -rf /tmp/*.whl /tmp/requirements.lock
-COPY LICENSE /usr/share/licenses/affogato-rss-reader/LICENSE
+COPY LICENSE THIRD_PARTY_NOTICES.md licenses/MathJax-APACHE-2.0.txt /usr/share/licenses/affogato-rss-reader/
 USER reader
 WORKDIR /app
 EXPOSE 8787

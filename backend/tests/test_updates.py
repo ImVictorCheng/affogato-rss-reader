@@ -15,10 +15,14 @@ from backend.app.update_runner import (
     _atomic_json,
     _download_images,
     _install,
+    _install_after_manifest_verification,
+    _load_request,
     _new_container_payload,
+    _process_request,
     _validate_compose,
 )
 from backend.app.updates import (
+    UpdateInstallUnavailable,
     check_for_updates,
     parse_version,
     request_update_install,
@@ -28,74 +32,25 @@ from backend.app.updates import (
 
 
 def release_compose(settings, version: str) -> bytes:
-    reader_image = f"{settings.update_image_repository}:{version}"
-    return yaml.safe_dump(
-        {
-            "name": "affogato-rss-reader",
-            "x-reader-image": reader_image,
-            "x-affogato-release": {
-                "version": version,
-                "reader-digest": f"sha256:{'1' * 64}",
-            },
-            "services": {
-                "log-init": {
-                    "image": reader_image,
-                    "tmpfs": ["/app/data", "/app/secrets"],
-                    "volumes": [
-                        "./logs:/app/logs",
-                        "affogato-rss-reader-update-control:/app/update-control",
-                    ],
-                },
-                "reader": {
-                    "image": reader_image,
-                    "restart": "unless-stopped",
-                    "ports": ["${AFFOGATO_RSS_READER_BIND_ADDRESS:-0.0.0.0}:${AFFOGATO_RSS_READER_PORT:-8787}:8787"],
-                    "environment": {
-                        "AFFOGATO_RSS_READER_DATA_DIR": "/app/data",
-                        "NEW_SETTING": "${NEW_SETTING:-from-new-compose}",
-                    },
-                    "volumes": [
-                        "affogato-rss-reader-data:/app/data",
-                        "affogato-rss-reader-secrets:/app/secrets",
-                        "affogato-rss-reader-update-control:/app/update-control",
-                        "./logs:/app/logs",
-                    ],
-                },
-                "updater": {
-                    "image": reader_image,
-                    "user": "0:0",
-                    "command": ["python", "-m", "backend.app.update_runner"],
-                    "network_mode": "none",
-                    "read_only": True,
-                    "cap_drop": ["ALL"],
-                    "security_opt": ["no-new-privileges:true"],
-                    "tmpfs": ["/tmp", "/app/secrets"],
-                    "environment": {
-                        "AFFOGATO_RSS_READER_DATA_DIR": "/app/data",
-                        "AFFOGATO_RSS_READER_UPDATE_CONTROL_DIR": "/app/update-control",
-                        "AFFOGATO_RSS_READER_UPDATE_WORKSPACE_DIR": "/workspace",
-                        "AFFOGATO_RSS_READER_UPDATE_GITHUB_REPOSITORY": settings.update_github_repository,
-                        "AFFOGATO_RSS_READER_UPDATE_IMAGE_REPOSITORY": settings.update_image_repository,
-                    },
-                    "volumes": [
-                        "/var/run/docker.sock:/var/run/docker.sock",
-                        "./:/workspace",
-                        "affogato-rss-reader-data:/app/data:ro",
-                        "affogato-rss-reader-update-control:/app/update-control",
-                    ],
-                },
-            },
-            "volumes": {
-                "affogato-rss-reader-data": None,
-                "affogato-rss-reader-secrets": None,
-                "affogato-rss-reader-update-control": None,
-            },
-        },
-        sort_keys=False,
-    ).encode()
+    root = Path(__file__).resolve().parents[2]
+    template_version = (root / "VERSION").read_text(encoding="utf-8").strip()
+    compose = (root / "compose.yaml").read_text(encoding="utf-8")
+    compose = compose.replace(
+        "ghcr.io/OWNER/affogato-rss-reader",
+        settings.update_image_repository,
+    )
+    compose = compose.replace(f'version: "{template_version}"', f'version: "{version}"')
+    compose = compose.replace(f":{template_version}@", f":{version}@")
+    compose = compose.replace("READER_DIGEST", f"sha256:{'1' * 64}")
+    return compose.encode()
 
 
-def update_client(settings, version: str = "0.3.1") -> httpx.Client:
+def update_client(
+    settings,
+    version: str = "0.3.1",
+    *,
+    asset_name: str | None = None,
+) -> httpx.Client:
     compose = release_compose(settings, version)
     digest = hashlib.sha256(compose).hexdigest()
 
@@ -111,7 +66,8 @@ def update_client(settings, version: str = "0.3.1") -> httpx.Client:
                     "published_at": "2026-08-02T05:00:00Z",
                     "assets": [
                         {
-                            "name": f"affogato-rss-reader-compose-{version}.yaml",
+                            "name": asset_name
+                            or f"affogato-rss-reader-compose-v2-{version}.yaml",
                             "browser_download_url": f"https://github.com/ImVictorCheng/affogato-rss-reader/releases/download/v{version}/compose.yaml",
                             "size": len(compose),
                             "digest": f"sha256:{digest}",
@@ -153,6 +109,7 @@ def test_update_check_downloads_and_verifies_release_asset(db_factory, settings)
     (control / "download-result.json").write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "request_id": request["request_id"],
                 "version": "0.3.1",
                 "success": True,
@@ -182,6 +139,17 @@ def test_update_check_downloads_and_verifies_release_asset(db_factory, settings)
     ) is True
 
 
+def test_digest_schema_requires_manual_migration_from_legacy_asset(db_factory, settings):
+    enabled = settings.model_copy(update={"update_check_enabled": True, "version": "0.3.0"})
+    legacy_name = "affogato-rss-reader-compose-0.3.1.yaml"
+    with update_client(enabled, asset_name=legacy_name) as client, db_factory() as db:
+        status = check_for_updates(db, enabled, client=client)
+
+    assert status["status"] == "available_manual"
+    assert "compatible automatic-update asset" in status["error"]
+    assert not (enabled.data_dir / "updates" / "0.3.1" / "compose.yaml").exists()
+
+
 def test_update_check_304_requeues_download_when_helper_recovers(db_factory, settings):
     enabled = settings.model_copy(update={"update_check_enabled": True, "version": "0.3.0"})
     with update_client(enabled) as client, db_factory() as db:
@@ -206,7 +174,7 @@ def test_update_check_304_requeues_download_when_helper_recovers(db_factory, set
     assert request["compose_digest"].startswith("sha256:")
 
 
-def test_install_request_requires_helper_and_creates_backup(db_factory, settings):
+def test_install_request_is_fail_closed_until_signed_manifests_exist(db_factory, settings):
     enabled = settings.model_copy(update={"update_check_enabled": True, "version": "0.3.0"})
     control = enabled.effective_update_control_dir
     control.mkdir(parents=True, exist_ok=True)
@@ -217,6 +185,7 @@ def test_install_request_requires_helper_and_creates_backup(db_factory, settings
     (control / "download-result.json").write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "request_id": state["download_request_id"],
                 "version": "0.3.1",
                 "success": True,
@@ -227,17 +196,16 @@ def test_install_request_requires_helper_and_creates_backup(db_factory, settings
     )
     assert update_status(enabled)["downloaded"] is True
 
-    status = request_update_install(enabled)
+    with pytest.raises(UpdateInstallUnavailable, match="signature-verified"):
+        request_update_install(enabled)
 
-    assert status["status"] == "installing"
-    request = json.loads((control / "install-request.json").read_text(encoding="utf-8"))
-    assert request["version"] == "0.3.1"
-    assert request["image_repository"] == enabled.update_image_repository
-    assert Path(request["backup_path"]).is_file()
-    assert "password" not in json.dumps(request).lower()
+    assert not (control / "install-request.json").exists()
+    status = update_status(enabled)
+    assert status["install_supported"] is False
+    assert "signature-verified" in status["install_unavailable_reason"]
 
 
-def test_update_runner_uses_digest_pull_and_expected_tag(settings, tmp_path):
+def test_update_runner_pulls_only_the_immutable_digest(settings, tmp_path):
     configured = settings.model_copy(update={"version": "0.3.0"})
     version = "0.3.1"
     asset_dir = configured.data_dir / "updates" / version
@@ -272,15 +240,11 @@ def test_update_runner_uses_digest_pull_and_expected_tag(settings, tmp_path):
                             "org.opencontainers.image.source": (
                                 f"https://github.com/{configured.update_github_repository}"
                             ),
-                            "org.opencontainers.image.licenses": "MIT",
+                            "org.opencontainers.image.licenses": "MIT AND Apache-2.0",
                         }
                     },
                 },
             )
-        if http_request.method == "POST" and http_request.url.path.endswith("/tag"):
-            assert http_request.url.params["repo"] == configured.update_image_repository
-            assert http_request.url.params["tag"] == version
-            return httpx.Response(201)
         return httpx.Response(404)
 
     with httpx.Client(
@@ -289,7 +253,7 @@ def test_update_runner_uses_digest_pull_and_expected_tag(settings, tmp_path):
         _download_images(configured, request, client=docker)
 
     assert ("POST", "/images/create") in calls
-    assert any(method == "POST" and path.endswith("/tag") for method, path in calls)
+    assert not any(path.endswith("/tag") for _method, path in calls)
 
 
 def test_update_runner_accepts_only_expected_compose_and_replaces_atomically(
@@ -310,7 +274,8 @@ def test_update_runner_accepts_only_expected_compose_and_replaces_atomically(
     asset_dir = configured.data_dir / "updates" / version
     asset_dir.mkdir(parents=True, exist_ok=True)
     asset = asset_dir / "compose.yaml"
-    asset.write_bytes(release_compose(configured, version))
+    original_compose = release_compose(configured, version)
+    asset.write_bytes(original_compose)
     request = {
         "schema_version": 1,
         "request_id": "a" * 32,
@@ -331,7 +296,7 @@ def test_update_runner_accepts_only_expected_compose_and_replaces_atomically(
         "Config": {
             "Env": [
                 "AFFOGATO_RSS_READER_DATA_DIR=/app/data",
-                "NEW_SETTING=preserved-user-value",
+                "AFFOGATO_RSS_READER_TIMEZONE=Asia/Shanghai",
                 "OLD_ONLY=must-disappear",
             ],
             "User": "9999:9999",
@@ -373,6 +338,10 @@ def test_update_runner_accepts_only_expected_compose_and_replaces_atomically(
         path = http_request.url.path
         operations.append((http_request.method, path))
         if http_request.method == "GET" and path.startswith("/images/"):
+            # The reader can still write the download directory while the
+            # privileged helper is installing. Mutating it after validation
+            # must not change the bytes installed into the workspace.
+            asset.write_bytes(b"name: attacker-controlled\n")
             return httpx.Response(
                 200,
                 json={
@@ -385,7 +354,7 @@ def test_update_runner_accepts_only_expected_compose_and_replaces_atomically(
                             "org.opencontainers.image.source": (
                                 f"https://github.com/{configured.update_github_repository}"
                             ),
-                            "org.opencontainers.image.licenses": "MIT",
+                            "org.opencontainers.image.licenses": "MIT AND Apache-2.0",
                         }
                     }
                 },
@@ -415,16 +384,21 @@ def test_update_runner_accepts_only_expected_compose_and_replaces_atomically(
     with httpx.Client(
         transport=httpx.MockTransport(handler), base_url="http://docker"
     ) as docker:
-        _install(configured, request, client=docker)
+        _install_after_manifest_verification(configured, request, client=docker)
 
-    assert active.read_bytes() == asset.read_bytes()
+    assert active.read_bytes() != original_compose
+    assert yaml.safe_load(active.read_bytes()) == yaml.safe_load(original_compose)
+    assert b"&reader-image" not in active.read_bytes()
+    assert b"*reader-image" not in active.read_bytes()
     assert (workspace / "compose.previous.yaml").is_file()
-    assert created_payload["Image"] == f"{configured.update_image_repository}:{version}"
+    assert created_payload["Image"] == (
+        f"{configured.update_image_repository}:{version}@sha256:{'1' * 64}"
+    )
     assert created_payload["HostConfig"]["RestartPolicy"]["Name"] == "unless-stopped"
     assert created_payload["HostConfig"]["PortBindings"]["8787/tcp"][0]["HostPort"] == "9999"
     assert len(created_payload["HostConfig"]["Binds"]) == 4
     assert "AFFOGATO_RSS_READER_DATA_DIR=/app/data" in created_payload["Env"]
-    assert "NEW_SETTING=preserved-user-value" in created_payload["Env"]
+    assert "AFFOGATO_RSS_READER_TIMEZONE=Asia/Shanghai" in created_payload["Env"]
     assert not any(value.startswith("OLD_ONLY=") for value in created_payload["Env"])
     assert "Cmd" not in created_payload
     assert "Entrypoint" not in created_payload
@@ -435,10 +409,101 @@ def test_update_runner_accepts_only_expected_compose_and_replaces_atomically(
     assert "com.docker.compose.image" not in created_payload["Labels"]
     assert ("DELETE", "/containers/old-reader-id") in operations
 
-    malicious = yaml.safe_load(asset.read_text(encoding="utf-8"))
+    malicious = yaml.safe_load(original_compose.decode())
     malicious["services"]["shell"] = {"image": "alpine:latest", "privileged": True}
     asset.write_text(yaml.safe_dump(malicious), encoding="utf-8")
     request["compose_digest"] = f"sha256:{hashlib.sha256(asset.read_bytes()).hexdigest()}"
+    with pytest.raises(UpdateRunnerError):
+        _validate_compose(configured, request)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "top-level-field",
+        "log-init-field",
+        "log-init-command",
+        "reader-field",
+        "reader-environment",
+        "reader-port",
+        "updater-security",
+        "tag-only-image",
+        "named-volume-options",
+        "extra-named-volume",
+        "duplicate-service-key",
+        "alias",
+        "merge-key",
+        "recursive-alias",
+    ],
+)
+def test_update_runner_rejects_every_unapproved_compose_shape(settings, mutation):
+    configured = settings.model_copy(update={"version": "0.3.0"})
+    version = "0.3.1"
+    asset_dir = configured.data_dir / "updates" / version
+    asset_dir.mkdir(parents=True, exist_ok=True)
+    document = yaml.safe_load(release_compose(configured, version))
+
+    if mutation == "top-level-field":
+        document["networks"] = {"host": {"external": True}}
+    elif mutation == "log-init-field":
+        document["services"]["log-init"]["privileged"] = True
+    elif mutation == "log-init-command":
+        document["services"]["log-init"]["command"] = ["sh", "-c", "id"]
+    elif mutation == "reader-field":
+        document["services"]["reader"]["user"] = "0:0"
+    elif mutation == "reader-environment":
+        document["services"]["reader"]["environment"]["LD_PRELOAD"] = "/workspace/x.so"
+    elif mutation == "reader-port":
+        document["services"]["reader"]["ports"] = ["0.0.0.0:22:22"]
+    elif mutation == "updater-security":
+        document["services"]["updater"]["security_opt"] = []
+    elif mutation == "tag-only-image":
+        document["services"]["reader"]["image"] = (
+            f"{configured.update_image_repository}:{version}"
+        )
+    elif mutation == "named-volume-options":
+        document["volumes"]["affogato-rss-reader-data"] = {"external": True}
+    elif mutation == "extra-named-volume":
+        document["volumes"]["attacker"] = None
+
+    if mutation == "duplicate-service-key":
+        content = release_compose(configured, version).replace(
+            b"  reader:\n",
+            b"  reader:\n    restart: always\n",
+            1,
+        )
+    elif mutation == "alias":
+        image = f"{configured.update_image_repository}:{version}@sha256:{'1' * 64}"
+        content = release_compose(configured, version).replace(
+            f"x-reader-image: {image}".encode(),
+            f"x-reader-image: &reader-image {image}".encode(),
+            1,
+        ).replace(
+            f"    image: {image}".encode(),
+            b"    image: *reader-image",
+        )
+    elif mutation == "merge-key":
+        content = release_compose(configured, version).replace(
+            b"  reader:\n",
+            b"  reader:\n    <<: &reader-defaults {restart: always}\n",
+            1,
+        )
+    elif mutation == "recursive-alias":
+        content = b"name: affogato-rss-reader\nloop: &loop [*loop]\n"
+    else:
+        content = yaml.safe_dump(document, sort_keys=False).encode()
+
+    asset = asset_dir / "compose.yaml"
+    asset.write_bytes(content)
+    request = {
+        "schema_version": 1,
+        "request_id": "a" * 32,
+        "version": version,
+        "source_repository": configured.update_github_repository,
+        "image_repository": configured.update_image_repository,
+        "compose_path": str(asset),
+        "compose_digest": f"sha256:{hashlib.sha256(content).hexdigest()}",
+    }
     with pytest.raises(UpdateRunnerError):
         _validate_compose(configured, request)
 
@@ -447,6 +512,77 @@ def test_public_update_status_does_not_expose_download_paths(settings):
     status = update_status(settings)
     assert "asset_path" not in status
     assert "asset_url" not in status
+    assert status["install_supported"] is False
+    assert "signature-verified" in status["install_unavailable_reason"]
+
+
+def test_update_runner_install_operation_is_always_fail_closed(settings):
+    with pytest.raises(UpdateRunnerError, match="signature-verified"):
+        _install(settings, {})
+
+
+def test_update_runner_request_schema_is_exact_and_size_bounded(settings, tmp_path):
+    request_path = tmp_path / "download-request.json"
+    common = {
+        "schema_version": 1,
+        "request_id": "a" * 32,
+        "version": "0.3.1",
+        "source_repository": settings.update_github_repository,
+        "image_repository": settings.update_image_repository,
+        "compose_path": str(settings.data_dir / "updates" / "0.3.1" / "compose.yaml"),
+        "compose_digest": f"sha256:{'1' * 64}",
+        "requested_at": "2026-08-10T08:00:00+00:00",
+    }
+    request_path.write_text(json.dumps(common), encoding="utf-8")
+    assert _load_request(settings, request_path, "download") == common
+
+    request_path.write_text(json.dumps({**common, "unexpected": True}), encoding="utf-8")
+    with pytest.raises(UpdateRunnerError, match="unexpected fields"):
+        _load_request(settings, request_path, "download")
+
+    install = {**common, "backup_path": str(settings.data_dir / "backups" / "before.db")}
+    request_path.write_text(json.dumps(install), encoding="utf-8")
+    assert _load_request(settings, request_path, "install") == install
+    with pytest.raises(UpdateRunnerError, match="unexpected fields"):
+        _load_request(settings, request_path, "download")
+
+    request_path.write_bytes(b" " * (64 * 1024 + 1))
+    with pytest.raises(UpdateRunnerError, match="small regular file"):
+        _load_request(settings, request_path, "download")
+
+
+def test_update_runner_claims_request_before_processing_and_preserves_replacement(
+    settings,
+):
+    control = settings.effective_update_control_dir
+    control.mkdir(parents=True, exist_ok=True)
+    queue_path = control / "download-request.json"
+    request = {
+        "schema_version": 1,
+        "request_id": "a" * 32,
+        "version": "0.3.1",
+        "source_repository": settings.update_github_repository,
+        "image_repository": settings.update_image_repository,
+        "compose_path": str(settings.data_dir / "updates" / "0.3.1" / "compose.yaml"),
+        "compose_digest": f"sha256:{'1' * 64}",
+        "requested_at": "2026-08-10T08:00:00+00:00",
+    }
+    queue_path.write_text(json.dumps(request), encoding="utf-8")
+
+    def operation(_settings, loaded):
+        assert loaded == request
+        queue_path.write_text("replacement request", encoding="utf-8")
+
+    _process_request(
+        settings,
+        queue_path,
+        "download-result.json",
+        operation,
+        "download",
+    )
+
+    assert queue_path.read_text(encoding="utf-8") == "replacement request"
+    assert not list(control.glob(".download-request.json.*.claimed"))
 
 
 def test_recreated_container_payload_does_not_reuse_runtime_identity():
@@ -509,3 +645,7 @@ def test_update_actions_require_owner_csrf(authenticated_client, settings, monke
     checked = client.post("/api/v1/updates/check", headers=headers)
     assert checked.status_code == 200
     assert checked.json()["status"] == "disabled"
+
+    install = client.post("/api/v1/updates/install", headers=headers)
+    assert install.status_code == 503
+    assert "signature-verified" in install.json()["detail"]

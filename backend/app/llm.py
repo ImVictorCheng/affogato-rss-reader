@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import httpx
 import json
+from threading import BoundedSemaphore, Lock
 from time import perf_counter
 from typing import Callable
 from sqlalchemy import select
@@ -15,10 +16,54 @@ from .secrets import SecretCipher, is_encrypted_secret, secret_hint
 
 TRANSLATION_FEATURE = "translation"
 BRIEF_FEATURE = "brief"
+AUTO_TAG_FEATURE = "auto_tag"
 ENCRYPTED_SETTING_KEYS = (
     "translation_deepl_api_key",
     "translation_google_cloud_api_key",
 )
+
+_limiter_lock = Lock()
+_limiters: dict[int, BoundedSemaphore] = {}
+_active_clients: dict[str, set[httpx.Client]] = {}
+_active_clients_lock = Lock()
+
+
+class LLMRequestCancelled(Exception):
+    """Raised inside an in-flight LLM request when the owner requested a stop."""
+
+
+def llm_request_limiter(limit: int) -> BoundedSemaphore:
+    """Return a process-wide semaphore shared by every LLM feature.
+
+    Translation and brief generation run in separate background workers; this
+    shared limiter keeps their combined concurrent requests bounded so a
+    rate-limited endpoint is not amplified by parallel maintenance work.
+    """
+    limit = max(1, min(int(limit), 16))
+    with _limiter_lock:
+        return _limiters.setdefault(limit, BoundedSemaphore(limit))
+
+
+def abort_llm_requests(token: str) -> int:
+    """Close every in-flight LLM client registered under ``token``.
+
+    Closing an httpx client aborts its pending request immediately, so an
+    owner stop takes effect even while the HTTP call is blocked waiting for
+    stream bytes. Returns the number of clients closed.
+    """
+    with _active_clients_lock:
+        clients = _active_clients.pop(token, None)
+    if not clients:
+        return 0
+    closed = 0
+    for client in clients:
+        try:
+            client.close()
+            closed += 1
+        except Exception:
+            # A client may already be closing or the connection long gone.
+            pass
+    return closed
 
 
 class LLMConnectionError(RuntimeError):
@@ -67,6 +112,7 @@ def _completion_text(payload: dict, *, require_complete: bool = False) -> str:
 def stream_completion_text(
     response: httpx.Response,
     progress_callback: Callable[[int], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
 ) -> str:
     """Read an OpenAI-compatible SSE response, with JSON fallback."""
     parts: list[str] = []
@@ -74,6 +120,8 @@ def stream_completion_text(
     last_payload: dict | None = None
     received_chars = 0
     for raw_line in response.iter_lines():
+        if stop_check and stop_check():
+            raise LLMRequestCancelled()
         line = raw_line.strip()
         if not line:
             continue
@@ -184,17 +232,28 @@ def save_llm_connection(
     connection = db.get(LLMConnection, connection_id) if connection_id else None
     if connection_id and connection is None:
         raise ValueError("LLM connection not found")
+    normalized_base_url = base_url.rstrip("/")
+    if (
+        connection is not None
+        and connection.api_key_encrypted
+        and normalized_base_url != connection.base_url.rstrip("/")
+        and api_key is None
+        and not clear_api_key
+    ):
+        raise ValueError(
+            "Changing an LLM base URL requires a new API key or explicit key removal"
+        )
     if connection is None:
         connection = LLMConnection(
             name=name.strip(),
-            base_url=base_url.rstrip("/"),
+            base_url=normalized_base_url,
             model=model.strip(),
         )
         db.add(connection)
         db.flush()
     else:
         connection.name = name.strip()
-        connection.base_url = base_url.rstrip("/")
+        connection.base_url = normalized_base_url
         connection.model = model.strip()
     if clear_api_key:
         connection.api_key_encrypted = None
@@ -315,6 +374,8 @@ def complete_feature_chat(
     temperature: float = 0.2,
     timeout_seconds: float | None = None,
     stream_progress_callback: Callable[[int], None] | None = None,
+    stop_check: Callable[[], bool] | None = None,
+    request_token: str | None = None,
 ) -> str:
     """Generate text with the LLM connection bound to a product feature."""
 
@@ -392,6 +453,9 @@ def complete_feature_chat(
         proxy=route.proxy,
         trust_env=route.trust_env,
     )
+    if owns_client and request_token:
+        with _active_clients_lock:
+            _active_clients.setdefault(request_token, set()).add(client)
     try:
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -405,26 +469,30 @@ def complete_feature_chat(
                 {"role": "user", "content": user_prompt},
             ],
         }
-        if feature_key == BRIEF_FEATURE:
-            with client.stream(
-                "POST",
-                endpoint,
-                headers=headers,
-                json={**payload, "stream": True},
-            ) as response:
-                response.raise_for_status()
-                result = stream_completion_text(
-                    response,
-                    progress_callback=stream_progress_callback,
+        with llm_request_limiter(settings.llm_max_concurrent_requests):
+            if feature_key == BRIEF_FEATURE:
+                with client.stream(
+                    "POST",
+                    endpoint,
+                    headers=headers,
+                    json={**payload, "stream": True},
+                ) as response:
+                    response.raise_for_status()
+                    result = stream_completion_text(
+                        response,
+                        progress_callback=stream_progress_callback,
+                        stop_check=stop_check,
+                    )
+            else:
+                response = client.post(
+                    endpoint,
+                    headers=headers,
+                    json=payload,
                 )
-        else:
-            response = client.post(
-                endpoint,
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-            result = _completion_text(response.json(), require_complete=True)
+                response.raise_for_status()
+                result = _completion_text(response.json(), require_complete=True)
+    except LLMRequestCancelled:
+        raise
     except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
         retryable = (
             isinstance(exc, httpx.RequestError)
@@ -471,6 +539,13 @@ def complete_feature_chat(
         return result
     finally:
         if owns_client:
+            if request_token:
+                with _active_clients_lock:
+                    group = _active_clients.get(request_token)
+                    if group is not None:
+                        group.discard(client)
+                        if not group:
+                            _active_clients.pop(request_token, None)
             client.close()
 
 

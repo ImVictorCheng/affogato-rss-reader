@@ -29,21 +29,23 @@ export function Sidebar({
   locale, feeds, folders, domains, tags, activeView, activeFeedId, activeFolder, activeTagId,
   activeDomainIds, domainMatch, resultCount, authMode, sortMode, sortDirection, onSelectView, onSelectFeed,
   onSelectFolder, onSelectTag, onToggleDomain, onDomainMatch, onClearDomains,
-  onSourceSort, onReorderFeeds, onManageFeeds, onOpenBriefs, onOpenSettings, onLogout,
+  onSourceSort, onReorderFeeds, onOpenBriefs, onOpenSettings, onLogout,
+  onRefreshAll, refreshingAll,
   briefsActive = false,
 }: {
   locale: Locale; feeds: Feed[]; folders: Folder[]; domains: Domain[]; tags: Tag[]; activeView: ReaderView;
   activeFeedId: number | null; activeFolder: string | null; activeTagId: number | null;
   activeDomainIds: number[]; domainMatch: DomainMatch; resultCount: number; authMode: "owner" | "none";
   sortMode: FolderSortMode; sortDirection: SortDirection;
+  refreshingAll?: boolean;
   briefsActive?: boolean;
   onSelectView: (value: ReaderView) => void; onSelectFeed: (id: number) => void;
   onSelectFolder: (folder: string) => void; onSelectTag: (id: number) => void;
   onToggleDomain: (id: number) => void; onDomainMatch: (match: DomainMatch) => void;
   onSourceSort: (mode: FolderSortMode, direction: SortDirection) => void;
   onReorderFeeds: (folder: string | null, feedIds: number[]) => void;
-  onClearDomains: () => void; onManageFeeds: () => void; onOpenBriefs: () => void;
-  onOpenSettings: () => void; onLogout: () => void;
+  onClearDomains: () => void; onOpenBriefs: () => void;
+  onOpenSettings: () => void; onLogout: () => void; onRefreshAll: () => void;
 }) {
   const [collapsedFolders, setCollapsedFolders] = useState<Set<string>>(() => new Set());
   const [draggedFeedId, setDraggedFeedId] = useState<number | null>(null);
@@ -110,6 +112,7 @@ export function Sidebar({
       <div className="nav-group__heading">
         <span className="nav-group__label">SOURCES</span>
         <div className="source-heading-actions">
+          <button className={`source-refresh-all ${refreshingAll ? "is-refreshing" : ""}`} onClick={onRefreshAll} disabled={feeds.length === 0 || refreshingAll} aria-label={t(locale, "refreshAll")} title={t(locale, "refreshAll")}><span aria-hidden="true">↻</span></button>
           <SelectMenu
             compact
             value={sortValue}
@@ -121,7 +124,6 @@ export function Sidebar({
               onSourceSort(mode, direction);
             }}
           />
-          <button className="text-button" onClick={onManageFeeds}>{t(locale, "manage")}</button>
         </div>
       </div>
       {folderGroups.length === 0 && <p className="sidebar__hint">{t(locale, "emptyHelp")}</p>}

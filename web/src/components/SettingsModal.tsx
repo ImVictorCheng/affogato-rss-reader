@@ -1,13 +1,14 @@
-import { type ChangeEvent, useEffect, useMemo, useState } from "react";
+import { type ChangeEvent, type FormEvent, useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import { composeSiteIdentity, customizeSiteIdentity, supportsGeneratedIdentity } from "../domainThemes";
 import { t } from "../i18n";
-import type { AppSettings, AuthStatus, CallLog, Feed, Job, LLMConnection, Locale, NetworkProxy, NetworkProxyTestResult, OnboardingProfile, ProxyMode, SiteIdentity, ThemeConfig, TranslationFallbackMode, TranslationProvider, TranslationProxyService, TranslationStatus, UpdateStatus } from "../types";
-import { errorText, formatDateTime } from "../utils";
+import type { AppSettings, AuthStatus, AutoTagStatus, CallLog, Domain, Feed, Folder, Job, LLMConnection, Locale, NetworkProxy, NetworkProxyTestResult, OnboardingProfile, ProxyMode, SiteIdentity, Tag, ThemeConfig, TranslationFallbackMode, TranslationProvider, TranslationProxyService, TranslationStatus, UpdateStatus } from "../types";
+import { errorText, formatDateTime, safeHttpUrl } from "../utils";
 import { Brand, ErrorNotice, Modal, SelectMenu, Spinner, Toggle } from "./Common";
+import { FeedManager } from "./FeedManager";
 
 const MAX_LOGO_BYTES = 256 * 1024;
-type SettingsPage = "home" | "appearance" | "llm" | "proxy" | "translation" | "activity" | "account";
+type SettingsPage = "home" | "appearance" | "llm" | "proxy" | "translation" | "content" | "activity" | "account";
 const TRANSLATION_PROXY_TARGETS: { id: TranslationProxyService; name: string; meta: string }[] = [
   { id: "google-gtx", name: "Google GTX", meta: "translate.googleapis.com" },
   { id: "deepl", name: "DeepL API", meta: "api.deepl.com" },
@@ -21,6 +22,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   onInstallUpdate: () => Promise<void>;
   notify: (message: string, tone?: "success" | "error") => void;
 }) {
+  const zh = locale === "zh-CN";
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("home");
   const [translation, setTranslation] = useState<TranslationStatus | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -45,6 +47,14 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   const [llmTesting, setLlmTesting] = useState(false);
   const [llmTest, setLlmTest] = useState<{ tone: "success" | "error"; message: string } | null>(null);
   const [feeds, setFeeds] = useState<Feed[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [domains, setDomains] = useState<Domain[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [tagDraft, setTagDraft] = useState("");
+  const [editingTagId, setEditingTagId] = useState<number | null>(null);
+  const [tagEditDraft, setTagEditDraft] = useState("");
+  const [tagBusyId, setTagBusyId] = useState<number | null>(null);
+  const [tagBusy, setTagBusy] = useState(false);
   const [networkProxy, setNetworkProxy] = useState<NetworkProxy | null>(null);
   const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxyUrl, setProxyUrl] = useState("");
@@ -74,6 +84,10 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   const [translationTesting, setTranslationTesting] = useState(false);
   const [translationRetrying, setTranslationRetrying] = useState(false);
   const [translationTest, setTranslationTest] = useState<{ tone: "success" | "error"; message: string } | null>(null);
+  const [autoTag, setAutoTag] = useState<AutoTagStatus | null>(null);
+  const [autoTagCreateNew, setAutoTagCreateNew] = useState(false);
+  const [autoTagLlmConnectionId, setAutoTagLlmConnectionId] = useState("");
+  const [autoTagSaving, setAutoTagSaving] = useState(false);
   const [brandName, setBrandName] = useState("");
   const [brandLogo, setBrandLogo] = useState("");
   const [brandLogoName, setBrandLogoName] = useState("");
@@ -134,6 +148,36 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     }, 5000);
     return () => window.clearInterval(timer);
   }, [settingsPage, locale]);
+  useEffect(() => {
+    if (settingsPage !== "content") return;
+    const refresh = async () => {
+      try {
+        const [status, connections, nextFeeds, nextFolders, nextTags, nextDomains] = await Promise.all([
+          api.autoTagStatus(),
+          api.llmConnections(),
+          api.feeds(),
+          api.folders(),
+          api.tags(),
+          api.domains(),
+        ]);
+        setAutoTag(status);
+        setAutoTagCreateNew(status.create_new);
+        setAutoTagLlmConnectionId(status.llm_connection_id ? String(status.llm_connection_id) : "");
+        setLlmConnections(connections);
+        setFeeds(nextFeeds);
+        setFolders(nextFolders);
+        setTags(nextTags);
+        setDomains(nextDomains);
+      } catch {
+        // Keep the last known settings during a transient refresh failure.
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => {
+      void api.autoTagStatus().then(setAutoTag).catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [settingsPage]);
   useEffect(() => {
     if (settingsPage !== "activity") return;
     void api.jobs(20).then(setJobs).catch((caught) => setError(errorText(caught)));
@@ -405,6 +449,72 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       setTranslationRetrying(false);
     }
   }
+  async function saveAutoTag(enabled = autoTag?.enabled ?? false) {
+    setAutoTagSaving(true);
+    try {
+      const updated = await api.setAutoTagStatus({
+        enabled,
+        create_new: autoTagCreateNew,
+        llm_connection_id: autoTagLlmConnectionId ? Number(autoTagLlmConnectionId) : null,
+      });
+      setAutoTag(updated);
+      setAutoTagCreateNew(updated.create_new);
+      setAutoTagLlmConnectionId(updated.llm_connection_id ? String(updated.llm_connection_id) : "");
+      notify(locale === "zh-CN" ? "自动打标签设置已保存。" : "Auto-tagging settings saved.");
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setAutoTagSaving(false);
+    }
+  }
+  async function refreshTags() {
+    setTags(await api.tags());
+  }
+  async function createTag(event: FormEvent) {
+    event.preventDefault();
+    if (!tagDraft.trim()) return;
+    setTagBusy(true);
+    try {
+      await api.createTag(tagDraft.trim());
+      setTagDraft("");
+      await refreshTags();
+      notify(locale === "zh-CN" ? "标签已创建。" : "Tag created.");
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setTagBusy(false);
+    }
+  }
+  async function renameTag(tag: Tag) {
+    if (!tagEditDraft.trim() || tagEditDraft.trim() === tag.name) {
+      setEditingTagId(null);
+      return;
+    }
+    setTagBusyId(tag.id);
+    try {
+      await api.updateTag(tag.id, { name: tagEditDraft.trim() });
+      setEditingTagId(null);
+      await refreshTags();
+      notify(locale === "zh-CN" ? "标签已重命名。" : "Tag renamed.");
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setTagBusyId(null);
+    }
+  }
+  async function removeTag(tag: Tag) {
+    if (!window.confirm(locale === "zh-CN" ? `删除标签“${tag.name}”？文章不会受影响。` : `Delete tag “${tag.name}”? Articles are not affected.`)) return;
+    setTagBusyId(tag.id);
+    try {
+      await api.deleteTag(tag.id);
+      await refreshTags();
+      notify(locale === "zh-CN" ? "标签已删除。" : "Tag deleted.");
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setTagBusyId(null);
+    }
+  }
   async function testTranslationConnection() {
     setTranslationTesting(true);
     setTranslationTest(null);
@@ -511,6 +621,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
           ["llm", "LLM", locale === "zh-CN" ? "LLM 连接" : "LLM connections", locale === "zh-CN" ? "添加、测试和管理模型连接" : "Add, test, and manage model connections"],
           ["proxy", "NETWORK", locale === "zh-CN" ? "网络代理" : "Network proxy", locale === "zh-CN" ? "设置应用全局代理与各功能独立路由" : "Set the application-wide route and feature overrides"],
           ["translation", "TRANSLATION", locale === "zh-CN" ? "翻译" : "Translation", locale === "zh-CN" ? "翻译服务、目标语言和回退方式" : "Provider, target language, and fallback"],
+          ["content", "CONTENT", locale === "zh-CN" ? "内容" : "Content", locale === "zh-CN" ? "订阅源管理与标签" : "Subscriptions and tags"],
           ["activity", "ACTIVITY", locale === "zh-CN" ? "活动、日志与快捷键" : "Activity, logs & shortcuts", locale === "zh-CN" ? "最近任务、LLM/翻译调用日志与键盘说明" : "Recent jobs, LLM/translation call logs, and keyboard controls"],
           ["account", "ACCOUNT", locale === "zh-CN" ? "账户与系统" : "Account & system", locale === "zh-CN" ? "应用更新、版本、退出登录与调试工具" : "Updates, version, sign out, and debug tools"],
         ] as const).map(([page, eyebrow, title, description]) => <button type="button" className="settings-nav-card" key={page} onClick={() => setSettingsPage(page)}>
@@ -672,6 +783,79 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       </div>
       <p className="muted">{locale === "zh-CN" ? "主服务" : "Primary"}: {translation?.provider} · {translation?.provider_healthy ? (locale === "zh-CN" ? "可用" : "ready") : (locale === "zh-CN" ? "未配置或异常" : "not configured or unhealthy")} · {fallbackMode === "automatic" ? (locale === "zh-CN" ? "自动回退 GTX" : "automatic GTX fallback") : (locale === "zh-CN" ? "手动回退" : "manual fallback")}</p>
     </section>}
+    {settingsPage === "content" && <>
+    <section className="settings-section">
+      <div className="section-heading"><div><span className="eyebrow">SUBSCRIPTIONS</span><h3>{locale === "zh-CN" ? "订阅源管理" : "Subscriptions"}</h3></div></div>
+      <FeedManager embedded locale={locale} feeds={feeds} folders={folders} domains={domains} onClose={() => setSettingsPage("home")} onChanged={async () => { const [nextFeeds, nextFolders, nextDomains] = await Promise.all([api.feeds(), api.folders(), api.domains()]); setFeeds(nextFeeds); setFolders(nextFolders); setDomains(nextDomains); }} notify={notify} />
+    </section>
+    <section className="settings-section translation-settings">
+      <div className="section-heading">
+        <div><span className="eyebrow">TAGS</span><h3>{locale === "zh-CN" ? "标签" : "Tags"}</h3></div>
+      </div>
+      <form className="field-with-action category-manager__create" onSubmit={createTag}><input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder={locale === "zh-CN" ? "新建标签" : "New tag"} maxLength={120} /><button className="button button--primary" disabled={tagBusy || !tagDraft.trim()}>+</button></form>
+      <div className="tag-manager-list">
+        {tags.length === 0 && <p className="category-manager__empty">{locale === "zh-CN" ? "还没有标签。可以手动创建，或开启下面的自动打标签。" : "No tags yet. Create one manually or enable auto tagging below."}</p>}
+        {tags.map((tag) => {
+          const editing = editingTagId === tag.id;
+          const count = tag.entry_count ?? 0;
+          return <div className={`tag-manager-card ${editing ? "is-editing" : ""}`} key={tag.id}>
+            <span className="tag-manager-card__dot" style={{ backgroundColor: tag.color || "#8878e8" }} aria-hidden="true" />
+            {editing
+              ? <label className="field tag-manager-card__edit"><input aria-label={zh ? `重命名标签 ${tag.name}` : `Rename tag ${tag.name}`} value={tagEditDraft} onChange={(event) => setTagEditDraft(event.target.value)} maxLength={120} autoFocus onKeyDown={(event) => { if (event.key === "Enter") void renameTag(tag); if (event.key === "Escape") setEditingTagId(null); }} /></label>
+              : <><strong title={tag.name}>{tag.name}</strong><small title={zh ? `${count} 篇文章` : `${count} entries`}>{count}</small></>}
+            <div className="tag-manager-card__actions">
+              {editing
+                ? <><button type="button" className="button button--primary button--small" disabled={tagBusyId === tag.id || !tagEditDraft.trim()} onClick={() => void renameTag(tag)}>{t(locale, "save")}</button><button type="button" className="text-button" onClick={() => setEditingTagId(null)}>{zh ? "取消" : "Cancel"}</button></>
+                : <><button type="button" className="tag-manager-card__icon" aria-label={zh ? `重命名标签 ${tag.name}` : `Rename tag ${tag.name}`} onClick={() => { setEditingTagId(tag.id); setTagEditDraft(tag.name); }}>✎</button><button type="button" className="tag-manager-card__icon tag-manager-card__icon--danger" aria-label={zh ? `删除标签 ${tag.name}` : `Delete tag ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => void removeTag(tag)}>×</button></>}
+            </div>
+          </div>;
+        })}
+      </div>
+      <hr />
+      <div className="section-heading">
+        <div><span className="eyebrow">AUTO TAG</span><h3>{locale === "zh-CN" ? "自动打标签" : "Auto tagging"}</h3></div>
+        {autoTag && <Toggle checked={autoTag.enabled} onChange={(value) => void saveAutoTag(value)} label={autoTag.enabled ? "On" : "Off"} />}
+      </div>
+      <p className="provider-warning">{locale === "zh-CN"
+        ? `开启后，文章标题与摘要会发送给所选 LLM 服务以自动附加标签（每篇最多 ${autoTag?.max_tags_per_entry ?? 5} 个）。自动附加的标签会随内容变化更新；你手动添加的标签不会被改动。`
+        : `When enabled, article titles and summaries are sent to the selected LLM provider for tagging (up to ${autoTag?.max_tags_per_entry ?? 5} per article). Auto-attached tags update when content changes; tags you add by hand are never touched.`}</p>
+      <div className="translation-settings__grid">
+        <label className="field"><span>{locale === "zh-CN" ? "用于打标签的 LLM 连接" : "LLM connection for tagging"}</span>
+          {llmConnections.length ? <SelectMenu value={autoTagLlmConnectionId} onChange={(value) => setAutoTagLlmConnectionId(value)} label={locale === "zh-CN" ? "用于打标签的 LLM 连接" : "LLM connection for tagging"} placeholder={locale === "zh-CN" ? "选择 LLM 连接" : "Choose LLM connection"} options={llmConnections.map((connection) => ({ value: String(connection.id), label: `${connection.name} · ${connection.model}` }))} /> : <p className="provider-warning">{locale === "zh-CN" ? "尚未添加 LLM 连接。请先在上方“LLM 连接”区域添加。" : "No LLM connection exists. Add one in the LLM connections section above."}</p>}
+        </label>
+      </div>
+      {autoTag?.enabled && (
+        <div className="translation-settings__fallback-note auto-tag-create-new">
+          <Toggle checked={autoTagCreateNew} onChange={setAutoTagCreateNew} label={locale === "zh-CN" ? "允许 LLM 创建新标签，并将新标签纳入标签库" : "Allow the LLM to create new tags and add them to the library"} />
+          <p>{locale === "zh-CN"
+            ? "关闭时只从现有标签中选择；开启后 LLM 可在找不到合适标签时新建标签。"
+            : "Off: the LLM picks only from existing tags. On: it may also invent new tags."}</p>
+        </div>
+      )}
+      <div className="translation-settings__actions">
+        <button type="button" className="button button--primary button--small" disabled={autoTagSaving || (autoTag?.enabled && !autoTagLlmConnectionId)} onClick={() => void saveAutoTag()}>{autoTagSaving ? (locale === "zh-CN" ? "正在保存…" : "Saving…") : t(locale, "save")}</button>
+      </div>
+      <div className="translation-status-grid" aria-label={locale === "zh-CN" ? "自动打标签任务状态" : "Auto-tagging job status"}>
+        <div className="translation-status-card translation-status-card--queued">
+          <span>{locale === "zh-CN" ? "等待打标签" : "Queued for tagging"}</span>
+          <strong>{autoTag?.pending_count ?? 0}</strong>
+        </div>
+        <div className="translation-status-card translation-status-card--running">
+          <span>{locale === "zh-CN" ? "正在打标签" : "Tagging now"}</span>
+          <strong>{autoTag?.running_count ?? 0}</strong>
+        </div>
+        <div className="translation-status-card translation-status-card--complete">
+          <span>{locale === "zh-CN" ? "已完成" : "Completed"}</span>
+          <strong>{autoTag?.complete_count ?? 0}</strong>
+        </div>
+        <div className="translation-status-card translation-status-card--failed">
+          <span>{locale === "zh-CN" ? "已失败" : "Failed"}</span>
+          <strong>{autoTag?.failed_count ?? 0}</strong>
+        </div>
+      </div>
+      <p className="muted">{autoTag?.configured ? (locale === "zh-CN" ? "LLM 连接已就绪。" : "LLM connection ready.") : (locale === "zh-CN" ? "尚未绑定 LLM 连接，开启前请先选择。" : "No LLM connection bound; choose one before enabling.")}</p>
+    </section>
+    </>}
     {settingsPage === "activity" && <>
     <section className="settings-section"><span className="eyebrow">ACTIVITY</span><h3>{t(locale, "recentJobs")}</h3><div className="job-list">{jobs.slice(0, 10).map((job) => <div className="job-row" key={job.id}><span className={`job-status job-status--${["completed", "success"].includes(job.status) ? "success" : ["failed", "error"].includes(job.status) ? "error" : "running"}`} /><div><strong>{job.feed_title || job.kind}</strong><span>{job.message || job.status}</span></div><span>{formatDateTime(job.started_at || job.created_at, locale)}</span></div>)}</div></section>
     <section className="settings-section call-logs-section">
@@ -707,7 +891,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     {settingsPage === "account" && <>
     <section className="settings-section update-settings">
       <div className="section-heading"><div><span className="eyebrow">APPLICATION UPDATE</span><h3>{locale === "zh-CN" ? "应用更新" : "Application update"}</h3></div><span className="update-settings__version">v{appUpdate?.current_version || settings?.version}</span></div>
-      <p>{locale === "zh-CN" ? `应用会在启动时和每天 ${String(appUpdate?.check_hour ?? 5).padStart(2, "0")}:00 自动检查，校验 Release 资产，并让 Docker Engine 按摘要预拉镜像。安装始终需要你确认。` : `The application checks on startup and every day at ${String(appUpdate?.check_hour ?? 5).padStart(2, "0")}:00, verifies the Release asset, and asks Docker Engine to pre-pull the digest-pinned image. Installation always requires your confirmation.`}</p>
+      <p>{locale === "zh-CN" ? `应用会在启动时和每天 ${String(appUpdate?.check_hour ?? 5).padStart(2, "0")}:00 自动检查并校验 Release 资产。可选更新助手会按摘要预拉镜像；在独立签名清单验证上线前，安装必须按 Release 说明手动完成。` : `The application checks on startup and every day at ${String(appUpdate?.check_hour ?? 5).padStart(2, "0")}:00 and verifies the Release asset. The optional helper can pre-pull the digest-pinned image; installation remains manual until independently signed release manifests are verified.`}</p>
       {appUpdate && <div className={`update-status-card update-status-card--${appUpdate.status}`}>
         <strong>{appUpdate.downloaded
           ? (locale === "zh-CN" ? `版本 ${appUpdate.latest_version} 已下载` : `Version ${appUpdate.latest_version} is downloaded`)
@@ -718,12 +902,12 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
               : (locale === "zh-CN" ? `更新状态：${appUpdate.status}` : `Update status: ${appUpdate.status}`)}</strong>
         <small>{locale === "zh-CN" ? "上次检查" : "Last checked"}：{formatDateTime(appUpdate.last_checked_at, locale)}</small>
         {appUpdate.error && <p className="update-status-card__error">{appUpdate.error}</p>}
-        {appUpdate.downloaded && !appUpdate.install_supported && <p>{locale === "zh-CN" ? "当前部署未运行更新辅助服务，请从 Release 页面手动安装。" : "This deployment is not running the update helper; install manually from the Release page."}</p>}
+        {appUpdate.downloaded && !appUpdate.install_supported && <p>{locale === "zh-CN" ? "自动安装当前安全停用：尚未建立独立签名清单信任根。请从 Release 页面手动安装。" : "Automatic installation is fail-closed until an independently signed manifest trust root is available. Install manually from the Release page."}</p>}
       </div>}
       <div className="translation-settings__actions">
         <button type="button" className="button button--secondary button--small" disabled={updateChecking} onClick={() => void checkForUpdates()}>{updateChecking ? (locale === "zh-CN" ? "正在检查…" : "Checking…") : (locale === "zh-CN" ? "立即检查" : "Check now")}</button>
-        {appUpdate?.downloaded && <button type="button" className="button button--primary button--small" disabled={updateInstalling || !appUpdate.install_supported} onClick={() => void installUpdate()}>{updateInstalling ? (locale === "zh-CN" ? "正在准备重启…" : "Preparing restart…") : (locale === "zh-CN" ? "安装并重启" : "Install and restart")}</button>}
-        {appUpdate?.release_url && <a className="button button--secondary button--small" href={appUpdate.release_url} target="_blank" rel="noreferrer">{locale === "zh-CN" ? "查看 Release" : "View release"}</a>}
+        {appUpdate?.downloaded && appUpdate.install_supported && <button type="button" className="button button--primary button--small" disabled={updateInstalling} onClick={() => void installUpdate()}>{updateInstalling ? (locale === "zh-CN" ? "正在准备重启…" : "Preparing restart…") : (locale === "zh-CN" ? "安装并重启" : "Install and restart")}</button>}
+        {safeHttpUrl(appUpdate?.release_url) && <a className="button button--secondary button--small" href={safeHttpUrl(appUpdate?.release_url) ?? undefined} target="_blank" rel="noreferrer">{locale === "zh-CN" ? "查看 Release" : "View release"}</a>}
       </div>
     </section>
     {settings?.debug && auth.mode === "owner" && <section className="settings-section debug-section"><div><span className="eyebrow">DEBUG MODE</span><h3>{locale === "zh-CN" ? "重置首次设置" : "Reset first-run setup"}</h3><p>{locale === "zh-CN" ? "删除 owner、所有登录会话、阅读状态和个性化配置，然后返回首次部署流程。实例中的订阅与文章会保留。" : "Delete the owner, every login session, reading states, and personalization, then return to first-run setup. Instance feeds and articles are preserved."}</p></div><button type="button" className="button button--danger-quiet" disabled={resetting} onClick={() => void resetDebugOwner()}>{resetting ? (locale === "zh-CN" ? "正在重置…" : "Resetting…") : (locale === "zh-CN" ? "注销并删除 owner" : "Sign out and delete owner")}</button></section>}

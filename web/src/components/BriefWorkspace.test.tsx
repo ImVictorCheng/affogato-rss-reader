@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api";
@@ -6,9 +6,19 @@ import type {
   Brief,
   BriefGenerationProgress,
   BriefSchedule,
+  Domain,
+  Feed,
   LLMConnection,
+  Tag,
 } from "../types";
 import { BriefWorkspace, naturalPeriodRange } from "./BriefWorkspace";
+import { resetMathJaxForTests } from "./MathJax";
+
+async function pickIn(container: HTMLElement, comboLabel: string, optionLabel: string) {
+  const combo = within(container).getByRole("combobox", { name: comboLabel });
+  await userEvent.click(combo);
+  await userEvent.click(within(combo.closest(".app-dropdown") as HTMLElement).getByRole("option", { name: optionLabel }));
+}
 
 const schedule: BriefSchedule = {
   id: 3,
@@ -62,10 +72,18 @@ function renderModal(
   connections: LLMConnection[] = [],
   briefs: Brief[] = [],
   latestProgress: BriefGenerationProgress | null = null,
+  options: {
+    domains?: Domain[];
+    feeds?: Feed[];
+    tags?: Tag[];
+  } = {},
 ) {
   vi.spyOn(api, "briefs").mockResolvedValue(briefs);
   vi.spyOn(api, "briefSchedules").mockResolvedValue(schedules);
   vi.spyOn(api, "llmConnections").mockResolvedValue(connections);
+  vi.spyOn(api, "domains").mockResolvedValue(options.domains ?? []);
+  vi.spyOn(api, "feeds").mockResolvedValue(options.feeds ?? []);
+  vi.spyOn(api, "tags").mockResolvedValue(options.tags ?? []);
   vi.spyOn(api, "briefConfiguration").mockResolvedValue({
     llm_connection_id: null,
     llm_connection_name: null,
@@ -82,7 +100,7 @@ function renderModal(
     model: connection.model,
     configured: true,
   });
-  vi.spyOn(api, "latestBriefGenerationProgress").mockResolvedValue(latestProgress);
+vi.spyOn(api, "latestBriefGenerationProgress").mockResolvedValue(latestProgress);
   render(
     <BriefWorkspace
       locale="zh-CN"
@@ -93,7 +111,11 @@ function renderModal(
 }
 
 describe("BriefWorkspace", () => {
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete window.MathJax;
+    resetMathJaxForTests();
+  });
 
   it("uses localized, descriptive controls instead of a stretched plus button", async () => {
     renderModal();
@@ -106,6 +128,7 @@ describe("BriefWorkspace", () => {
     expect(screen.getByRole("button", { name: "添加计划" })).toHaveClass(
       "brief-schedule-form__submit",
     );
+    expect(document.querySelector(".brief-workspace > .provider-warning")).toHaveTextContent("LLM");
     expect(screen.queryByRole("button", { name: "+" })).not.toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
@@ -128,6 +151,12 @@ describe("BriefWorkspace", () => {
   });
 
   it("renders the brief as GitHub-flavored Markdown", async () => {
+    const typesetPromise = vi.fn().mockResolvedValue(undefined);
+    window.MathJax = {
+      startup: { promise: Promise.resolve() },
+      typesetClear: vi.fn(),
+      typesetPromise,
+    };
     renderModal([], [connection], [{
       ...brief,
       notes: [
@@ -146,6 +175,18 @@ describe("BriefWorkspace", () => {
         "",
         "`inline-code`",
         "",
+        "Inline formula $a*b_c$ and \\(E=mc^2\\).",
+        "",
+        "$$",
+        "\\begin{aligned}a&=b\\\\c&=d\\end{aligned}",
+        "$$",
+        "",
+        "`$code_not_math$`",
+        "",
+        "![Remote chart](https://images.example.test/chart.png)",
+        "",
+        "[Blocked location](file:///private/report)",
+        "",
         "[参考来源](https://example.test/report)",
       ].join("\n"),
     }]);
@@ -158,6 +199,13 @@ describe("BriefWorkspace", () => {
     expect(screen.getByText("跨来源观察").closest("blockquote")).toBeInTheDocument();
     expect(screen.getByRole("table")).toBeInTheDocument();
     expect(screen.getByText("inline-code").tagName).toBe("CODE");
+    expect(screen.getByText("$code_not_math$").tagName).toBe("CODE");
+    expect(document.querySelectorAll(".mathjax-source--inline")).toHaveLength(2);
+    expect(document.querySelectorAll(".mathjax-source--display")).toHaveLength(1);
+    await waitFor(() => expect(typesetPromise).toHaveBeenCalledOnce());
+    expect(screen.getByRole("img", { name: "Remote chart" })).toHaveClass("brief-image-placeholder");
+    expect(document.querySelector(".brief-summary img")).not.toBeInTheDocument();
+    expect(screen.getByText("Blocked location")).not.toHaveAttribute("href");
     expect(screen.getByRole("link", { name: "参考来源" })).toHaveAttribute(
       "target",
       "_blank",
@@ -263,7 +311,7 @@ describe("BriefWorkspace", () => {
     });
 
     await userEvent.click(
-      await screen.findByRole("button", { name: "从断点重试" }),
+      await screen.findByRole("button", { name: "从断点继续" }),
     );
 
     expect(retry).toHaveBeenCalledWith("brief-resume-test");
@@ -304,6 +352,247 @@ describe("BriefWorkspace", () => {
     expect(remove).toHaveBeenCalledWith(brief.id);
     expect(await screen.findByRole("heading", { name: nextBrief.title })).toBeInTheDocument();
     expect(screen.queryByText(brief.title)).not.toBeInTheDocument();
+  });
+
+  it("edits an existing schedule and saves the changes", async () => {
+    const update = vi.spyOn(api, "updateBriefSchedule").mockResolvedValue({
+      ...schedule,
+      name: "每周简报",
+      period: "weekly",
+      cutoff_time: "07:30",
+      timezone: "Asia/Shanghai",
+      weekday: 0,
+    });
+    renderModal([schedule]);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "修改计划 工作日晨报" }),
+    );
+
+    const nameField = screen.getByRole("textbox", { name: "计划名称" });
+    await userEvent.clear(nameField);
+    await userEvent.type(nameField, "每周简报");
+    await userEvent.click(screen.getByRole("button", { name: "每周" }));
+    const timeField = screen.getByLabelText("生成时间");
+    await userEvent.clear(timeField);
+    await userEvent.type(timeField, "07:30");
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(update).toHaveBeenCalledWith(
+      3,
+      expect.objectContaining({
+        name: "每周简报",
+        period: "weekly",
+        cutoff_time: "07:30",
+        weekday: 0,
+      }),
+    );
+    expect(screen.queryByRole("button", { name: "取消" })).not.toBeInTheDocument();
+  });
+
+  it("lets a daily schedule choose a start time and sends it on save", async () => {
+    const dailySchedule = { ...schedule, start_time: "09:00" };
+    const update = vi.spyOn(api, "updateBriefSchedule").mockResolvedValue({
+      ...dailySchedule,
+      name: "工作日窗口",
+      cutoff_time: "18:00",
+    });
+    renderModal([dailySchedule]);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "修改计划 工作日晨报" }),
+    );
+
+    const startField = screen.getByLabelText("窗口开始时间");
+    expect(startField).toHaveValue("09:00");
+    await userEvent.clear(startField);
+    await userEvent.type(startField, "08:30");
+    const endField = screen.getByLabelText("生成时间");
+    await userEvent.clear(endField);
+    await userEvent.type(endField, "18:00");
+    await userEvent.click(screen.getByRole("button", { name: "保存修改" }));
+
+    expect(update).toHaveBeenCalledWith(
+      3,
+      expect.objectContaining({
+        period: "daily",
+        start_time: "08:30",
+        cutoff_time: "18:00",
+      }),
+    );
+  });
+
+  it("selects domain, feed, and tag coverage for a schedule and saves them", async () => {
+    const domain: Domain = {
+      id: 1,
+      name: "Physics",
+      description: "",
+      color: "#2bc7c3",
+      position: 0,
+      feed_count: 1,
+      entry_count: 2,
+    };
+    const feed: Feed = {
+      id: 5,
+      title: "Quantum Journal",
+      url: "https://example.test/quantum.xml",
+      folder: "Physics",
+      position: 0,
+      enabled: true,
+      poll_interval_minutes: 60,
+      status: "healthy",
+      unread_count: 1,
+      entry_count: 3,
+      error_count: 0,
+      domains: [],
+    };
+    const tag: Tag = { id: 7, name: "method", color: null, entry_count: 1 };
+    const create = vi.spyOn(api, "createBriefSchedule").mockResolvedValue({
+      ...schedule,
+      name: "过滤计划",
+      domain_ids: [1],
+      feed_ids: [5],
+      tag_ids: [7],
+    });
+    renderModal([], [], [], null, { domains: [domain], feeds: [feed], tags: [tag] });
+
+    const nameField = await screen.findByRole("textbox", { name: "计划名称" });
+    await userEvent.type(nameField, "过滤计划");
+    const form = document.querySelector("form.brief-schedule-form") as HTMLElement;
+    await pickIn(form, "领域", "Physics");
+    await pickIn(form, "订阅源", "Quantum Journal");
+    await pickIn(form, "标签", "method");
+    await userEvent.click(screen.getByRole("button", { name: "添加计划" }));
+
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        domain_ids: [1],
+        feed_ids: [5],
+        tag_ids: [7],
+        domain_match: "any",
+      }),
+    );
+  });
+
+  it("shows the ANY/ALL domain match control when more than one domain is selected", async () => {
+    const domainA: Domain = { id: 1, name: "Physics", description: "", color: "#2bc7c3", position: 0, feed_count: 1, entry_count: 1 };
+    const domainB: Domain = { id: 2, name: "AI", description: "", color: "#6d5fc2", position: 1, feed_count: 1, entry_count: 1 };
+    renderModal([], [], [], null, { domains: [domainA, domainB] });
+
+    await screen.findByRole("textbox", { name: "计划名称" });
+    const form = document.querySelector("form.brief-schedule-form") as HTMLElement;
+    expect(within(form).queryByRole("button", { name: "ANY" })).not.toBeInTheDocument();
+    const domainCombo = within(form).getByRole("combobox", { name: "领域" });
+    await userEvent.click(domainCombo);
+    await userEvent.click(within(domainCombo.closest(".app-dropdown") as HTMLElement).getByRole("option", { name: "Physics" }));
+    await userEvent.click(within(domainCombo.closest(".app-dropdown") as HTMLElement).getByRole("option", { name: "AI" }));
+    expect(within(form).getByRole("button", { name: "ANY" })).toBeInTheDocument();
+    await userEvent.click(within(form).getByRole("button", { name: "ALL" }));
+  });
+
+  it("deletes an existing schedule after confirmation", async () => {
+    const remove = vi.spyOn(api, "deleteBriefSchedule").mockResolvedValue();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderModal([schedule]);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "删除计划 工作日晨报" }),
+    );
+
+    expect(remove).toHaveBeenCalledWith(schedule.id);
+  });
+
+  it("runs a schedule immediately from its row", async () => {
+    const run = vi.spyOn(api, "runBriefSchedule").mockResolvedValue(brief);
+    renderModal([schedule]);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "立即生成 工作日晨报" }),
+    );
+
+    expect(run).toHaveBeenCalledWith(schedule.id);
+    expect(await screen.findByRole("heading", { name: brief.title })).toBeInTheDocument();
+  });
+
+  it("sends the selected coverage when generating a brief manually", async () => {
+    const domain: Domain = { id: 1, name: "Physics", description: "", color: "#2bc7c3", position: 0, feed_count: 1, entry_count: 2 };
+    const feed: Feed = {
+      id: 5, title: "Quantum Journal", url: "https://example.test/q.xml", folder: "Physics",
+      position: 0, enabled: true, poll_interval_minutes: 60, status: "healthy",
+      unread_count: 0, entry_count: 3, error_count: 0, domains: [],
+    };
+    const tag: Tag = { id: 7, name: "method", color: null, entry_count: 1 };
+    const create = vi.spyOn(api, "createBrief").mockResolvedValue(brief);
+    renderModal([], [connection], [], null, { domains: [domain], feeds: [feed], tags: [tag] });
+
+    await screen.findByRole("button", { name: "生成简报" });
+    const domainCombo = screen.getAllByRole("combobox", { name: "领域" })[0];
+    await userEvent.click(domainCombo);
+    await userEvent.click(within(domainCombo.closest(".app-dropdown") as HTMLElement).getByRole("option", { name: "Physics" }));
+    const feedCombo = screen.getAllByRole("combobox", { name: "订阅源" })[0];
+    await userEvent.click(feedCombo);
+    await userEvent.click(within(feedCombo.closest(".app-dropdown") as HTMLElement).getByRole("option", { name: "Quantum Journal" }));
+    const tagCombo = screen.getAllByRole("combobox", { name: "标签" })[0];
+    await userEvent.click(tagCombo);
+    await userEvent.click(within(tagCombo.closest(".app-dropdown") as HTMLElement).getByRole("option", { name: "method" }));
+    await userEvent.click(screen.getByRole("button", { name: "生成简报" }));
+
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        domain_ids: [1],
+        feed_ids: [5],
+        tag_ids: [7],
+        domain_match: "any",
+      }),
+    );
+  });
+
+  it("stops a running generation from the progress panel", async () => {
+    const stop = vi.spyOn(api, "stopBriefGeneration").mockResolvedValue({
+      idempotency_key: "brief-stop-test",
+      status: "running",
+      stage: "summarizing_batches",
+      completed: 2,
+      total: 4,
+      can_retry: false,
+      attempt: 1,
+    });
+    renderModal([], [connection], [], {
+      idempotency_key: "brief-stop-test",
+      status: "running",
+      stage: "summarizing_batches",
+      completed: 2,
+      total: 4,
+    });
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "停止生成" }),
+    );
+
+    expect(stop).toHaveBeenCalledWith("brief-stop-test");
+  });
+
+  it("offers restart from scratch alongside checkpoint resume after a stop", async () => {
+    const restart = vi.spyOn(api, "restartBriefGeneration").mockResolvedValue({
+      ...brief,
+      title: "从头再来的简报",
+    });
+    renderModal([], [connection], [], {
+      idempotency_key: "brief-stopped-test",
+      status: "failed",
+      stage: "summarizing_batches",
+      completed: 2,
+      total: 4,
+      can_retry: true,
+      stopped: true,
+      message: "Generation stopped by owner",
+    });
+
+    expect(await screen.findByText("生成已停止")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "从断点继续" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "从头开始" }));
+    expect(restart).toHaveBeenCalledWith("brief-stopped-test");
+    expect(await screen.findByRole("heading", { name: "从头再来的简报" })).toBeInTheDocument();
   });
 });
 

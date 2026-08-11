@@ -6,10 +6,15 @@ const domains = [
   { id: 1, name: "Science", description: "", color: "#2bc7c3", position: 0, feed_count: 1, entry_count: 2 },
   { id: 2, name: "Technology", description: "", color: "#8878e8", position: 1, feed_count: 1, entry_count: 1 },
 ];
+const tags = [
+  { id: 1, name: "Condensed Matter", color: "#8878e8", entry_count: 1 },
+  { id: 2, name: "QEC", color: "#8878e8", entry_count: 1 },
+  { id: 3, name: "Quantum Computing", color: "#8878e8", entry_count: 2 },
+];
 const originalEntries = [
   {
     id: 101, title: "A reproducible experiment", translated_title: "一项可复现实验",
-    summary: "The original summary remains readable.", translated_summary: "原始摘要始终可读。",
+    summary: "The state $\\lvert\\psi\\rangle=a*b_c$ evolves with \\[H=\\frac{p^2}{2m}+V(x)\\].", translated_summary: "能量满足 \\(E=mc^2\\)，原始摘要始终可读。",
     url: "https://example.org/articles/101", authors: ["Ada Lovelace"], categories: ["research"],
     published_at: "2026-07-26T03:00:00Z", updated_at: "2026-07-26T03:00:00Z",
     feed_titles: ["Example Science"], feed_ids: [1], domains, tags: [],
@@ -37,7 +42,7 @@ const brief = {
   period_start: "2026-07-26T00:00:00Z", period_end: "2026-07-27T00:00:00Z",
   start_at: "2026-07-26T00:00:00Z", end_at: "2026-07-27T00:00:00Z",
   title: "Daily brief · 2026-07-27",
-  notes: "## Overview\n\n**Key finding** across sources.\n\n| Theme | Direction |\n| --- | --- |\n| Reproducibility | Improving |",
+  notes: "## Overview\n\n**Key finding** across sources with $a*b_c + \\href{https://math-marker.invalid}{marker} + \\class{math-marker}{x} + \\style{color:red}{y}$ and \\(E=mc^2\\).\n\n$$\n\\begin{aligned}a&=b\\\\c&=d\\end{aligned}\n$$\n\n`$code_not_math$`\n\n![Remote chart](https://remote-marker.invalid/chart.png)\n\n[Blocked location](file:///private/report) · [Safe reference](https://example.test/report)\n\n| Theme | Direction |\n| --- | --- |\n| Reproducibility | Improving |",
   stats: { entries: 2, feeds: 1, analyzed_entries: 2 },
   filters: {}, item_count: 2,
   created_at: "2026-07-27T01:00:00Z", updated_at: "2026-07-27T01:00:00Z",
@@ -70,8 +75,13 @@ const server = createServer(async (request, response) => {
     if (path === "/api/v1/feeds" && request.method === "GET") return json(response, 200, { items: [{ ...feed, unread_count: entries.filter((item) => !item.state.read).length, entry_count: entries.length }] });
     if (path === "/api/v1/folders") return json(response, 200, { items: [{ id: 1, name: "Research", position: 0, sort_mode: "alpha", sort_direction: "asc", feed_count: 1 }] });
     if (path === "/api/v1/domains") return json(response, 200, { items: domains });
-    if (path === "/api/v1/tags") return json(response, 200, { items: [] });
+    if (path === "/api/v1/tags") return json(response, 200, { items: tags });
     if (path === "/api/v1/llm/connections") return json(response, 200, []);
+    if (path === "/api/v1/auto-tag/status") return json(response, 200, {
+      enabled: false, create_new: false, llm_connection_id: null, llm_connection_name: null,
+      model: null, configured: false, max_tags_per_entry: 5,
+      pending_count: 0, running_count: 0, complete_count: 0, failed_count: 0,
+    });
     if (path === "/api/v1/briefs/configuration") return json(response, 200, { llm_connection_id: null, llm_connection_name: null, model: null, configured: false });
     if (path === "/api/v1/briefs/rule") return json(response, 200, { content: "# Brief generation rule\n\n- Synthesize trends.", is_custom: false });
     if (path === "/api/v1/briefs" && request.method === "GET") return json(response, 200, { items: [brief] });

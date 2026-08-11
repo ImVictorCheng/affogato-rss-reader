@@ -105,7 +105,7 @@ def run_call_log_test(image: str) -> None:
             image,
             "sh",
             "-c",
-            "chown 10001:10001 /app/logs && chmod 0755 /app/logs",
+            "chown 10001:10001 /app/logs && chmod 0700 /app/logs",
         )
         docker(
             "run",
@@ -155,6 +155,17 @@ def main() -> int:
     if container_exists(args.container):
         raise RuntimeError(f"Refusing to replace existing container {args.container}")
 
+    license_label = docker(
+        "image",
+        "inspect",
+        "--format",
+        '{{ index .Config.Labels "org.opencontainers.image.licenses" }}',
+        args.image,
+        capture=True,
+    ).stdout.strip()
+    if license_label != "MIT AND Apache-2.0":
+        raise RuntimeError(f"Unexpected OCI license label: {license_label!r}")
+
     docker(
         "run",
         "--rm",
@@ -172,7 +183,7 @@ def main() -> int:
             "--name",
             args.container,
             "-p",
-            f"{args.port}:8787",
+            f"127.0.0.1:{args.port}:8787",
             "-e",
             "AFFOGATO_RSS_READER_AUTH_MODE=none",
             args.image,
@@ -202,6 +213,22 @@ def main() -> int:
             "-q",
             "MIT License",
             "/usr/share/licenses/affogato-rss-reader/LICENSE",
+        )
+        docker(
+            "exec",
+            args.container,
+            "grep",
+            "-q",
+            "Version 2.0",
+            "/usr/share/licenses/affogato-rss-reader/MathJax-APACHE-2.0.txt",
+        )
+        docker(
+            "exec",
+            args.container,
+            "grep",
+            "-q",
+            "MathJax 3.2.2",
+            "/usr/share/licenses/affogato-rss-reader/THIRD_PARTY_NOTICES.md",
         )
         print(json.dumps({"health": health, "database": state}, sort_keys=True))
     finally:

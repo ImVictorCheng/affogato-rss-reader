@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { api } from "../api";
 import { t } from "../i18n";
 import type {
@@ -10,23 +11,35 @@ import type {
   BriefPeriod,
   BriefRule,
   BriefSchedule,
+  Domain,
+  Feed,
   LLMConnection,
   Locale,
+  Tag,
 } from "../types";
 import {
   downloadBlob,
   errorText,
   formatDateTime,
+  safeHttpUrl,
   uniqueRequestKey,
 } from "../utils";
 import {
   EmptyState,
   ErrorNotice,
   Modal,
+  MultiSelectMenu,
+  SegmentedControl,
   SelectMenu,
   Spinner,
   Toggle,
 } from "./Common";
+import {
+  containsMarkdownMath,
+  MathJaxScope,
+  prepareMathMarkdown,
+  rehypeMathJaxSource,
+} from "./MathJax";
 
 function localDateTimeValue(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, "0");
@@ -56,35 +69,94 @@ export function naturalPeriodRange(period: BriefPeriod, now = new Date()) {
 }
 
 function BriefSummary({ markdown }: { markdown: string }) {
+  const preparedMarkdown = prepareMathMarkdown(markdown);
   return (
     <article className="brief-summary">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        skipHtml
-        components={{
-          a: ({ node: _node, href, children, ...props }) => (
-            <a
-              {...props}
-              href={href}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              {children}
-            </a>
-          ),
-          img: ({ node: _node, alt, ...props }) => (
-            <img
-              {...props}
-              alt={alt ?? ""}
-              loading="lazy"
-              referrerPolicy="no-referrer"
-            />
-          ),
-        }}
-      >
-        {markdown}
-      </ReactMarkdown>
+      <MathJaxScope source={markdown} enabled={containsMarkdownMath(markdown)}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm, remarkMath]}
+          rehypePlugins={[rehypeMathJaxSource]}
+          skipHtml
+          components={{
+            a: ({ node: _node, href, children, ...props }) => (
+              safeHttpUrl(href)
+                ? <a
+                  {...props}
+                  href={safeHttpUrl(href) ?? undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  {children}
+                </a>
+                : <span className="brief-link-blocked">{children}</span>
+            ),
+            img: ({ node: _node, alt }) => (
+              <span className="brief-image-placeholder" role="img" aria-label={alt || "Remote image blocked"}>
+                {alt || "Remote image blocked"}
+              </span>
+            ),
+          }}
+        >
+          {preparedMarkdown}
+        </ReactMarkdown>
+      </MathJaxScope>
     </article>
+  );
+}
+
+function CoveragePicker({
+  locale, domains, feeds, tags, domainIds, feedIds, tagIds, domainMatch,
+  onDomainIds, onFeedIds, onTagIds, onDomainMatch,
+}: {
+  locale: Locale;
+  domains: Domain[];
+  feeds: Feed[];
+  tags: Tag[];
+  domainIds: number[];
+  feedIds: number[];
+  tagIds: number[];
+  domainMatch: "any" | "all";
+  onDomainIds: (value: number[]) => void;
+  onFeedIds: (value: number[]) => void;
+  onTagIds: (value: number[]) => void;
+  onDomainMatch: (value: "any" | "all") => void;
+}) {
+  const zh = locale === "zh-CN";
+  return (
+    <div className="brief-coverage">
+      <span className="brief-coverage__title">{zh ? "覆盖范围" : "Coverage"}</span>
+      <div className="brief-coverage__selects">
+        <MultiSelectMenu
+          label={zh ? "领域" : "Domains"}
+          placeholder={zh ? "全部领域" : "All domains"}
+          value={domainIds.map(String)}
+          options={domains.map((domain) => ({ value: String(domain.id), label: domain.name }))}
+          onChange={(values) => onDomainIds(values.map(Number))}
+        />
+        <MultiSelectMenu
+          label={zh ? "订阅源" : "Feeds"}
+          placeholder={zh ? "全部订阅源" : "All feeds"}
+          value={feedIds.map(String)}
+          options={feeds.map((feed) => ({ value: String(feed.id), label: feed.title }))}
+          onChange={(values) => onFeedIds(values.map(Number))}
+        />
+        <MultiSelectMenu
+          label={zh ? "标签" : "Tags"}
+          placeholder={zh ? "全部标签" : "All tags"}
+          value={tagIds.map(String)}
+          options={tags.map((tag) => ({ value: String(tag.id), label: tag.name }))}
+          onChange={(values) => onTagIds(values.map(Number))}
+        />
+      </div>
+      {domainIds.length > 1 && (
+        <SegmentedControl
+          label="Domain matching"
+          value={domainMatch}
+          onChange={onDomainMatch}
+          options={[{ value: "any", label: "ANY" }, { value: "all", label: "ALL" }]}
+        />
+      )}
+    </div>
   );
 }
 
@@ -118,9 +190,26 @@ export function BriefWorkspace({ locale, onBack, notify }: {
   const [deletingBriefId, setDeletingBriefId] = useState<number | null>(null);
   const [scheduleName, setScheduleName] = useState("");
   const [cutoffTime, setCutoffTime] = useState("09:00");
+  const [scheduleStartTime, setScheduleStartTime] = useState("");
   const [timezone, setTimezone] = useState(
     Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
   );
+  const [schedulePeriod, setSchedulePeriod] = useState<BriefPeriod>(period);
+  const [editingSchedule, setEditingSchedule] = useState<number | null>(null);
+  const [stoppingGeneration, setStoppingGeneration] = useState(false);
+  const [restartingGeneration, setRestartingGeneration] = useState(false);
+  const [scheduleRunPending, setScheduleRunPending] = useState(false);
+  const [domains, setDomains] = useState<Domain[]>([]);
+  const [feeds, setFeeds] = useState<Feed[]>([]);
+  const [tags, setTags] = useState<Tag[]>([]);
+  const [scheduleDomainIds, setScheduleDomainIds] = useState<number[]>([]);
+  const [scheduleFeedIds, setScheduleFeedIds] = useState<number[]>([]);
+  const [scheduleTagIds, setScheduleTagIds] = useState<number[]>([]);
+  const [scheduleDomainMatch, setScheduleDomainMatch] = useState<"any" | "all">("any");
+  const [manualDomainIds, setManualDomainIds] = useState<number[]>([]);
+  const [manualFeedIds, setManualFeedIds] = useState<number[]>([]);
+  const [manualTagIds, setManualTagIds] = useState<number[]>([]);
+  const [manualDomainMatch, setManualDomainMatch] = useState<"any" | "all">("any");
   const [error, setError] = useState("");
   const zh = locale === "zh-CN";
   const periodLabel = {
@@ -138,16 +227,22 @@ export function BriefWorkspace({ locale, onBack, notify }: {
 
   async function load() {
     try {
-      const [items, plans, availableConnections, briefConfiguration] = await Promise.all([
+      const [items, plans, availableConnections, briefConfiguration, domains, feeds, tags] = await Promise.all([
         api.briefs(period),
         api.briefSchedules(),
         api.llmConnections(),
         api.briefConfiguration(),
+        api.domains(),
+        api.feeds(),
+        api.tags(),
       ]);
       setBriefs(items);
       setSchedules(plans);
       setConnections(availableConnections);
       setConfiguration(briefConfiguration);
+      setDomains(domains);
+      setFeeds(feeds);
+      setTags(tags);
       setConnectionId(
         briefConfiguration.llm_connection_id
           ? String(briefConfiguration.llm_connection_id)
@@ -224,6 +319,26 @@ export function BriefWorkspace({ locale, onBack, notify }: {
     };
   }, [generationProgress?.idempotency_key, generationProgress?.status]);
 
+  useEffect(() => {
+    if (!scheduleRunPending) return;
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const value = await api.latestBriefGenerationProgress(period);
+        if (cancelled || !value || value.status !== "running") return;
+        setGenerationProgress(value);
+      } catch {
+        // Keep polling; the server may still be starting the job.
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 750);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [scheduleRunPending, period]);
+
   async function generate() {
     if (!connectionId) {
       setError(
@@ -255,8 +370,10 @@ export function BriefWorkspace({ locale, onBack, notify }: {
         idempotency_key: requestKey,
         start_at: new Date(startAt).toISOString(),
         end_at: new Date(endAt).toISOString(),
-        domain_ids: [],
-        domain_match: "any",
+        domain_ids: manualDomainIds,
+        feed_ids: manualFeedIds,
+        tag_ids: manualTagIds,
+        domain_match: manualDomainMatch,
       });
       setGenerationProgress({
         idempotency_key: requestKey,
@@ -342,6 +459,98 @@ export function BriefWorkspace({ locale, onBack, notify }: {
       }
     } finally {
       setRetryingGeneration(false);
+    }
+  }
+
+  async function restartGeneration() {
+    if (!generationProgress?.can_retry) return;
+    const requestKey = generationProgress.idempotency_key;
+    setRestartingGeneration(true);
+    setError("");
+    setGenerationProgress({
+      ...generationProgress,
+      status: "running",
+      message: zh ? "正在从头开始生成…" : "Restarting generation from scratch…",
+    });
+    try {
+      const value = await api.restartBriefGeneration(requestKey);
+      setGenerationProgress({
+        idempotency_key: requestKey,
+        status: "completed",
+        stage: "finalizing",
+        completed: 1,
+        total: 1,
+        brief_id: value.id,
+        can_retry: false,
+        attempt: (generationProgress.attempt || 1) + 1,
+      });
+      setBriefs((current) => [
+        value,
+        ...current.filter((item) => item.id !== value.id),
+      ]);
+      setActive(value);
+      notify(zh ? "简报已从头开始重新生成" : "Brief regenerated from scratch");
+    } catch (caught) {
+      const message = errorText(caught);
+      try {
+        const serverProgress = await api.briefGenerationProgress(requestKey);
+        setGenerationProgress(serverProgress);
+        setError(
+          serverProgress.status === "running"
+            ? (zh
+                ? "连接已中断，但后台仍在重新生成。"
+                : "Disconnected, but the server is still regenerating from scratch.")
+            : serverProgress.message || message,
+        );
+      } catch {
+        setError(message);
+      }
+    } finally {
+      setRestartingGeneration(false);
+    }
+  }
+
+  async function stopGeneration() {
+    if (!generationProgress || generationProgress.status !== "running") return;
+    const requestKey = generationProgress.idempotency_key;
+    setStoppingGeneration(true);
+    setError("");
+    try {
+      await api.stopBriefGeneration(requestKey);
+      setGenerationProgress({
+        ...generationProgress,
+        message: zh ? "正在停止生成…" : "Stopping generation…",
+      });
+    } catch (caught) {
+      setError(errorText(caught));
+    } finally {
+      setStoppingGeneration(false);
+    }
+  }
+
+  async function runScheduleNow(schedule: BriefSchedule) {
+    if (generationProgress?.status === "running" || scheduleRunPending) return;
+    setError("");
+    setGenerationProgress(null);
+    setScheduleRunPending(true);
+    try {
+      const value = await api.runBriefSchedule(schedule.id);
+      setBriefs((current) => [
+        value,
+        ...current.filter((item) => item.id !== value.id),
+      ]);
+      setActive(value);
+      notify(zh ? "简报已生成" : "Brief generated");
+    } catch (caught) {
+      setError(errorText(caught));
+      try {
+        const progress = await api.latestBriefGenerationProgress(schedule.period);
+        if (progress && progress.status !== "completed") setGenerationProgress(progress);
+      } catch {
+        // The run failed before any job was created; the error is shown above.
+      }
+    } finally {
+      setScheduleRunPending(false);
     }
   }
 
@@ -434,24 +643,90 @@ export function BriefWorkspace({ locale, onBack, notify }: {
     }
   }
 
-  async function createSchedule(event: FormEvent) {
+  async function submitSchedule(event: FormEvent) {
     event.preventDefault();
+    const startTime = schedulePeriod === "daily" && scheduleStartTime ? scheduleStartTime : null;
     try {
-      await api.createBriefSchedule({
+      const common: {
+        name: string;
+        timezone: string;
+        cutoff_time: string;
+        start_time: string | null;
+        domain_ids: number[];
+        feed_ids: number[];
+        tag_ids: number[];
+        domain_match: "any" | "all";
+      } = {
         name: scheduleName,
-        period,
         timezone,
         cutoff_time: cutoffTime,
-        weekday: period === "weekly" ? 0 : null,
-        month_day: period === "monthly" || period === "yearly" ? 1 : null,
-        year_month: period === "yearly" ? 1 : null,
-        domain_ids: [],
-        feed_ids: [],
-        tag_ids: [],
-        domain_match: "any",
-        enabled: true,
-      });
+        start_time: startTime,
+        domain_ids: scheduleDomainIds,
+        feed_ids: scheduleFeedIds,
+        tag_ids: scheduleTagIds,
+        domain_match: scheduleDomainMatch,
+      };
+      if (editingSchedule !== null) {
+        const existing = schedules.find((item) => item.id === editingSchedule);
+        await api.updateBriefSchedule(editingSchedule, {
+          ...common,
+          period: schedulePeriod,
+          weekday: schedulePeriod === "weekly" ? (existing?.weekday ?? 0) : null,
+          month_day: schedulePeriod === "monthly" || schedulePeriod === "yearly"
+            ? (existing?.month_day ?? 1)
+            : null,
+          year_month: schedulePeriod === "yearly" ? (existing?.year_month ?? 1) : null,
+        });
+      } else {
+        await api.createBriefSchedule({
+          ...common,
+          period: schedulePeriod,
+          weekday: schedulePeriod === "weekly" ? 0 : null,
+          month_day: schedulePeriod === "monthly" || schedulePeriod === "yearly" ? 1 : null,
+          year_month: schedulePeriod === "yearly" ? 1 : null,
+          enabled: true,
+        });
+      }
       setScheduleName("");
+      setScheduleStartTime("");
+      setEditingSchedule(null);
+      await load();
+    } catch (caught) {
+      setError(errorText(caught));
+    }
+  }
+
+  function startEditSchedule(schedule: BriefSchedule) {
+    setScheduleName(schedule.name);
+    setSchedulePeriod(schedule.period);
+    setCutoffTime(schedule.cutoff_time);
+    setScheduleStartTime(schedule.start_time || "");
+    setTimezone(schedule.timezone);
+    setScheduleDomainIds(schedule.domain_ids || []);
+    setScheduleFeedIds(schedule.feed_ids || []);
+    setScheduleTagIds(schedule.tag_ids || []);
+    setScheduleDomainMatch(schedule.domain_match || "any");
+    setEditingSchedule(schedule.id);
+  }
+
+  function cancelEditSchedule() {
+    setScheduleName("");
+    setSchedulePeriod(period);
+    setCutoffTime("09:00");
+    setScheduleStartTime("");
+    setTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC");
+    setScheduleDomainIds([]);
+    setScheduleFeedIds([]);
+    setScheduleTagIds([]);
+    setScheduleDomainMatch("any");
+    setEditingSchedule(null);
+  }
+
+  async function deleteSchedule(schedule: BriefSchedule) {
+    if (!window.confirm(zh ? `确定删除计划「${schedule.name}」吗？` : `Delete the schedule "${schedule.name}"?`)) return;
+    try {
+      await api.deleteBriefSchedule(schedule.id);
+      if (editingSchedule === schedule.id) cancelEditSchedule();
       await load();
     } catch (caught) {
       setError(errorText(caught));
@@ -476,6 +751,9 @@ export function BriefWorkspace({ locale, onBack, notify }: {
           {zh ? "返回阅读" : "Back to reader"}
         </button>
       </header>
+      <p className="provider-warning">{zh
+        ? "生成简报会把所选时间范围内的文章标题与摘要发送给你选择的 LLM 服务；自动计划也会按计划重复发送。"
+        : "Brief generation sends article titles and summaries from the selected range to your chosen LLM provider; schedules repeat this transfer automatically."}</p>
       {error && <ErrorNotice message={error} compact />}
       <div className="brief-toolbar">
         <div className="modal-tabs">
@@ -533,15 +811,17 @@ export function BriefWorkspace({ locale, onBack, notify }: {
             <strong>
               {generationProgress.status === "completed"
                 ? (zh ? "简报生成完成" : "Brief complete")
-                : generationProgress.status === "failed"
-                  ? (zh ? "简报生成失败" : "Brief generation failed")
-                  : generationProgress.stage === "summarizing_batches"
-                    ? (zh ? "正在分批总结条目" : "Summarizing article batches")
-                    : generationProgress.stage === "consolidating"
-                      ? (zh ? "正在合并各批结果" : "Consolidating batch results")
-                      : generationProgress.stage === "finalizing"
-                        ? (zh ? "正在生成最终简报" : "Writing the final brief")
-                        : (zh ? "正在准备输入内容" : "Preparing source content")}
+                : generationProgress.status === "failed" && generationProgress.stopped
+                  ? (zh ? "生成已停止" : "Generation stopped")
+                  : generationProgress.status === "failed"
+                    ? (zh ? "简报生成失败" : "Brief generation failed")
+                    : generationProgress.stage === "summarizing_batches"
+                      ? (zh ? "正在分批总结条目" : "Summarizing article batches")
+                      : generationProgress.stage === "consolidating"
+                        ? (zh ? "正在合并各批结果" : "Consolidating batch results")
+                        : generationProgress.stage === "finalizing"
+                          ? (zh ? "正在生成最终简报" : "Writing the final brief")
+                          : (zh ? "正在准备输入内容" : "Preparing source content")}
             </strong>
             <span>
               {generationProgress.message ||
@@ -562,15 +842,26 @@ export function BriefWorkspace({ locale, onBack, notify }: {
           {generationProgress.status === "failed" && (
             <div className="brief-generation-progress__actions">
               {generationProgress.can_retry ? (
-                <button
-                  className="button button--primary button--small"
-                  disabled={retryingGeneration}
-                  onClick={() => void retryGeneration()}
-                >
-                  {retryingGeneration
-                    ? (zh ? "正在继续…" : "Resuming…")
-                    : (zh ? "从断点重试" : "Retry from checkpoint")}
-                </button>
+                <>
+                  <button
+                    className="button button--secondary button--small"
+                    disabled={retryingGeneration || restartingGeneration}
+                    onClick={() => void retryGeneration()}
+                  >
+                    {retryingGeneration
+                      ? (zh ? "正在继续…" : "Resuming…")
+                      : (zh ? "从断点继续" : "Resume from checkpoint")}
+                  </button>
+                  <button
+                    className="button button--primary button--small"
+                    disabled={retryingGeneration || restartingGeneration}
+                    onClick={() => void restartGeneration()}
+                  >
+                    {restartingGeneration
+                      ? (zh ? "正在重新生成…" : "Regenerating…")
+                      : (zh ? "从头开始" : "Restart from scratch")}
+                  </button>
+                </>
               ) : (
                 <span>
                   {zh
@@ -578,6 +869,19 @@ export function BriefWorkspace({ locale, onBack, notify }: {
                     : "This older task has no saved checkpoints; start a new generation."}
                 </span>
               )}
+            </div>
+          )}
+          {generationProgress.status === "running" && (
+            <div className="brief-generation-progress__actions">
+              <button
+                className="button button--secondary button--small"
+                disabled={stoppingGeneration}
+                onClick={() => void stopGeneration()}
+              >
+                {stoppingGeneration
+                  ? (zh ? "正在停止…" : "Stopping…")
+                  : (zh ? "停止生成" : "Stop generation")}
+              </button>
             </div>
           )}
         </section>
@@ -595,6 +899,20 @@ export function BriefWorkspace({ locale, onBack, notify }: {
           {zh ? "恢复当前周期" : "Use current period"}
         </button>
       </section>
+      <CoveragePicker
+        locale={locale}
+        domains={domains}
+        feeds={feeds}
+        tags={tags}
+        domainIds={manualDomainIds}
+        feedIds={manualFeedIds}
+        tagIds={manualTagIds}
+        domainMatch={manualDomainMatch}
+        onDomainIds={setManualDomainIds}
+        onFeedIds={setManualFeedIds}
+        onTagIds={setManualTagIds}
+        onDomainMatch={setManualDomainMatch}
+      />
       {connections.length === 0 && (
         <p className="brief-connection-hint">
           {zh
@@ -755,16 +1073,42 @@ export function BriefWorkspace({ locale, onBack, notify }: {
         <p className="brief-schedules__intro">
           {zh ? "按当前简报周期自动生成内容，生成时间以所选时区为准。" : "Generate this brief period automatically using the selected timezone."}
         </p>
-        <form className="brief-schedule-form" onSubmit={createSchedule}>
+        <form className="brief-schedule-form" onSubmit={submitSchedule}>
           <label className="field">
             <span>{zh ? "计划名称" : "Schedule name"}</span>
             <input
               required
               value={scheduleName}
-              placeholder={zh ? `例如：${periodLabel[period]}晨报` : `e.g. ${periodLabel[period]} digest`}
+              placeholder={zh ? `例如：${periodLabel[schedulePeriod]}晨报` : `e.g. ${periodLabel[schedulePeriod]} digest`}
               onChange={(event) => setScheduleName(event.target.value)}
             />
           </label>
+          <label className="field">
+            <span>{zh ? "周期" : "Period"}</span>
+            <div className="brief-schedule-form__periods">
+              {(["daily", "weekly", "monthly", "yearly"] as BriefPeriod[]).map((value) => (
+                <button
+                  type="button"
+                  key={value}
+                  className={schedulePeriod === value ? "is-active" : ""}
+                  onClick={() => setSchedulePeriod(value)}
+                >
+                  {periodLabel[value]}
+                </button>
+              ))}
+            </div>
+          </label>
+          {schedulePeriod === "daily" && (
+            <label className="field">
+              <span>{zh ? "窗口开始时间" : "Window start time"}</span>
+              <input
+                type="time"
+                value={scheduleStartTime}
+                placeholder={zh ? "可选" : "Optional"}
+                onChange={(event) => setScheduleStartTime(event.target.value)}
+              />
+            </label>
+          )}
           <label className="field">
             <span>{zh ? "生成时间" : "Run time"}</span>
             <input
@@ -782,10 +1126,31 @@ export function BriefWorkspace({ locale, onBack, notify }: {
               onChange={(event) => setTimezone(event.target.value)}
             />
           </label>
-          <button type="submit" className="button button--primary brief-schedule-form__submit">
-            <span aria-hidden="true">+</span>
-            {zh ? "添加计划" : "Add schedule"}
-          </button>
+          <CoveragePicker
+            locale={locale}
+            domains={domains}
+            feeds={feeds}
+            tags={tags}
+            domainIds={scheduleDomainIds}
+            feedIds={scheduleFeedIds}
+            tagIds={scheduleTagIds}
+            domainMatch={scheduleDomainMatch}
+            onDomainIds={setScheduleDomainIds}
+            onFeedIds={setScheduleFeedIds}
+            onTagIds={setScheduleTagIds}
+            onDomainMatch={setScheduleDomainMatch}
+          />
+          <div className="brief-schedule-form__submit-row">
+            {editingSchedule !== null && (
+              <button type="button" className="button button--secondary" onClick={cancelEditSchedule}>
+                {zh ? "取消" : "Cancel"}
+              </button>
+            )}
+            <button type="submit" className="button button--primary brief-schedule-form__submit">
+              <span aria-hidden="true">{editingSchedule !== null ? "✎" : "+"}</span>
+              {editingSchedule !== null ? (zh ? "保存修改" : "Save changes") : (zh ? "添加计划" : "Add schedule")}
+            </button>
+          </div>
         </form>
         {schedules.length === 0 ? (
           <div className="brief-schedules__empty">
@@ -800,7 +1165,7 @@ export function BriefWorkspace({ locale, onBack, notify }: {
                 <div className="brief-schedule-row__main">
                   <strong>{schedule.name}</strong>
                   <small>
-                    {periodLabel[schedule.period]} · {schedule.cutoff_time} · {schedule.timezone}
+                    {periodLabel[schedule.period]} · {schedule.start_time ? `${schedule.start_time}–${schedule.cutoff_time}` : schedule.cutoff_time} · {schedule.timezone}
                   </small>
                 </div>
                 <Toggle
@@ -812,6 +1177,34 @@ export function BriefWorkspace({ locale, onBack, notify }: {
                       .then(load)
                   }
                 />
+                <div className="brief-schedule-row__actions">
+                  <button
+                    type="button"
+                    aria-label={zh ? `立即生成 ${schedule.name}` : `Run now ${schedule.name}`}
+                    title={zh ? "立即生成" : "Run now"}
+                    disabled={generationProgress?.status === "running" || scheduleRunPending}
+                    onClick={() => void runScheduleNow(schedule)}
+                  >
+                    <span aria-hidden="true">▶</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={zh ? `修改计划 ${schedule.name}` : `Edit schedule ${schedule.name}`}
+                    title={zh ? "修改计划" : "Edit schedule"}
+                    onClick={() => startEditSchedule(schedule)}
+                  >
+                    <span aria-hidden="true">✎</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="is-danger"
+                    aria-label={zh ? `删除计划 ${schedule.name}` : `Delete schedule ${schedule.name}`}
+                    title={zh ? "删除计划" : "Delete schedule"}
+                    onClick={() => void deleteSchedule(schedule)}
+                  >
+                    <span aria-hidden="true">⌫</span>
+                  </button>
+                </div>
               </div>
             ))}
           </div>

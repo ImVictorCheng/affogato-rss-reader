@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from backend.app.parsing import (
+    MAX_ENTRY_TITLE_CHARS,
     canonicalize_url,
     clean_html,
     normalize_doi,
@@ -60,6 +63,8 @@ def test_parse_arxiv_atom_version_announce_categories_and_doi():
 def test_normalizers():
     assert normalize_doi("https://doi.org/10.1000/XYZ.1") == "10.1000/xyz.1"
     assert canonicalize_url("HTTPS://Example.COM:443/a/?utm_campaign=x&x=1#part") == "https://example.com/a?x=1"
+    assert canonicalize_url("javascript:alert(1)") == ""
+    assert canonicalize_url("not a URL") == ""
     assert clean_html("<style>x</style><p>Hello&nbsp;world</p>") == "Hello world"
 
 
@@ -68,3 +73,33 @@ def test_untrusted_html_uses_lxml_instead_of_stdlib_html_parser():
 
     assert soup.builder.NAME == "lxml"
     assert soup.get_text(" ", strip=True) == "safe"
+
+
+def test_parse_feed_rejects_oversized_fields_and_entry_counts():
+    oversized_title = "x" * (MAX_ENTRY_TITLE_CHARS + 1)
+    oversized = (
+        "<rss version='2.0'><channel><title>Feed</title><item>"
+        f"<guid>one</guid><link>https://example.test/one</link><title>{oversized_title}</title>"
+        "</item></channel></rss>"
+    ).encode()
+    with pytest.raises(ValueError, match="entry title exceeds"):
+        parse_feed(oversized, "application/rss+xml")
+
+    two_entries = b"""<rss version='2.0'><channel><title>Feed</title>
+      <item><guid>one</guid><link>https://example.test/one</link></item>
+      <item><guid>two</guid><link>https://example.test/two</link></item>
+    </channel></rss>"""
+    with pytest.raises(ValueError, match="more than 1 entries"):
+        parse_feed(two_entries, "application/rss+xml", max_entries=1)
+
+
+def test_parse_feed_clears_non_http_entry_and_site_links():
+    payload = b"""<rss version='2.0'><channel><title>Feed</title>
+      <link>javascript:alert(1)</link>
+      <item><guid>javascript:alert(2)</guid><title>Unsafe link</title></item>
+    </channel></rss>"""
+
+    metadata, entries = parse_feed(payload, "application/rss+xml")
+
+    assert metadata["site_url"] == ""
+    assert entries[0].url == ""

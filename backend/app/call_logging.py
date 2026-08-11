@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
@@ -15,6 +16,28 @@ CallStatus = Literal["success", "error"]
 
 _log_lock = Lock()
 logger = logging.getLogger(__name__)
+
+
+def _restrict_mode(path: Path, mode: int) -> None:
+    try:
+        path.chmod(mode)
+    except OSError:
+        # Windows ACLs and some mounted filesystems do not expose POSIX modes.
+        pass
+
+
+def prepare_call_log_path(settings: Settings | None = None) -> Path:
+    """Create and tighten the private call-log location before it is used."""
+
+    settings = settings or get_settings()
+    path = settings.effective_call_log_file
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _restrict_mode(path.parent, 0o700)
+    for index in range(settings.call_log_backups + 1):
+        candidate = path if index == 0 else path.with_name(f"{path.name}.{index}")
+        if candidate.is_file():
+            _restrict_mode(candidate, 0o600)
+    return path
 
 
 def _rotate_logs(path: Path, *, max_bytes: int, backup_count: int) -> None:
@@ -70,17 +93,18 @@ def write_call_log(
         "cached": bool(cached),
         "error": str(error)[:2000] if error else None,
     }
-    path = settings.effective_call_log_file
     with _log_lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = prepare_call_log_path(settings)
         _rotate_logs(
             path,
             max_bytes=settings.call_log_max_bytes,
             backup_count=settings.call_log_backups,
         )
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(descriptor, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
             handle.write("\n")
+        _restrict_mode(path, 0o600)
     return record
 
 
@@ -119,7 +143,7 @@ def read_call_logs(
     settings: Settings | None = None,
 ) -> list[dict]:
     settings = settings or get_settings()
-    path = settings.effective_call_log_file
+    path = prepare_call_log_path(settings)
     if not path.is_file():
         return []
     records: list[dict] = []

@@ -27,13 +27,32 @@ versions, and impact. Maintainers should acknowledge a report within seven days.
   summaries to the selected third-party provider. In automatic fallback mode,
   Google GTX also receives the text if the primary provider fails; manual mode
   stops without sending it to GTX.
+- Auto-tagging and brief generation also send source titles and summaries to
+  the owner-selected LLM provider. Auto-tagging continues in the background
+  while enabled, and brief schedules repeat that transfer at their configured
+  times. Keep these features disabled for content that must not leave the
+  instance.
+- The optional AI theme generator sends the primary domain, selected domain
+  names, and the free-form style preference to the endpoint chosen on that
+  screen. Its API key is used for that one request and is not persisted.
+- Feed discovery and synchronization reject loopback, private, link-local, and
+  other non-public targets by default, including redirect targets. A deployment
+  that intentionally subscribes to trusted LAN feeds can opt in with
+  `AFFOGATO_RSS_READER_FEED_ALLOW_PRIVATE_NETWORKS=true`; do not enable this on
+  an instance where untrusted users can manage subscriptions.
+- To enforce that boundary without a DNS-rebinding gap, the application resolves
+  feed hostnames locally and connects the selected direct or proxy route to the
+  validated IP while retaining the original TLS hostname. A feed proxy therefore
+  does not provide DNS-query anonymity; use a trusted local resolver when DNS
+  metadata is sensitive.
 - The release Compose bundle's update helper mounts the Docker daemon socket,
-  which is inherently host-privileged. It has no published port, drops Linux
-  capabilities, uses a read-only root filesystem, and accepts
-  only a fixed repository plus a digest-verified, tightly validated Compose
-  asset. The Web application never mounts the socket. If this trust model is not
-  acceptable for a deployment, stop the `updater` service and install releases
-  manually; the application will continue to check and download updates.
+  which is inherently host-privileged. It is isolated behind the opt-in
+  `release-updates` profile and is not started by the default Compose command.
+  It has no published port, drops Linux capabilities, and uses a read-only root
+  filesystem. Automatic installation is fail-closed until independently signed
+  release manifests provide a trust root; checks and verified asset downloads
+  continue, and releases must be installed manually. The Web application never
+  mounts the socket.
 
 ## Release integrity
 
@@ -41,8 +60,10 @@ versions, and impact. Maintainers should acknowledge a report within seven days.
   image or release bundle is published.
 - GitHub Actions and Docker base images are pinned to immutable revisions.
   Dependabot opens reviewable updates for both sets of pins.
-- CI builds, runs, and scans both `amd64` and `arm64` images. Unreviewed High or
-  Critical Grype findings block the release.
+- A release builds each `amd64` and `arm64` image once under an untagged digest,
+  then scans and smoke-tests those exact digests before publishing the combined
+  version and `latest` tags. Unreviewed High or Critical Grype findings block
+  publication.
 - `.grype.yaml` contains only exact, documented CPython CPE exceptions for code
   paths that the service does not use. Each exception is also restricted to the
   current Python version, so a runtime update requires a fresh review.

@@ -17,6 +17,7 @@ jobs:
       contents: read
     outputs:
       image-name: ${{ steps.image-name.outputs.name }}
+      staging-image-name: ${{ steps.image-name.outputs.staging-name }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -42,23 +43,31 @@ jobs:
             exit 1
           fi
           echo "name=ghcr.io/${owner}/affogato-rss-reader" >> "$GITHUB_OUTPUT"
+          echo "staging-name=ghcr.io/${owner}/affogato-rss-reader-staging" >> "$GITHUB_OUTPUT"
 
   quality-gate:
     needs: validate
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
+    with:
+      run_container_tests: false
 
-  image:
+  image-platform:
     needs: [validate, quality-gate]
+    name: Release image (${{ matrix.platform }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
-    outputs:
-      reader-digest: ${{ steps.build.outputs.digest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -76,15 +85,12 @@ jobs:
           images: ${{ needs.validate.outputs.image-name }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
       - id: build
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ needs.validate.outputs.staging-image-name }},push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=${{ steps.meta.outputs.version }}
@@ -92,24 +98,152 @@ jobs:
             SOURCE_URL=https://github.com/${{ github.repository }}
           sbom: true
           provenance: mode=max
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+      - name: Pull the exact platform digest for verification
+        shell: bash
+        run: |
+          docker pull \
+            --platform "${{ matrix.platform }}" \
+            "${{ needs.validate.outputs.staging-image-name }}@${{ steps.build.outputs.digest }}"
+      - name: Reject High or Critical vulnerabilities in the exact release digest
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
         with:
-          subject-name: ${{ needs.validate.outputs.image-name }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
+          image: ${{ needs.validate.outputs.staging-image-name }}@${{ steps.build.outputs.digest }}
+          fail-build: true
+          severity-cutoff: high
+          only-fixed: false
+          output-format: table
+          grype-version: v0.116.1
+          config: .grype.yaml
+      - name: Smoke-test the exact release digest
+        shell: bash
+        run: |
+          image="${{ needs.validate.outputs.staging-image-name }}@${{ steps.build.outputs.digest }}"
+          python scripts/container_smoke_test.py \
+            --image "$image" \
+            --container "affogato-release-${{ matrix.arch }}" \
+            --port 18787
+      - if: always()
+        run: docker rm -f -v "affogato-release-${{ matrix.arch }}" || true
+      - name: Export verified platform digest
+        shell: bash
+        run: |
+          digest="${{ steps.build.outputs.digest }}"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build did not return an immutable platform digest: $digest" >&2
+            exit 1
+          fi
+          mkdir -p /tmp/release-digests
+          touch "/tmp/release-digests/${digest#sha256:}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-digest-${{ matrix.arch }}
+          path: /tmp/release-digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    needs: [validate, image-platform]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      reader-digest: ${{ steps.publish.outputs.reader-digest }}
+    steps:
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-digest-*
+          path: /tmp/release-digests
+          merge-multiple: true
+      - id: publish
+        name: Create the verified multi-platform candidate manifest
+        shell: bash
+        env:
+          STAGING_IMAGE_NAME: ${{ needs.validate.outputs.staging-image-name }}
+        run: |
+          mapfile -t digest_files < <(find /tmp/release-digests -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ "${#digest_files[@]}" -ne 2 ]]; then
+            echo "Expected two verified platform digests, found ${#digest_files[@]}." >&2
+            exit 1
+          fi
+          sources=()
+          for digest in "${digest_files[@]}"; do
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Invalid platform digest artifact: $digest" >&2
+              exit 1
+            fi
+            sources+=("${STAGING_IMAGE_NAME}@sha256:${digest}")
+          done
+          candidate="${STAGING_IMAGE_NAME}:candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          metadata_file="$(mktemp)"
+          manifest_file="$(mktemp)"
+          trap 'rm -f "$metadata_file" "$manifest_file"' EXIT
+          docker buildx imagetools create \
+            --metadata-file "$metadata_file" \
+            --tag "$candidate" \
+            "${sources[@]}"
+          reader_digest="$(jq -er '."containerimage.digest"' "$metadata_file")"
+          if [[ ! "$reader_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Candidate manifest has no immutable digest: $reader_digest" >&2
+            exit 1
+          fi
+          resolved_digest="$(docker buildx imagetools inspect "$candidate" --format '{{.Manifest.Digest}}')"
+          if [[ "$resolved_digest" != "$reader_digest" ]]; then
+            echo "Candidate tag resolved to $resolved_digest instead of $reader_digest." >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect --raw "$candidate" > "$manifest_file"
+          jq -e '
+            (.manifests // []) as $all
+            | ([$all[] | select(
+                .platform.os == "linux"
+                and (.platform.architecture == "amd64" or .platform.architecture == "arm64")
+              )]) as $images
+            | ([$all[] | select(
+                .platform.os == "unknown" and .platform.architecture == "unknown"
+              )]) as $attestations
+            | ([$images[] | "\(.platform.os)/\(.platform.architecture)"] | sort)
+                == ["linux/amd64", "linux/arm64"]
+              and ($all | length) == (($images | length) + ($attestations | length))
+              and ($attestations | length) == 2
+              and all($attestations[];
+                .annotations["vnd.docker.reference.type"] == "attestation-manifest"
+                and (.annotations["vnd.docker.reference.digest"] as $reference
+                  | any($images[]; .digest == $reference))
+              )
+              and all($images[]; .digest as $image_digest
+                | ([$attestations[] | select(
+                    .annotations["vnd.docker.reference.digest"] == $image_digest
+                  )] | length) == 1)
+          ' "$manifest_file"
+          docker pull --platform linux/amd64 "$candidate"
+          docker pull --platform linux/arm64 "$candidate"
+          echo "reader-digest=$reader_digest" >> "$GITHUB_OUTPUT"
 
   package:
     runs-on: ubuntu-latest
     needs: [validate, image]
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Create Compose release bundle
+      - run: mkdir -p dist
+      - uses: anchore/sbom-action@a930d0ac434e3182448fe678398ba5713717112a # v0.21.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/affogato-rss-reader-source.spdx.json
+      - name: Create Compose release bundle and checksums
         shell: bash
         run: |
           image_name="${{ needs.validate.outputs.image-name }}"
@@ -117,12 +251,92 @@ jobs:
           python scripts/build_release_bundle.py \
             --image-name "${image_name}" \
             --reader-digest "${reader_digest}" \
+            --source-sbom dist/affogato-rss-reader-source.spdx.json \
             --output-dir dist
-      - uses: anchore/sbom-action@a930d0ac434e3182448fe678398ba5713717112a # v0.21.0
+          cd dist
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          path: .
-          format: spdx-json
-          output-file: dist/affogato-rss-reader-source.spdx.json
+          name: release-assets
+          path: |
+            dist/*.tar.gz
+            dist/*.yaml
+            dist/SHA256SUMS
+            dist/*.spdx.json
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [validate, image, package]
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+      - uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-assets
+          path: dist
+      - id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ${{ needs.validate.outputs.image-name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - name: Publish version tags only after release assets pass
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ needs.validate.outputs.image-name }}
+          STAGING_IMAGE_NAME: ${{ needs.validate.outputs.staging-image-name }}
+          EXPECTED_DIGEST: ${{ needs.image.outputs.reader-digest }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAGS_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          if [[ ! "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Candidate manifest has no immutable digest: $EXPECTED_DIGEST" >&2
+            exit 1
+          fi
+          immutable_version_ref="${IMAGE_NAME}:${VERSION}"
+          if docker buildx imagetools inspect "$immutable_version_ref" >/dev/null 2>&1; then
+            echo "Refusing to overwrite existing immutable version tag: $immutable_version_ref" >&2
+            exit 1
+          fi
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$TAGS_JSON")
+          tag_args=()
+          for tag in "${tags[@]}"; do
+            tag_args+=(--tag "$tag")
+          done
+          metadata_file="$(mktemp)"
+          trap 'rm -f "$metadata_file"' EXIT
+          docker buildx imagetools create \
+            --metadata-file "$metadata_file" \
+            "${tag_args[@]}" \
+            "${STAGING_IMAGE_NAME}@${EXPECTED_DIGEST}"
+          copied_digest="$(jq -er '."containerimage.digest"' "$metadata_file")"
+          if [[ "$copied_digest" != "$EXPECTED_DIGEST" ]]; then
+            echo "Registry copy changed the manifest digest: $copied_digest" >&2
+            exit 1
+          fi
+          published_digest="$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" --format '{{.Manifest.Digest}}')"
+          if [[ "$published_digest" != "$EXPECTED_DIGEST" ]]; then
+            echo "Published manifest digest changed: $published_digest" >&2
+            exit 1
+          fi
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ${{ needs.validate.outputs.image-name }}
+          subject-digest: ${{ needs.image.outputs.reader-digest }}
+          push-to-registry: true
       - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
           generate_release_notes: true

@@ -22,6 +22,7 @@ from .llm import (
     get_feature_connection,
     get_llm_connection,
     list_llm_connections,
+    llm_request_limiter,
     set_encrypted_setting,
     stream_completion_text,
     unbind_llm_connection,
@@ -34,9 +35,6 @@ from .network_proxy import (
 )
 from .secrets import SecretKeyError
 
-_semaphore_lock = Lock()
-_provider_semaphores: dict[int, BoundedSemaphore] = {}
-
 TRANSLATION_RECORD_PROVIDER = "translation-chain"
 LEGACY_TRANSLATION_PROVIDER = "google-gtx"
 AVAILABLE_TRANSLATION_PROVIDERS = (
@@ -48,9 +46,8 @@ AVAILABLE_TRANSLATION_PROVIDERS = (
 
 
 def _translation_semaphore(limit: int) -> BoundedSemaphore:
-    limit = max(1, min(limit, 16))
-    with _semaphore_lock:
-        return _provider_semaphores.setdefault(limit, BoundedSemaphore(limit))
+    """Return the process-wide LLM limiter shared with brief generation."""
+    return llm_request_limiter(limit)
 
 
 class TranslationError(RuntimeError):
@@ -438,6 +435,15 @@ def _set_setting(db: Session, key: str, value: str) -> None:
         db.add(AppSetting(key=key, value=value))
 
 
+def _setting_has_value(db: Session, key: str, default: str | None = None) -> bool:
+    row = db.get(AppSetting, key)
+    return bool(row.value if row is not None else default)
+
+
+def _same_endpoint(left: str, right: str) -> bool:
+    return left.rstrip("/") == right.rstrip("/")
+
+
 def is_translation_enabled(db: Session, settings: Settings | None = None) -> bool:
     row = db.get(AppSetting, "translation_enabled")
     return (row.value.lower() == "true") if row else (settings or get_settings()).translation_enabled
@@ -475,14 +481,13 @@ def translation_configuration(
         if include_secrets and connection
         else (settings.translation_llm_api_key if include_secrets else None)
     )
-    deepl_row = db.get(AppSetting, "translation_deepl_api_key")
-    google_cloud_row = db.get(AppSetting, "translation_google_cloud_api_key")
-    deepl_configured = bool(
-        (deepl_row and deepl_row.value) or settings.deepl_api_key
+    deepl_configured = _setting_has_value(
+        db, "translation_deepl_api_key", settings.deepl_api_key
     )
-    google_cloud_configured = bool(
-        (google_cloud_row and google_cloud_row.value)
-        or settings.google_cloud_translation_api_key
+    google_cloud_configured = _setting_has_value(
+        db,
+        "translation_google_cloud_api_key",
+        settings.google_cloud_translation_api_key,
     )
     deepl_api_key = (
         encrypted_setting_value(
@@ -635,6 +640,17 @@ def build_selected_translation_provider(
             ),
         )
     if selected == "deepl":
+        configured_endpoint = str(config["deepl_endpoint"])
+        if (
+            deepl_endpoint is not None
+            and not _same_endpoint(deepl_endpoint, configured_endpoint)
+            and deepl_api_key is None
+            and config["deepl_api_key"]
+        ):
+            raise TranslationConfigurationError(
+                "Testing a different DeepL endpoint requires a new API key; "
+                "the saved key is bound to its existing endpoint"
+            )
         key = deepl_api_key or config["deepl_api_key"]
         if not key:
             if allow_unconfigured:
@@ -642,7 +658,7 @@ def build_selected_translation_provider(
             raise TranslationConfigurationError("DeepL API key is not configured")
         return DeepLProvider(
             settings,
-            endpoint=deepl_endpoint or str(config["deepl_endpoint"]),
+            endpoint=deepl_endpoint or configured_endpoint,
             api_key=str(key),
             route=http_route_for_translation_service(db, "deepl", settings),
         )
@@ -722,6 +738,21 @@ def configure_translation(
     settings: Settings | None = None,
 ) -> None:
     settings = settings or get_settings()
+    if deepl_endpoint is not None:
+        configured_endpoint = str(
+            _setting(db, "translation_deepl_endpoint", settings.deepl_endpoint)
+        )
+        if (
+            not _same_endpoint(deepl_endpoint, configured_endpoint)
+            and _setting_has_value(
+                db, "translation_deepl_api_key", settings.deepl_api_key
+            )
+            and deepl_api_key is None
+            and not clear_deepl_api_key
+        ):
+            raise ValueError(
+                "Changing the DeepL endpoint requires a new API key or explicit key removal"
+            )
     _set_setting(db, "translation_enabled", "true" if enabled else "false")
     if target:
         _set_setting(db, "translation_target", target)

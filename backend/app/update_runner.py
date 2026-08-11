@@ -8,12 +8,13 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import time
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -32,6 +33,11 @@ _SERVICE = "reader"
 _DOCKER_SOCKET = "/var/run/docker.sock"
 _READER_UID = 10001
 _READER_GID = 10001
+_MAX_REQUEST_BYTES = 64 * 1024
+_AUTO_INSTALL_DISABLED_MESSAGE = (
+    "Automatic installation is disabled until release manifests can be "
+    "independently signature-verified; install this release manually."
+)
 
 
 class UpdateRunnerError(RuntimeError):
@@ -40,9 +46,9 @@ class UpdateRunnerError(RuntimeError):
 
 @dataclass(frozen=True)
 class ValidatedCompose:
-    path: Path
+    snapshot: bytes
     reader_source: str
-    reader_tag: str
+    reader_image: str
     reader_service: dict[str, Any]
 
 
@@ -66,14 +72,6 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _safe_child(path: Path, root: Path) -> Path:
     resolved = path.resolve()
     if not resolved.is_relative_to(root.resolve()):
@@ -81,47 +79,341 @@ def _safe_child(path: Path, root: Path) -> Path:
     return resolved
 
 
-def _load_request(settings: Settings, path: Path) -> dict[str, Any]:
+def _load_request(
+    settings: Settings,
+    path: Path,
+    request_kind: Literal["download", "install"],
+) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        request = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as request_file:
+            metadata = os.fstat(request_file.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size < 1
+                or metadata.st_size > _MAX_REQUEST_BYTES
+            ):
+                raise UpdateRunnerError("The update request is not a small regular file.")
+            payload = request_file.read(_MAX_REQUEST_BYTES + 1)
+            if len(payload) > _MAX_REQUEST_BYTES:
+                raise UpdateRunnerError("The update request is too large.")
+        request = json.loads(payload.decode("utf-8"))
+    except UpdateRunnerError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise UpdateRunnerError("The update request is unreadable.") from exc
-    if not isinstance(request, dict) or request.get("schema_version") != 1:
+    if (
+        not isinstance(request, dict)
+        or type(request.get("schema_version")) is not int
+        or request.get("schema_version") != 1
+    ):
         raise UpdateRunnerError("The update request schema is unsupported.")
-    required = {
+    common_fields = {
+        "schema_version",
         "request_id",
         "version",
         "source_repository",
         "image_repository",
         "compose_path",
         "compose_digest",
+        "requested_at",
     }
-    if not required.issubset(request):
-        raise UpdateRunnerError("The update request is missing required fields.")
+    expected_fields = common_fields | ({"backup_path"} if request_kind == "install" else set())
+    if set(request) != expected_fields:
+        raise UpdateRunnerError(f"The {request_kind} request has unexpected fields.")
     if not re.fullmatch(r"[0-9a-f]{32}", str(request["request_id"])):
         raise UpdateRunnerError("The update request identifier is invalid.")
-    parse_version(str(request["version"]))
+    if not isinstance(request["version"], str):
+        raise UpdateRunnerError("The update request version is invalid.")
+    parse_version(request["version"])
     if request["source_repository"] != settings.update_github_repository:
         raise UpdateRunnerError("The update request referenced an untrusted source repository.")
     if request["image_repository"] != settings.update_image_repository:
         raise UpdateRunnerError("The update request referenced an untrusted image repository.")
     if not _DIGEST_RE.fullmatch(str(request["compose_digest"])):
         raise UpdateRunnerError("The update request contains an invalid digest.")
+    if not isinstance(request["compose_path"], str) or not request["compose_path"]:
+        raise UpdateRunnerError("The update request contains an invalid Compose path.")
+    requested_at = request["requested_at"]
+    if not isinstance(requested_at, str) or len(requested_at) > 64:
+        raise UpdateRunnerError("The update request timestamp is invalid.")
+    try:
+        parsed_requested_at = datetime.fromisoformat(requested_at)
+    except ValueError as exc:
+        raise UpdateRunnerError("The update request timestamp is invalid.") from exc
+    if parsed_requested_at.tzinfo is None:
+        raise UpdateRunnerError("The update request timestamp must include a timezone.")
+    if request_kind == "install" and (
+        not isinstance(request["backup_path"], str) or not request["backup_path"]
+    ):
+        raise UpdateRunnerError("The update request contains an invalid backup path.")
     return request
 
 
-def _service_volumes(service: dict[str, Any], name: str) -> set[str]:
-    volumes = service.get("volumes")
-    if not isinstance(volumes, list) or not all(isinstance(value, str) for value in volumes):
-        raise UpdateRunnerError(f"The {name} service volume configuration is invalid.")
-    return set(volumes)
+def _expected_reader_environment(settings: Settings) -> dict[str, str]:
+    return {
+        "FORWARDED_ALLOW_IPS": "${AFFOGATO_RSS_READER_FORWARDED_ALLOW_IPS:-127.0.0.1}",
+        "AFFOGATO_RSS_READER_ALLOWED_HOSTS": (
+            "${AFFOGATO_RSS_READER_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+        ),
+        "AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES": (
+            "${AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES:-3145728}"
+        ),
+        "AFFOGATO_RSS_READER_REQUEST_BODY_TIMEOUT_SECONDS": (
+            "${AFFOGATO_RSS_READER_REQUEST_BODY_TIMEOUT_SECONDS:-30}"
+        ),
+        "AFFOGATO_RSS_READER_FEED_MAX_RESPONSE_BYTES": (
+            "${AFFOGATO_RSS_READER_FEED_MAX_RESPONSE_BYTES:-5242880}"
+        ),
+        "AFFOGATO_RSS_READER_FEED_MAX_REDIRECTS": (
+            "${AFFOGATO_RSS_READER_FEED_MAX_REDIRECTS:-5}"
+        ),
+        "AFFOGATO_RSS_READER_FEED_MAX_ENTRIES": (
+            "${AFFOGATO_RSS_READER_FEED_MAX_ENTRIES:-1000}"
+        ),
+        "AFFOGATO_RSS_READER_FEED_TOTAL_TIMEOUT_SECONDS": (
+            "${AFFOGATO_RSS_READER_FEED_TOTAL_TIMEOUT_SECONDS:-60}"
+        ),
+        "AFFOGATO_RSS_READER_FEED_ALLOW_PRIVATE_NETWORKS": (
+            "${AFFOGATO_RSS_READER_FEED_ALLOW_PRIVATE_NETWORKS:-false}"
+        ),
+        "HTTP_PROXY": "${HTTP_PROXY:-}",
+        "HTTPS_PROXY": "${HTTPS_PROXY:-}",
+        "ALL_PROXY": "${ALL_PROXY:-}",
+        "NO_PROXY": "${NO_PROXY:-127.0.0.1,localhost}",
+        "AFFOGATO_RSS_READER_DATA_DIR": "/app/data",
+        "AFFOGATO_RSS_READER_TIMEZONE": "${AFFOGATO_RSS_READER_TIMEZONE:-UTC}",
+        "AFFOGATO_RSS_READER_AUTH_MODE": "${AFFOGATO_RSS_READER_AUTH_MODE:-owner}",
+        "AFFOGATO_RSS_READER_DEBUG": "${AFFOGATO_RSS_READER_DEBUG:-false}",
+        "AFFOGATO_RSS_READER_COOKIE_SECURE": (
+            "${AFFOGATO_RSS_READER_COOKIE_SECURE:-false}"
+        ),
+        "AFFOGATO_RSS_READER_SCHEDULER_ENABLED": (
+            "${AFFOGATO_RSS_READER_SCHEDULER_ENABLED:-true}"
+        ),
+        "AFFOGATO_RSS_READER_SYNC_ON_STARTUP": (
+            "${AFFOGATO_RSS_READER_SYNC_ON_STARTUP:-false}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_ENABLED": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_ENABLED:-false}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_TARGET": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_TARGET:-zh-CN}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_PROVIDER": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_PROVIDER:-google-gtx}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_FALLBACK_MODE": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_FALLBACK_MODE:-automatic}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_REQUEST_TIMEOUT_SECONDS": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_REQUEST_TIMEOUT_SECONDS:-30}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_MAX_ATTEMPTS": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_MAX_ATTEMPTS:-4}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_RETRY_BASE_SECONDS": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_RETRY_BASE_SECONDS:-2}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_LLM_BASE_URL": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_LLM_BASE_URL:-https://api.openai.com/v1}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_LLM_MODEL": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_LLM_MODEL:-gpt-4o-mini}"
+        ),
+        "AFFOGATO_RSS_READER_TRANSLATION_LLM_API_KEY": (
+            "${AFFOGATO_RSS_READER_TRANSLATION_LLM_API_KEY:-}"
+        ),
+        "AFFOGATO_RSS_READER_DEEPL_ENDPOINT": (
+            "${AFFOGATO_RSS_READER_DEEPL_ENDPOINT:-https://api-free.deepl.com/v2/translate}"
+        ),
+        "AFFOGATO_RSS_READER_DEEPL_API_KEY": (
+            "${AFFOGATO_RSS_READER_DEEPL_API_KEY:-}"
+        ),
+        "AFFOGATO_RSS_READER_GOOGLE_CLOUD_TRANSLATION_API_KEY": (
+            "${AFFOGATO_RSS_READER_GOOGLE_CLOUD_TRANSLATION_API_KEY:-}"
+        ),
+        "AFFOGATO_RSS_READER_LLM_SUMMARY_TIMEOUT_SECONDS": (
+            "${AFFOGATO_RSS_READER_LLM_SUMMARY_TIMEOUT_SECONDS:-30}"
+        ),
+        "AFFOGATO_RSS_READER_BRIEF_BATCH_CONCURRENCY": (
+            "${AFFOGATO_RSS_READER_BRIEF_BATCH_CONCURRENCY:-2}"
+        ),
+        "AFFOGATO_RSS_READER_BRIEF_LLM_MAX_ATTEMPTS": (
+            "${AFFOGATO_RSS_READER_BRIEF_LLM_MAX_ATTEMPTS:-4}"
+        ),
+        "AFFOGATO_RSS_READER_BRIEF_LLM_RETRY_BASE_SECONDS": (
+            "${AFFOGATO_RSS_READER_BRIEF_LLM_RETRY_BASE_SECONDS:-2}"
+        ),
+        "AFFOGATO_RSS_READER_SECRET_KEY_FILE": (
+            "${AFFOGATO_RSS_READER_SECRET_KEY_FILE:-/app/secrets/master.key}"
+        ),
+        "AFFOGATO_RSS_READER_SECRET_KEY_PREVIOUS_FILES": (
+            "${AFFOGATO_RSS_READER_SECRET_KEY_PREVIOUS_FILES:-}"
+        ),
+        "AFFOGATO_RSS_READER_CALL_LOG_FILE": (
+            "${AFFOGATO_RSS_READER_CALL_LOG_FILE:-/app/logs/llm-translation.jsonl}"
+        ),
+        "AFFOGATO_RSS_READER_CALL_LOG_MAX_BYTES": (
+            "${AFFOGATO_RSS_READER_CALL_LOG_MAX_BYTES:-10485760}"
+        ),
+        "AFFOGATO_RSS_READER_CALL_LOG_BACKUPS": (
+            "${AFFOGATO_RSS_READER_CALL_LOG_BACKUPS:-5}"
+        ),
+        "AFFOGATO_RSS_READER_BACKUP_KEEP_DAYS": (
+            "${AFFOGATO_RSS_READER_BACKUP_KEEP_DAYS:-30}"
+        ),
+        "AFFOGATO_RSS_READER_BACKUP_MAX_COUNT": (
+            "${AFFOGATO_RSS_READER_BACKUP_MAX_COUNT:-14}"
+        ),
+        "AFFOGATO_RSS_READER_BACKUP_MIN_COUNT": (
+            "${AFFOGATO_RSS_READER_BACKUP_MIN_COUNT:-2}"
+        ),
+        "AFFOGATO_RSS_READER_BACKUP_MAX_TOTAL_BYTES": (
+            "${AFFOGATO_RSS_READER_BACKUP_MAX_TOTAL_BYTES:-2147483648}"
+        ),
+        "AFFOGATO_RSS_READER_SQLITE_WAL_AUTOCHECKPOINT_PAGES": (
+            "${AFFOGATO_RSS_READER_SQLITE_WAL_AUTOCHECKPOINT_PAGES:-1000}"
+        ),
+        "AFFOGATO_RSS_READER_SQLITE_JOURNAL_SIZE_LIMIT_BYTES": (
+            "${AFFOGATO_RSS_READER_SQLITE_JOURNAL_SIZE_LIMIT_BYTES:-67108864}"
+        ),
+        "AFFOGATO_RSS_READER_UPDATE_CHECK_ENABLED": (
+            "${AFFOGATO_RSS_READER_UPDATE_CHECK_ENABLED:-true}"
+        ),
+        "AFFOGATO_RSS_READER_UPDATE_CHECK_HOUR": (
+            "${AFFOGATO_RSS_READER_UPDATE_CHECK_HOUR:-5}"
+        ),
+        "AFFOGATO_RSS_READER_UPDATE_CONTROL_DIR": "/app/update-control",
+        "AFFOGATO_RSS_READER_UPDATE_GITHUB_REPOSITORY": settings.update_github_repository,
+        "AFFOGATO_RSS_READER_UPDATE_IMAGE_REPOSITORY": settings.update_image_repository,
+    }
 
 
-def _service_tmpfs(service: dict[str, Any], name: str) -> set[str]:
-    tmpfs = service.get("tmpfs")
-    if not isinstance(tmpfs, list) or not all(isinstance(value, str) for value in tmpfs):
-        raise UpdateRunnerError(f"The {name} service tmpfs configuration is invalid.")
-    return {value.split(":", 1)[0] for value in tmpfs}
+def _expected_services(settings: Settings, image: str) -> dict[str, dict[str, Any]]:
+    depends_on = {"log-init": {"condition": "service_completed_successfully"}}
+    return {
+        "log-init": {
+            "image": image,
+            "user": "0:0",
+            "restart": "no",
+            "command": [
+                "sh",
+                "-c",
+                "mkdir -p /app/logs /app/update-control\n"
+                "chown 10001:10001 /app/logs\n"
+                "chmod 0700 /app/logs\n"
+                "chown 10001:0 /app/update-control\n"
+                "chmod 0770 /app/update-control\n",
+            ],
+            "volumes": [
+                "./logs:/app/logs",
+                "affogato-rss-reader-update-control:/app/update-control",
+            ],
+            "tmpfs": ["/app/data", "/app/secrets"],
+        },
+        "reader": {
+            "image": image,
+            "restart": "unless-stopped",
+            "depends_on": depends_on,
+            "ports": [
+                "${AFFOGATO_RSS_READER_BIND_ADDRESS:-127.0.0.1}:"
+                "${AFFOGATO_RSS_READER_PORT:-8787}:8787"
+            ],
+            "environment": _expected_reader_environment(settings),
+            "volumes": [
+                "affogato-rss-reader-data:/app/data",
+                "affogato-rss-reader-secrets:/app/secrets",
+                "affogato-rss-reader-update-control:/app/update-control",
+                "./logs:/app/logs",
+            ],
+        },
+        "updater": {
+            "image": image,
+            "profiles": ["release-updates"],
+            "user": "0:0",
+            "command": ["python", "-m", "backend.app.update_runner"],
+            "healthcheck": {"disable": True},
+            "restart": "unless-stopped",
+            "depends_on": depends_on,
+            "network_mode": "none",
+            "read_only": True,
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "environment": {
+                "AFFOGATO_RSS_READER_DATA_DIR": "/app/data",
+                "AFFOGATO_RSS_READER_UPDATE_CONTROL_DIR": "/app/update-control",
+                "AFFOGATO_RSS_READER_UPDATE_WORKSPACE_DIR": "/workspace",
+                "AFFOGATO_RSS_READER_UPDATE_GITHUB_REPOSITORY": (
+                    settings.update_github_repository
+                ),
+                "AFFOGATO_RSS_READER_UPDATE_IMAGE_REPOSITORY": (
+                    settings.update_image_repository
+                ),
+            },
+            "volumes": [
+                "/var/run/docker.sock:/var/run/docker.sock",
+                "./:/workspace",
+                "affogato-rss-reader-data:/app/data:ro",
+                "affogato-rss-reader-update-control:/app/update-control",
+            ],
+            "tmpfs": ["/tmp", "/app/secrets"],
+        },
+    }
+
+
+def _reject_duplicate_yaml_keys(
+    node: yaml.Node | None,
+    *,
+    stack: set[int] | None = None,
+    seen: set[int] | None = None,
+    depth: int = 0,
+) -> None:
+    if depth > 64:
+        raise UpdateRunnerError("The Compose update asset is nested too deeply.")
+    if node is None:
+        return
+    stack = set() if stack is None else stack
+    seen = set() if seen is None else seen
+    identity = id(node)
+    if identity in stack:
+        raise UpdateRunnerError("The Compose update asset contains a recursive alias.")
+    if identity in seen:
+        raise UpdateRunnerError("The Compose update asset contains a YAML alias.")
+    seen.add(identity)
+    if not isinstance(node, (yaml.MappingNode, yaml.SequenceNode)):
+        return
+    stack.add(identity)
+    try:
+        if isinstance(node, yaml.MappingNode):
+            keys: set[str] = set()
+            for key_node, value_node in node.value:
+                if not isinstance(key_node, yaml.ScalarNode):
+                    raise UpdateRunnerError("The Compose update asset contains a non-scalar key.")
+                if key_node.value == "<<":
+                    raise UpdateRunnerError("The Compose update asset contains a YAML merge key.")
+                if key_node.value in keys:
+                    raise UpdateRunnerError("The Compose update asset contains duplicate keys.")
+                keys.add(key_node.value)
+                _reject_duplicate_yaml_keys(
+                    value_node,
+                    stack=stack,
+                    seen=seen,
+                    depth=depth + 1,
+                )
+        else:
+            for value_node in node.value:
+                _reject_duplicate_yaml_keys(
+                    value_node,
+                    stack=stack,
+                    seen=seen,
+                    depth=depth + 1,
+                )
+    finally:
+        stack.remove(identity)
 
 
 def _validate_compose(settings: Settings, request: dict[str, Any]) -> ValidatedCompose:
@@ -129,132 +421,84 @@ def _validate_compose(settings: Settings, request: dict[str, Any]) -> ValidatedC
     path = _safe_child(Path(str(request["compose_path"])), update_root)
     if path.name != "compose.yaml" or not path.is_file():
         raise UpdateRunnerError("The verified Compose update asset is unavailable.")
-    if _sha256(path) != str(request["compose_digest"]).removeprefix("sha256:"):
+    try:
+        snapshot = path.read_bytes()
+    except OSError as exc:
+        raise UpdateRunnerError("The verified Compose update asset is unavailable.") from exc
+    if not snapshot or len(snapshot) > 5 * 1024 * 1024:
+        raise UpdateRunnerError("The verified Compose update asset has an invalid size.")
+    if hashlib.sha256(snapshot).hexdigest() != str(request["compose_digest"]).removeprefix(
+        "sha256:"
+    ):
         raise UpdateRunnerError("The Compose update asset failed its final digest check.")
     try:
-        compose = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        compose_text = snapshot.decode("utf-8")
+        _reject_duplicate_yaml_keys(yaml.compose(compose_text, Loader=yaml.SafeLoader))
+        compose = yaml.safe_load(compose_text)
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
         raise UpdateRunnerError("The Compose update asset is invalid YAML.") from exc
-    if not isinstance(compose, dict) or compose.get("name") != _PROJECT:
+    expected_top_level = {
+        "name",
+        "x-reader-image",
+        "x-affogato-release",
+        "services",
+        "volumes",
+    }
+    if (
+        not isinstance(compose, dict)
+        or set(compose) != expected_top_level
+        or compose.get("name") != _PROJECT
+    ):
         raise UpdateRunnerError("The Compose update asset has an unexpected project name.")
-    forbidden_top_level = {"include", "networks", "secrets", "configs"}
-    if forbidden_top_level.intersection(compose):
-        raise UpdateRunnerError("The Compose update asset contains unsupported top-level resources.")
     release = compose.get("x-affogato-release")
-    if not isinstance(release, dict) or release.get("version") != str(request["version"]):
+    if not isinstance(release, dict):
         raise UpdateRunnerError("The Compose update asset has invalid release metadata.")
     reader_digest = str(release.get("reader-digest") or "")
-    if set(release) != {"version", "reader-digest"} or not _DIGEST_RE.fullmatch(reader_digest):
+    expected_release = {
+        "version": str(request["version"]),
+        "reader-digest": reader_digest,
+    }
+    if (
+        release != expected_release
+        or not _DIGEST_RE.fullmatch(reader_digest)
+    ):
         raise UpdateRunnerError("The Compose update asset is missing its immutable image digest.")
     services = compose.get("services")
     if not isinstance(services, dict) or set(services) != {"log-init", "reader", "updater"}:
         raise UpdateRunnerError("The Compose update asset has unexpected services.")
-    for name, service in services.items():
-        if not isinstance(service, dict):
-            raise UpdateRunnerError(f"The {name} service definition is invalid.")
-
     version = str(request["version"])
-    reader_image = f"{settings.update_image_repository}:{version}"
-    if any(services[name].get("image") != reader_image for name in services):
-        raise UpdateRunnerError("A service image does not match the requested release.")
+    reader_image = f"{settings.update_image_repository}:{version}@{reader_digest}"
     if compose.get("x-reader-image") != reader_image:
         raise UpdateRunnerError("The shared image reference does not match the requested release.")
-
-    forbidden = {"build", "privileged", "devices", "cap_add", "pid", "ipc", "entrypoint"}
-    for name, service in services.items():
-        found = forbidden.intersection(service)
-        if found:
-            raise UpdateRunnerError(
-                f"The {name} service contains forbidden settings: {', '.join(sorted(found))}."
-            )
-
-    supported_reader_fields = {
-        "image",
-        "restart",
-        "depends_on",
-        "ports",
-        "environment",
-        "volumes",
-        "user",
-        "command",
-        "working_dir",
-        "read_only",
-        "cap_drop",
-        "security_opt",
-        "tmpfs",
-        "network_mode",
-        "stop_grace_period",
-    }
-    unsupported_reader_fields = set(services["reader"]) - supported_reader_fields
-    if unsupported_reader_fields:
-        raise UpdateRunnerError(
-            "The reader service contains settings that automatic installation cannot safely "
-            f"apply: {', '.join(sorted(unsupported_reader_fields))}."
-        )
-
-    expected_volumes = {
-        "log-init": {
-            "./logs:/app/logs",
-            "affogato-rss-reader-update-control:/app/update-control",
-        },
-        "reader": {
-            "affogato-rss-reader-data:/app/data",
-            "affogato-rss-reader-secrets:/app/secrets",
-            "affogato-rss-reader-update-control:/app/update-control",
-            "./logs:/app/logs",
-        },
-        "updater": {
-            "/var/run/docker.sock:/var/run/docker.sock",
-            "./:/workspace",
-            "affogato-rss-reader-data:/app/data:ro",
-            "affogato-rss-reader-update-control:/app/update-control",
-        },
-    }
-    for name, expected in expected_volumes.items():
-        if _service_volumes(services[name], name) != expected:
-            raise UpdateRunnerError(f"The {name} service has unexpected mounts.")
-
-    expected_tmpfs = {
-        "log-init": {"/app/data", "/app/secrets"},
-        "updater": {"/tmp", "/app/secrets"},
-    }
-    for name, expected in expected_tmpfs.items():
-        if _service_tmpfs(services[name], name) != expected:
-            raise UpdateRunnerError(f"The {name} service has unexpected tmpfs mounts.")
-
-    updater = services["updater"]
-    if updater.get("network_mode") != "none" or updater.get("ports"):
-        raise UpdateRunnerError("The update helper must have networking disabled and no ports.")
-    if updater.get("user") != "0:0" or updater.get("read_only") is not True:
-        raise UpdateRunnerError("The update helper must use its restricted root configuration.")
-    if updater.get("command") != ["python", "-m", "backend.app.update_runner"]:
-        raise UpdateRunnerError("The update helper command is unexpected.")
-    if "ALL" not in (updater.get("cap_drop") or []):
-        raise UpdateRunnerError("The update helper must drop Linux capabilities.")
-    if "no-new-privileges:true" not in (updater.get("security_opt") or []):
-        raise UpdateRunnerError("The update helper must disable privilege escalation.")
-    expected_updater_environment = {
-        "AFFOGATO_RSS_READER_DATA_DIR": "/app/data",
-        "AFFOGATO_RSS_READER_UPDATE_CONTROL_DIR": "/app/update-control",
-        "AFFOGATO_RSS_READER_UPDATE_WORKSPACE_DIR": "/workspace",
-        "AFFOGATO_RSS_READER_UPDATE_GITHUB_REPOSITORY": settings.update_github_repository,
-        "AFFOGATO_RSS_READER_UPDATE_IMAGE_REPOSITORY": settings.update_image_repository,
-    }
-    if updater.get("environment") != expected_updater_environment:
-        raise UpdateRunnerError("The update helper environment is unexpected.")
-
+    expected_services = _expected_services(settings, reader_image)
+    for name, expected in expected_services.items():
+        if services.get(name) != expected:
+            raise UpdateRunnerError(f"The {name} service definition is not an approved release shape.")
     declared_volumes = compose.get("volumes")
     expected_named_volumes = {
-        "affogato-rss-reader-data",
-        "affogato-rss-reader-secrets",
-        "affogato-rss-reader-update-control",
+        "affogato-rss-reader-data": None,
+        "affogato-rss-reader-secrets": None,
+        "affogato-rss-reader-update-control": None,
     }
-    if not isinstance(declared_volumes, dict) or set(declared_volumes) != expected_named_volumes:
+    if declared_volumes != expected_named_volumes:
         raise UpdateRunnerError("The Compose update asset has unexpected named volumes.")
+    canonical_compose = {
+        "name": _PROJECT,
+        "x-reader-image": reader_image,
+        "x-affogato-release": expected_release,
+        "services": expected_services,
+        "volumes": expected_named_volumes,
+    }
+    canonical_snapshot = yaml.safe_dump(
+        canonical_compose,
+        allow_unicode=False,
+        default_flow_style=False,
+        sort_keys=False,
+    ).encode("utf-8")
     return ValidatedCompose(
-        path=path,
+        snapshot=canonical_snapshot,
         reader_source=f"{settings.update_image_repository}@{reader_digest}",
-        reader_tag=reader_image,
+        reader_image=reader_image,
         reader_service=deepcopy(services["reader"]),
     )
 
@@ -315,7 +559,7 @@ def _verify_image(
         raise UpdateRunnerError("The downloaded image version label does not match the release.")
     if labels.get("org.opencontainers.image.source") != expected_source:
         raise UpdateRunnerError("The downloaded image source label is untrusted.")
-    if labels.get("org.opencontainers.image.licenses") != "MIT":
+    if labels.get("org.opencontainers.image.licenses") != "MIT AND Apache-2.0":
         raise UpdateRunnerError("The downloaded image license label is unexpected.")
     if expected_digest_ref is not None:
         repo_digests = payload.get("RepoDigests")
@@ -362,14 +606,6 @@ def _download_images(
             str(request["version"]),
             expected_digest_ref=validated.reader_source,
         )
-        repository, tag = validated.reader_tag.rsplit(":", 1)
-        _engine_request(
-            client,
-            "POST",
-            f"/images/{quote(validated.reader_source, safe='')}/tag",
-            params={"repo": repository, "tag": tag},
-        )
-        _verify_image(client, settings, validated.reader_tag, str(request["version"]))
     finally:
         if owns_client:
             client.close()
@@ -695,7 +931,7 @@ def _wait_until_ready(client: httpx.Client, container_id: str, timeout: float = 
     raise UpdateRunnerError("The replacement reader did not become healthy in time.")
 
 
-def _replace_compose_file(settings: Settings, asset: Path) -> tuple[Path, Path]:
+def _replace_compose_file(settings: Settings, snapshot: bytes) -> tuple[Path, Path]:
     workspace = settings.update_workspace_dir.resolve()
     target = _safe_child(workspace / "compose.yaml", workspace)
     if not target.is_file():
@@ -705,7 +941,7 @@ def _replace_compose_file(settings: Settings, asset: Path) -> tuple[Path, Path]:
     shutil.copy2(target, temporary_backup)
     os.replace(temporary_backup, previous)
     temporary_target = _safe_child(workspace / f".compose.{uuid4().hex}.tmp", workspace)
-    shutil.copy2(asset, temporary_target)
+    temporary_target.write_bytes(snapshot)
     os.replace(temporary_target, target)
     return target, previous
 
@@ -726,7 +962,7 @@ def _verify_backup(settings: Settings, request: dict[str, Any]) -> None:
         raise UpdateRunnerError("The required pre-update backup is unavailable.")
 
 
-def _install(
+def _install_after_manifest_verification(
     settings: Settings,
     request: dict[str, Any],
     *,
@@ -749,7 +985,7 @@ def _install(
         _verify_image(
             client,
             settings,
-            validated.reader_tag,
+            validated.reader_source,
             str(request["version"]),
             expected_digest_ref=validated.reader_source,
         )
@@ -758,7 +994,7 @@ def _install(
         old_name = str(current.get("Name") or "").lstrip("/")
         if not old_id or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]+", old_name):
             raise UpdateRunnerError("The managed reader container name is invalid.")
-        target, previous = _replace_compose_file(settings, validated.path)
+        target, previous = _replace_compose_file(settings, validated.snapshot)
         rollback_name = f"{old_name}-rollback-{str(request['request_id'])[:8]}"
         _engine_request(
             client,
@@ -781,7 +1017,7 @@ def _install(
             params={"name": old_name},
             json=_new_container_payload(
                 current,
-                validated.reader_tag,
+                validated.reader_image,
                 validated.reader_service,
                 settings.update_workspace_dir,
             ),
@@ -837,6 +1073,16 @@ def _install(
             client.close()
 
 
+def _install(
+    settings: Settings,
+    request: dict[str, Any],
+    *,
+    client: httpx.Client | None = None,
+) -> None:
+    del settings, request, client
+    raise UpdateRunnerError(_AUTO_INSTALL_DISABLED_MESSAGE)
+
+
 def _write_result(
     filename: str,
     control_dir: Path,
@@ -863,10 +1109,26 @@ def _process_request(
     path: Path,
     result_filename: str,
     operation: Any,
+    request_kind: Literal["download", "install"],
 ) -> None:
     request: dict[str, Any] = {}
+    claimed = path.with_name(f".{path.name}.{uuid4().hex}.claimed")
     try:
-        request = _load_request(settings, path)
+        os.replace(path, claimed)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.exception("Could not atomically claim the update request")
+        _write_result(
+            result_filename,
+            settings.effective_update_control_dir,
+            request,
+            success=False,
+            error=str(exc)[:1000] or exc.__class__.__name__,
+        )
+        return
+    try:
+        request = _load_request(settings, claimed, request_kind)
         logger.info("Processing Affogato RSS Reader %s update to %s", path.stem, request["version"])
         operation(settings, request)
         _write_result(result_filename, settings.effective_update_control_dir, request, success=True, error=None)
@@ -881,7 +1143,7 @@ def _process_request(
         )
     finally:
         try:
-            path.unlink()
+            claimed.unlink()
         except OSError:
             pass
 
@@ -900,9 +1162,21 @@ def run() -> None:
             {"schema_version": 1, "updated_at": _iso_now()},
         )
         if download_path.is_file():
-            _process_request(settings, download_path, "download-result.json", _download_images)
+            _process_request(
+                settings,
+                download_path,
+                "download-result.json",
+                _download_images,
+                "download",
+            )
         if install_path.is_file():
-            _process_request(settings, install_path, "install-result.json", _install)
+            _process_request(
+                settings,
+                install_path,
+                "install-result.json",
+                _install,
+                "install",
+            )
         time.sleep(settings.update_runner_poll_seconds)
 
 

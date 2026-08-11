@@ -61,6 +61,7 @@ function renderSidebar(
   const onSourceSort = vi.fn();
   const onReorderFeeds = vi.fn();
   const onOpenBriefs = vi.fn();
+  const onRefreshAll = vi.fn();
   render(<Sidebar
     locale="zh-CN"
     feeds={feeds}
@@ -90,12 +91,12 @@ function renderSidebar(
     onClearDomains={vi.fn()}
     onSourceSort={onSourceSort}
     onReorderFeeds={onReorderFeeds}
-    onManageFeeds={vi.fn()}
     onOpenBriefs={onOpenBriefs}
     onOpenSettings={vi.fn()}
     onLogout={vi.fn()}
+    onRefreshAll={onRefreshAll}
   />);
-  return { onSelectFolder, onSourceSort, onReorderFeeds, onOpenBriefs };
+  return { onSelectFolder, onSourceSort, onReorderFeeds, onOpenBriefs, onRefreshAll };
 }
 
 describe("Sidebar source folders", () => {
@@ -107,6 +108,16 @@ describe("Sidebar source folders", () => {
     expect(button).toBeEnabled();
     await user.click(button);
     expect(onOpenBriefs).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes every feed from the sources heading", async () => {
+    const user = userEvent.setup();
+    const { onRefreshAll } = renderSidebar();
+
+    const button = screen.getByRole("button", { name: "全部刷新" });
+    expect(button).toBeEnabled();
+    await user.click(button);
+    expect(onRefreshAll).toHaveBeenCalledOnce();
   });
 
   it("shows only the brief navigation item as active in the brief workspace", () => {

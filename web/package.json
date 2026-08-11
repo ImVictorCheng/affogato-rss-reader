@@ -1,10 +1,13 @@
 {
   "name": "affogato-rss-reader-web",
   "private": true,
-  "version": "0.3.1",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
+    "prepare:mathjax": "node scripts/prepare-mathjax.mjs",
+    "predev": "npm run prepare:mathjax",
     "dev": "vite",
+    "prebuild": "npm run prepare:mathjax",
     "build": "tsc -b && vite build",
     "check:ui": "node scripts/check-ui-conventions.mjs",
     "typecheck": "tsc -b --pretty false",
@@ -15,10 +18,12 @@
     "test:e2e:install": "playwright install chromium"
   },
   "dependencies": {
+    "mathjax": "3.2.2",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "remark-math": "6.0.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.54.2",
@@ -32,5 +37,8 @@
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
     "vitest": "^3.2.4"
+  },
+  "overrides": {
+    "nanoid": "3.3.17"
   }
 }

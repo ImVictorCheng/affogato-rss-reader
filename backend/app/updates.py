@@ -25,6 +25,11 @@ GITHUB_API_VERSION = "2026-03-10"
 UPDATE_STATE_SCHEMA = 1
 MAX_COMPOSE_ASSET_BYTES = 5 * 1024 * 1024
 UPDATER_HEARTBEAT_MAX_AGE_SECONDS = 15
+MAX_RESULT_BYTES = 64 * 1024
+AUTOMATIC_INSTALL_UNAVAILABLE_REASON = (
+    "Automatic installation is disabled until release manifests can be "
+    "independently signature-verified; install this release manually."
+)
 _VERSION_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 _STATE_LOCK = threading.RLock()
 _CHECK_LOCK = threading.Lock()
@@ -162,17 +167,44 @@ def updater_is_available(settings: Settings | None = None) -> bool:
         return False
 
 
+def _read_result(path: Path) -> dict[str, Any] | None:
+    """Read a helper result defensively; the control directory is reader-writable."""
+    try:
+        stat = path.lstat()
+        if not path.is_file() or path.is_symlink() or stat.st_size > MAX_RESULT_BYTES:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    required = {"schema_version", "request_id", "version", "success"}
+    if set(value) - (required | {"finished_at", "error"}) or not required <= value.keys():
+        return None
+    if value["schema_version"] != UPDATE_STATE_SCHEMA or not isinstance(value["request_id"], str):
+        return None
+    if not isinstance(value["version"], str) or not isinstance(value["success"], bool):
+        return None
+    if "finished_at" in value and value["finished_at"] is not None and not isinstance(value["finished_at"], str):
+        return None
+    if "error" in value and value["error"] is not None and not isinstance(value["error"], str):
+        return None
+    return value
+
+
 def _consume_install_result(settings: Settings, state: dict[str, Any]) -> dict[str, Any]:
     result_path = settings.effective_update_control_dir / "install-result.json"
-    try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return state
-    if not isinstance(result, dict):
+    result = _read_result(result_path)
+    if result is None:
         return state
     requested_version = str(result.get("version") or "")
     request_id = str(result.get("request_id") or "")
-    if state.get("request_id") and request_id != state.get("request_id"):
+    if not state.get("request_id") or request_id != state.get("request_id"):
+        return state
+    try:
+        if parse_version(requested_version) != parse_version(str(state.get("latest_version") or requested_version)):
+            return state
+    except ValueError:
         return state
     if result.get("success"):
         try:
@@ -204,14 +236,11 @@ def _consume_install_result(settings: Settings, state: dict[str, Any]) -> dict[s
 
 def _consume_download_result(settings: Settings, state: dict[str, Any]) -> dict[str, Any]:
     result_path = settings.effective_update_control_dir / "download-result.json"
-    try:
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return state
-    if not isinstance(result, dict):
+    result = _read_result(result_path)
+    if result is None:
         return state
     request_id = str(result.get("request_id") or "")
-    if state.get("download_request_id") and request_id != state.get("download_request_id"):
+    if not state.get("download_request_id") or request_id != state.get("download_request_id"):
         return state
     version = str(result.get("version") or "")
     if result.get("success"):
@@ -219,7 +248,7 @@ def _consume_download_result(settings: Settings, state: dict[str, Any]) -> dict[
             valid_version = parse_version(version) > parse_version(settings.version)
         except ValueError:
             valid_version = False
-        if valid_version and _asset_is_valid(settings, state):
+        if valid_version and version == str(state.get("latest_version")) and _asset_is_valid(settings, state):
             state.update(
                 status="downloaded",
                 images_downloaded_version=version,
@@ -267,7 +296,8 @@ def _public_status(settings: Settings, state: dict[str, Any]) -> dict[str, Any]:
         "installed_at": state.get("installed_at"),
         "downloaded": downloaded,
         "downloaded_bytes": state.get("asset_size") if downloaded else None,
-        "install_supported": updater_is_available(settings),
+        "install_supported": False,
+        "install_unavailable_reason": AUTOMATIC_INSTALL_UNAVAILABLE_REASON,
         "automatic_checks_enabled": settings.update_check_enabled,
         "check_hour": settings.update_check_hour,
         "error": state.get("error"),
@@ -511,7 +541,11 @@ def check_for_updates(
                 _write_state(settings, state)
                 return _public_status(settings, state)
 
-        expected_name = f"affogato-rss-reader-compose-{latest}.yaml"
+        # v0.3.1 and earlier accepted tag-only Compose images. Publishing the
+        # digest-pinned schema under a v2 asset name makes those clients fall
+        # back to an explicit manual migration instead of handing the asset to
+        # an incompatible, long-lived helper container.
+        expected_name = f"affogato-rss-reader-compose-v2-{latest}.yaml"
         assets = release.get("assets") if isinstance(release.get("assets"), list) else []
         asset = next(
             (item for item in assets if isinstance(item, dict) and item.get("name") == expected_name),
@@ -623,6 +657,12 @@ def update_check_due(
 
 def request_update_install(settings: Settings | None = None) -> dict[str, Any]:
     settings = settings or get_settings()
+    raise UpdateInstallUnavailable(AUTOMATIC_INSTALL_UNAVAILABLE_REASON)
+
+
+def _request_update_install_after_manifest_verification(
+    settings: Settings,
+) -> dict[str, Any]:
     with _STATE_LOCK:
         state = _read_state(settings)
         if state.get("status") != "downloaded" or not _asset_is_valid(settings, state):
@@ -654,7 +694,6 @@ def request_update_install(settings: Settings | None = None) -> dict[str, Any]:
             "image_repository": settings.update_image_repository,
             "compose_path": str(asset_path),
             "compose_digest": state["asset_digest"],
-            "release_url": state.get("release_url"),
             "backup_path": str(backup),
             "requested_at": requested_at,
         }

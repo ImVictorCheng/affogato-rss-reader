@@ -150,12 +150,23 @@ def save_network_proxy_config(
         )
 
     config = get_network_proxy_config(db)
+    normalized_username = username.strip() if username and username.strip() else None
+    if (
+        config is not None
+        and config.password_encrypted
+        and (normalized_url != config.url or normalized_username != config.username)
+        and password is None
+        and not clear_password
+    ):
+        raise ValueError(
+            "Changing the proxy URL or username requires a new password or explicit password removal"
+        )
     if config is None:
         config = NetworkProxyConfig(id=1)
         db.add(config)
     config.enabled = enabled
     config.url = normalized_url
-    config.username = username.strip() if username and username.strip() else None
+    config.username = normalized_username
     config.global_mode = global_mode
     config.translation_service_modes = {
         service: translation_service_modes.get(service, "direct")
@@ -253,12 +264,17 @@ def http_route_for_mode(
         return HttpRoute(proxy=None, trust_env=True)
     if mode == "custom":
         config = get_network_proxy_config(db)
-        if config and config.enabled:
-            return HttpRoute(
-                proxy=_custom_proxy_url(config, settings),
-                trust_env=False,
+        if config is None or not config.enabled:
+            raise ValueError(
+                "Custom proxy mode is selected, but the custom proxy is not enabled"
             )
-    return HttpRoute(proxy=None, trust_env=False)
+        return HttpRoute(
+            proxy=_custom_proxy_url(config, settings),
+            trust_env=False,
+        )
+    if mode == "direct":
+        return HttpRoute(proxy=None, trust_env=False)
+    raise ValueError(f"Unsupported proxy mode: {mode}")
 
 
 def http_route_for_feed(
@@ -319,14 +335,18 @@ def _resolve_test_proxy_url(
     if not normalized_url:
         raise ValueError("Proxy URL is required")
     config = get_network_proxy_config(db)
-    effective_password = (
-        password
-        if password is not None
-        else (_stored_password(config, settings) if use_saved_password else None)
-    )
+    normalized_username = username.strip() if username and username.strip() else None
+    effective_password = password
+    if password is None and use_saved_password and config and config.password_encrypted:
+        if normalized_url != config.url or normalized_username != config.username:
+            raise ValueError(
+                "Testing a different proxy URL or username requires a new password; "
+                "the saved password is bound to its existing target"
+            )
+        effective_password = _stored_password(config, settings)
     return _compose_proxy_url(
         normalized_url,
-        username.strip() if username and username.strip() else None,
+        normalized_username,
         effective_password,
     )
 

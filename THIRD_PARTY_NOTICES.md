@@ -4,6 +4,13 @@ Affogato RSS Reader is MIT licensed and includes open-source Python and JavaScri
 dependencies whose licenses are provided by their respective distributions.
 Release images include an SPDX software bill of materials for the exact build.
 
+Bundled runtime assets:
+
+- MathJax 3.2.2 is distributed under the Apache License 2.0. The complete
+  license text is included at `licenses/MathJax-APACHE-2.0.txt` in release
+  bundles, at `/vendor/mathjax/LICENSE` in the Web application, and under
+  `/usr/share/licenses/affogato-rss-reader/` in the container image.
+
 Optional external services and data sources:
 
 - DeepL, Google Cloud Translation, and user-configured OpenAI-compatible

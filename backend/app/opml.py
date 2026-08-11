@@ -15,6 +15,19 @@ from .sync import validate_http_url
 
 
 MAX_OPML_NESTING = 64
+MAX_OPML_OUTLINES = 10_000
+MAX_OPML_DOMAINS_PER_FEED = 100
+MAX_FEED_URL_CHARS = 4_096
+MAX_FEED_TITLE_CHARS = 500
+MAX_FOLDER_NAME_CHARS = 160
+MAX_DOMAIN_NAME_CHARS = 120
+
+
+def _bounded_text(value: str | None, *, label: str, max_chars: int) -> str | None:
+    normalized = value.strip() if value else ""
+    if len(normalized) > max_chars:
+        raise ValueError(f"OPML {label} exceeds the {max_chars}-character limit")
+    return normalized or None
 
 
 def _iter_outlines(body: ET.Element) -> Iterator[tuple[ET.Element, str | None]]:
@@ -101,7 +114,13 @@ def import_opml_document(db: Session, raw: bytes, settings: Settings) -> dict[st
     body = root.find("body")
     if body is None:
         raise ValueError("OPML body is missing")
-    outlines = list(_iter_outlines(body))
+    outlines: list[tuple[ET.Element, str | None]] = []
+    for outline in _iter_outlines(body):
+        if len(outlines) >= MAX_OPML_OUTLINES:
+            raise ValueError(
+                f"OPML contains more than {MAX_OPML_OUTLINES} outlines"
+            )
+        outlines.append(outline)
     imported = skipped = 0
     known_urls = set(db.scalars(select(Feed.url)))
     known_folders = set(db.scalars(select(Folder.name)))
@@ -113,14 +132,22 @@ def import_opml_document(db: Session, raw: bytes, settings: Settings) -> dict[st
     }
 
     for child, folder in outlines:
-        xml_url = child.attrib.get("xmlUrl") or child.attrib.get("xmlurl")
+        xml_url = _bounded_text(
+            child.attrib.get("xmlUrl") or child.attrib.get("xmlurl"),
+            label="feed URL",
+            max_chars=MAX_FEED_URL_CHARS,
+        )
         if not xml_url:
-            folder_name = (
-                child.attrib.get("title")
-                or child.attrib.get("text")
-                or folder
-                or ""
-            ).strip() or None
+            folder_name = _bounded_text(
+                (
+                    child.attrib.get("title")
+                    or child.attrib.get("text")
+                    or folder
+                    or ""
+                ),
+                label="folder name",
+                max_chars=MAX_FOLDER_NAME_CHARS,
+            )
             if folder_name and folder_name not in known_folders:
                 db.add(Folder(name=folder_name, position=len(known_folders)))
                 known_folders.add(folder_name)
@@ -133,12 +160,32 @@ def import_opml_document(db: Session, raw: bytes, settings: Settings) -> dict[st
         if xml_url in known_urls:
             skipped += 1
             continue
+        title = _bounded_text(
+            child.attrib.get("title") or child.attrib.get("text") or xml_url,
+            label="feed title",
+            max_chars=MAX_FEED_TITLE_CHARS,
+        )
+        site_url = _bounded_text(
+            child.attrib.get("htmlUrl"),
+            label="site URL",
+            max_chars=MAX_FEED_URL_CHARS,
+        )
+        if site_url:
+            try:
+                validate_http_url(site_url)
+            except ValueError:
+                site_url = None
+        folder_name = _bounded_text(
+            folder,
+            label="folder name",
+            max_chars=MAX_FOLDER_NAME_CHARS,
+        )
         feed = Feed(
-            title=child.attrib.get("title") or child.attrib.get("text") or xml_url,
+            title=title or xml_url,
             url=xml_url,
-            site_url=child.attrib.get("htmlUrl"),
-            folder=folder.strip() if folder else None,
-            position=next_positions.get(folder, 0),
+            site_url=site_url,
+            folder=folder_name,
+            position=next_positions.get(folder_name, 0),
             enabled=child.attrib.get("affogatoRssReaderEnabled", "true").lower() != "false",
             poll_interval_minutes=max(
                 15,
@@ -153,13 +200,26 @@ def import_opml_document(db: Session, raw: bytes, settings: Settings) -> dict[st
             ),
         )
         db.add(feed)
-        next_positions[folder] = feed.position + 1
+        next_positions[folder_name] = feed.position + 1
         db.flush()
-        for name in (
-            item.strip()
-            for item in child.attrib.get("affogatoRssReaderDomains", "").split(",")
-            if item.strip()
-        ):
+        domain_names = list(
+            dict.fromkeys(
+                item.strip()
+                for item in child.attrib.get(
+                    "affogatoRssReaderDomains", ""
+                ).split(",")
+                if item.strip()
+            )
+        )
+        if len(domain_names) > MAX_OPML_DOMAINS_PER_FEED:
+            raise ValueError(
+                f"OPML feed has more than {MAX_OPML_DOMAINS_PER_FEED} domains"
+            )
+        for name in domain_names:
+            if len(name) > MAX_DOMAIN_NAME_CHARS:
+                raise ValueError(
+                    f"OPML domain name exceeds the {MAX_DOMAIN_NAME_CHARS}-character limit"
+                )
             domain = db.scalar(
                 select(Domain).where(func.lower(Domain.name) == name.lower())
             )

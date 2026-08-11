@@ -234,6 +234,20 @@ export interface TranslationStatus {
   google_cloud_api_key_configured: boolean;
 }
 
+export interface AutoTagStatus {
+  enabled: boolean;
+  create_new: boolean;
+  llm_connection_id?: number | null;
+  llm_connection_name?: string | null;
+  model?: string | null;
+  configured: boolean;
+  max_tags_per_entry: number;
+  pending_count: number;
+  running_count: number;
+  complete_count: number;
+  failed_count: number;
+}
+
 export interface TranslationSettingsInput {
   enabled: boolean;
   target_language: string;
@@ -380,6 +394,8 @@ export interface BriefGenerationProgress {
   message?: string | null;
   can_retry?: boolean;
   attempt?: number;
+  stopped?: boolean;
+  schedule_id?: number | null;
 }
 
 export interface BriefConfiguration {
@@ -400,6 +416,7 @@ export interface BriefSchedule {
   period: BriefPeriod;
   timezone: string;
   cutoff_time: string;
+  start_time?: string | null;
   weekday?: number | null;
   month_day?: number | null;
   year_month?: number | null;
@@ -438,6 +455,7 @@ export interface UpdateStatus {
   downloaded: boolean;
   downloaded_bytes?: number | null;
   install_supported: boolean;
+  install_unavailable_reason?: string | null;
   automatic_checks_enabled: boolean;
   check_hour: number;
   error?: string | null;

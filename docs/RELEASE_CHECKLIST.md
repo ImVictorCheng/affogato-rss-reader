@@ -1,13 +1,13 @@
 # Release checklist
 
-Current candidate: `0.3.1`
-Database migration head: `0012`
+Current candidate: `0.4.0`
+Database migration head: `0014`
 
 ## Repository preparation
 
 - [x] Keep `VERSION`, backend metadata, frontend metadata, container defaults,
   Compose files, and user-facing version labels synchronized.
-- [x] Add the dated `0.3.1` section to `CHANGELOG.md`.
+- [ ] Add the dated `0.4.0` section to `CHANGELOG.md`.
 - [x] Update the empty-database container smoke test to require migration `0011`.
 - [x] Include the new migration in the backend package.
 - [x] Keep the release bundle pointed at the versioned GHCR image.
@@ -29,7 +29,7 @@ npm run test:e2e
 Then build the same development image shape used by Compose and run an
 empty-library health and migration smoke test.
 
-## `0.3.0` candidate verification
+## `0.4.0` candidate verification
 
 Verified locally on 2026-08-01:
 
@@ -67,7 +67,7 @@ Verified locally on 2026-08-01:
 ## Publishing
 
 1. Push the release-preparation commit and wait for every CI job to pass.
-2. Create and push the annotated tag `v0.3.1`.
+2. Create and push the annotated tag `v0.4.0`.
 3. Confirm that the Release workflow publishes the `amd64` and `arm64` image,
    provenance attestation, SBOM, Compose archive, and `SHA256SUMS`.
 4. Download the archive from the GitHub Release and verify its checksum before

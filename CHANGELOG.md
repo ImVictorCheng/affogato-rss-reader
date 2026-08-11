@@ -4,7 +4,19 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-08-02
+### Security
+
+- Bind published ports to loopback by default and enforce explicit Host, request-body,
+  feed-response, redirect, entry-count, and total-deadline boundaries
+- Publish digest-pinned Compose assets only after the exact multi-platform image
+  manifest has passed dependency audits, vulnerability scans, and smoke tests
+- Keep the Docker-socket updater behind an opt-in Compose profile and fail automatic
+  installation closed until an independently signed release manifest provides a
+  trust root; update checks and verified asset downloads remain available
+- Canonicalize strictly allowlisted Compose data before any future privileged install,
+  and atomically claim small, exact-schema update requests before processing them
+
+## [0.4.0] - 2026-08-02
 
 ### Added
 

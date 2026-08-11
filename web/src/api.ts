@@ -2,6 +2,7 @@ import type {
   ApiErrorBody,
   AppSettings,
   AuthStatus,
+  AutoTagStatus,
   Brief,
   BriefGenerationProgress,
   BriefConfiguration,
@@ -227,6 +228,9 @@ class ApiClient {
   refreshFeed(id: number) {
     return this.request<void>(`/feeds/${id}/refresh`, { method: "POST" });
   }
+  refreshAllFeeds() {
+    return this.request<{ refreshed: number }>("/feeds/refresh-all", { method: "POST" });
+  }
   downloadOpml() {
     return this.request<Blob>("/feeds/opml", {}, "blob");
   }
@@ -271,6 +275,12 @@ class ApiClient {
   createTag(name: string) {
     return this.request<Tag>("/tags", { method: "POST", body: JSON.stringify({ name }) });
   }
+  updateTag(id: number, patch: Partial<Pick<Tag, "name" | "color">>) {
+    return this.request<Tag>(`/tags/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+  }
+  deleteTag(id: number) {
+    return this.request<void>(`/tags/${id}`, { method: "DELETE" });
+  }
   addEntryTag(entryId: number, tagId: number) {
     return this.request<void>(`/entries/${entryId}/tags/${tagId}`, { method: "POST" });
   }
@@ -294,6 +304,12 @@ class ApiClient {
   }
   translationStatus() {
     return this.request<TranslationStatus>("/translations/status");
+  }
+  autoTagStatus() {
+    return this.request<AutoTagStatus>("/auto-tag/status");
+  }
+  setAutoTagStatus(settings: { enabled: boolean; create_new: boolean; llm_connection_id?: number | null }) {
+    return this.request<AutoTagStatus>("/auto-tag/status", { method: "PATCH", body: JSON.stringify(settings) });
   }
   setTranslation(settings: TranslationSettingsInput) {
     return this.request<TranslationStatus>("/translations/status", { method: "PATCH", body: JSON.stringify(settings) });
@@ -376,6 +392,18 @@ class ApiClient {
       { method: "POST" },
     );
   }
+  restartBriefGeneration(idempotencyKey: string) {
+    return this.request<Brief>(
+      `/briefs/generation-progress/${encodeURIComponent(idempotencyKey)}/restart`,
+      { method: "POST" },
+    );
+  }
+  stopBriefGeneration(idempotencyKey: string) {
+    return this.request<BriefGenerationProgress>(
+      `/briefs/generation-progress/${encodeURIComponent(idempotencyKey)}/stop`,
+      { method: "POST" },
+    );
+  }
   updateBrief(id: number, patch: { title?: string; notes?: string }) {
     return this.request<Brief>(`/briefs/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
   }
@@ -393,6 +421,12 @@ class ApiClient {
   }
   updateBriefSchedule(id: number, patch: Partial<BriefSchedule>) {
     return this.request<BriefSchedule>(`/brief-schedules/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
+  }
+  runBriefSchedule(scheduleId: number) {
+    return this.request<Brief>(`/brief-schedules/${scheduleId}/run`, { method: "POST" });
+  }
+  deleteBriefSchedule(id: number) {
+    return this.request<void>(`/brief-schedules/${id}`, { method: "DELETE" });
   }
   runDueBriefs() {
     return this.request<{ items: Brief[] }>("/brief-schedules/run-due", { method: "POST" });

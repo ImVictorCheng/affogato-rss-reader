@@ -1,13 +1,13 @@
 name: affogato-rss-reader
 
-x-reader-image: &reader-image ghcr.io/OWNER/affogato-rss-reader:0.3.1
+x-reader-image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
 x-affogato-release:
-  version: "0.3.1"
+  version: "0.4.0"
   reader-digest: READER_DIGEST
 
 services:
   log-init:
-    image: *reader-image
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
     user: "0:0"
     restart: "no"
     command:
@@ -16,7 +16,7 @@ services:
       - |
         mkdir -p /app/logs /app/update-control
         chown 10001:10001 /app/logs
-        chmod 0755 /app/logs
+        chmod 0700 /app/logs
         chown 10001:0 /app/update-control
         chmod 0770 /app/update-control
     volumes:
@@ -27,15 +27,23 @@ services:
       - /app/secrets
 
   reader:
-    image: *reader-image
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
     restart: unless-stopped
     depends_on:
       log-init:
         condition: service_completed_successfully
     ports:
-      - "${AFFOGATO_RSS_READER_BIND_ADDRESS:-0.0.0.0}:${AFFOGATO_RSS_READER_PORT:-8787}:8787"
+      - "${AFFOGATO_RSS_READER_BIND_ADDRESS:-127.0.0.1}:${AFFOGATO_RSS_READER_PORT:-8787}:8787"
     environment:
       FORWARDED_ALLOW_IPS: "${AFFOGATO_RSS_READER_FORWARDED_ALLOW_IPS:-127.0.0.1}"
+      AFFOGATO_RSS_READER_ALLOWED_HOSTS: "${AFFOGATO_RSS_READER_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES: "${AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES:-3145728}"
+      AFFOGATO_RSS_READER_REQUEST_BODY_TIMEOUT_SECONDS: "${AFFOGATO_RSS_READER_REQUEST_BODY_TIMEOUT_SECONDS:-30}"
+      AFFOGATO_RSS_READER_FEED_MAX_RESPONSE_BYTES: "${AFFOGATO_RSS_READER_FEED_MAX_RESPONSE_BYTES:-5242880}"
+      AFFOGATO_RSS_READER_FEED_MAX_REDIRECTS: "${AFFOGATO_RSS_READER_FEED_MAX_REDIRECTS:-5}"
+      AFFOGATO_RSS_READER_FEED_MAX_ENTRIES: "${AFFOGATO_RSS_READER_FEED_MAX_ENTRIES:-1000}"
+      AFFOGATO_RSS_READER_FEED_TOTAL_TIMEOUT_SECONDS: "${AFFOGATO_RSS_READER_FEED_TOTAL_TIMEOUT_SECONDS:-60}"
+      AFFOGATO_RSS_READER_FEED_ALLOW_PRIVATE_NETWORKS: "${AFFOGATO_RSS_READER_FEED_ALLOW_PRIVATE_NETWORKS:-false}"
       HTTP_PROXY: "${HTTP_PROXY:-}"
       HTTPS_PROXY: "${HTTPS_PROXY:-}"
       ALL_PROXY: "${ALL_PROXY:-}"
@@ -87,7 +95,8 @@ services:
       - ./logs:/app/logs
 
   updater:
-    image: *reader-image
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
+    profiles: ["release-updates"]
     user: "0:0"
     command: ["python", "-m", "backend.app.update_runner"]
     healthcheck:

@@ -12,14 +12,20 @@ from time import monotonic, sleep
 from typing import Callable
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings
-from .llm import BRIEF_FEATURE, LLMConnectionError, complete_feature_chat
+from .llm import (
+    BRIEF_FEATURE,
+    LLMConnectionError,
+    LLMRequestCancelled,
+    complete_feature_chat,
+)
 from .models import (
     Brief,
+    BriefGenerationCheckpoint,
     BriefItem,
     BriefSchedule,
     Domain,
@@ -29,8 +35,10 @@ from .models import (
     EntryTag,
     Feed,
     FeedDomain,
+    Job,
     Tag,
     Translation,
+    utcnow,
 )
 
 PERIODS = ("daily", "weekly", "monthly", "yearly")
@@ -44,6 +52,11 @@ BriefProgressCallback = Callable[[str, int, int, str | None], None]
 BriefStreamProgressCallback = Callable[[str, int, int, str, int], None]
 BriefCheckpointLoader = Callable[[str, str], str | None]
 BriefCheckpointSaver = Callable[[str, str, str], None]
+BriefShouldStop = Callable[[], bool]
+
+
+class BriefGenerationCancelled(Exception):
+    """Raised inside brief generation when the owner requested a stop."""
 PERIOD_TITLES = {
     "daily": "每日简报",
     "weekly": "每周简报",
@@ -100,10 +113,14 @@ def _complete_brief_chat(
     temperature: float = 0.2,
     retry_callback: Callable[[int, int, float, str], None] | None = None,
     stream_progress_callback: Callable[[int], None] | None = None,
+    should_stop: BriefShouldStop | None = None,
+    request_token: str | None = None,
 ) -> str:
     """Call the brief LLM with bounded retries for transient failures."""
     attempts = settings.brief_llm_max_attempts
     for attempt in range(1, attempts + 1):
+        if should_stop and should_stop():
+            raise BriefGenerationCancelled()
         try:
             return complete_feature_chat(
                 db,
@@ -114,8 +131,14 @@ def _complete_brief_chat(
                 temperature=temperature,
                 timeout_seconds=timeout_seconds,
                 stream_progress_callback=stream_progress_callback,
+                stop_check=should_stop,
+                request_token=request_token,
             )
+        except LLMRequestCancelled as exc:
+            raise BriefGenerationCancelled() from exc
         except LLMConnectionError as exc:
+            if should_stop and should_stop():
+                raise BriefGenerationCancelled() from exc
             if not exc.retryable or attempt >= attempts:
                 raise
             delay = min(
@@ -124,9 +147,22 @@ def _complete_brief_chat(
             )
             if retry_callback:
                 retry_callback(attempt + 1, attempts, delay, str(exc))
-            if delay:
-                sleep(delay)
+            if delay and _interruptible_sleep(delay, should_stop):
+                raise BriefGenerationCancelled()
     raise RuntimeError("Unreachable brief retry state")
+
+
+def _interruptible_sleep(seconds: float, should_stop: BriefShouldStop | None) -> bool:
+    """Sleep in small steps, aborting early when a stop was requested.
+
+    Returns True when the stop was requested during the sleep.
+    """
+    deadline = monotonic() + seconds
+    while monotonic() < deadline:
+        if should_stop and should_stop():
+            return True
+        sleep(min(0.2, deadline - monotonic()))
+    return False
 
 
 def brief_rule_path(settings: Settings | None = None) -> Path:
@@ -212,6 +248,9 @@ def _previous_boundary(schedule: BriefSchedule, boundary: datetime) -> datetime:
     zone = ZoneInfo(schedule.timezone)
     local = boundary.astimezone(zone)
     if schedule.period == "daily":
+        if schedule.start_time:
+            hour, minute = (int(part) for part in schedule.start_time.split(":"))
+            return local.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return local - timedelta(days=1)
     if schedule.period == "weekly":
         return local - timedelta(days=7)
@@ -221,24 +260,6 @@ def _previous_boundary(schedule: BriefSchedule, boundary: datetime) -> datetime:
         return local.replace(year=year, month=month, day=day)
     if schedule.period == "yearly":
         year = local.year - 1
-        day = min(schedule.month_day or 1, calendar.monthrange(year, local.month)[1])
-        return local.replace(year=year, day=day)
-    raise ValueError(f"Unsupported brief period: {schedule.period}")
-
-
-def _next_boundary(schedule: BriefSchedule, boundary: datetime) -> datetime:
-    zone = ZoneInfo(schedule.timezone)
-    local = boundary.astimezone(zone)
-    if schedule.period == "daily":
-        return local + timedelta(days=1)
-    if schedule.period == "weekly":
-        return local + timedelta(days=7)
-    if schedule.period == "monthly":
-        year, month = (local.year + 1, 1) if local.month == 12 else (local.year, local.month + 1)
-        day = min(schedule.month_day or 1, calendar.monthrange(year, month)[1])
-        return local.replace(year=year, month=month, day=day)
-    if schedule.period == "yearly":
-        year = local.year + 1
         day = min(schedule.month_day or 1, calendar.monthrange(year, local.month)[1])
         return local.replace(year=year, day=day)
     raise ValueError(f"Unsupported brief period: {schedule.period}")
@@ -714,6 +735,8 @@ def _summarize_brief_batches(
     stream_progress_callback: BriefStreamProgressCallback | None = None,
     checkpoint_loader: BriefCheckpointLoader | None = None,
     checkpoint_saver: BriefCheckpointSaver | None = None,
+    should_stop: BriefShouldStop | None = None,
+    request_token: str | None = None,
 ) -> list[str]:
     observations = [""] * len(prompts)
     prompt_hashes = [
@@ -728,6 +751,8 @@ def _summarize_brief_batches(
     bind = db.get_bind()
 
     def summarize(index: int, system_prompt: str, user_prompt: str) -> tuple[int, str]:
+        if should_stop and should_stop():
+            raise BriefGenerationCancelled()
         with Session(bind=bind) as batch_db:
             value = _complete_brief_chat(
                 batch_db,
@@ -736,6 +761,8 @@ def _summarize_brief_batches(
                 settings=settings,
                 temperature=0.1,
                 timeout_seconds=timeout_seconds,
+                should_stop=should_stop,
+                request_token=request_token,
                 stream_progress_callback=(
                     (
                         lambda received_chars: stream_progress_callback(
@@ -780,11 +807,15 @@ def _summarize_brief_batches(
             index = futures[future]
             try:
                 result_index, observation = future.result()
+            except BriefGenerationCancelled:
+                raise
             except LLMConnectionError as exc:
                 if first_error is None:
                     first_error = (index, exc)
                 continue
             observations[result_index] = observation
+            if should_stop and should_stop():
+                raise BriefGenerationCancelled()
             if checkpoint_saver:
                 checkpoint_saver(
                     "batch",
@@ -829,9 +860,13 @@ def create_brief(
     progress_callback: BriefProgressCallback | None = None,
     checkpoint_loader: BriefCheckpointLoader | None = None,
     checkpoint_saver: BriefCheckpointSaver | None = None,
+    should_stop: BriefShouldStop | None = None,
+    request_token: str | None = None,
 ) -> Brief:
     if period not in PERIODS:
         raise ValueError(f"period must be one of: {', '.join(PERIODS)}")
+    if should_stop and should_stop():
+        raise BriefGenerationCancelled()
     filters = filters or {}
     existing = None
     if idempotency_key:
@@ -866,6 +901,8 @@ def create_brief(
         MAX_BRIEF_LLM_REQUEST_SECONDS,
     )
     if included_entries == len(entries):
+        if should_stop and should_stop():
+            raise BriefGenerationCancelled()
         if progress_callback:
             progress_callback("finalizing", 0, 1, None)
         final_key = _prompt_hash(system_prompt, user_prompt)
@@ -878,6 +915,8 @@ def create_brief(
                     user_prompt=user_prompt,
                     settings=resolved_settings,
                     timeout_seconds=timeout_seconds,
+                    should_stop=should_stop,
+                    request_token=request_token,
                     retry_callback=(
                         (
                             lambda attempt, attempts, delay, _error: progress_callback(
@@ -931,6 +970,8 @@ def create_brief(
             stream_progress_callback=stream_progress_callback,
             checkpoint_loader=checkpoint_loader,
             checkpoint_saver=checkpoint_saver,
+            should_stop=should_stop,
+            request_token=request_token,
         )
 
         for _reduction_round in range(1, MAX_REDUCTION_ROUNDS + 1):
@@ -970,6 +1011,8 @@ def create_brief(
             ):
                 if consolidated[group_index]:
                     continue
+                if should_stop and should_stop():
+                    raise BriefGenerationCancelled()
                 value = _complete_brief_chat(
                     db,
                     system_prompt=group_system,
@@ -977,6 +1020,8 @@ def create_brief(
                     settings=resolved_settings,
                     temperature=0.1,
                     timeout_seconds=timeout_seconds,
+                    should_stop=should_stop,
+                    request_token=request_token,
                     retry_callback=(
                         (
                             lambda attempt, attempts, delay, _error: progress_callback(
@@ -1029,6 +1074,8 @@ def create_brief(
 
         if progress_callback:
             progress_callback("finalizing", 0, 1, None)
+        if should_stop and should_stop():
+            raise BriefGenerationCancelled()
         final_key = _prompt_hash(reduce_system, reduce_user)
         summary = checkpoint_loader("final", final_key) if checkpoint_loader else None
         if not summary:
@@ -1039,6 +1086,8 @@ def create_brief(
                     user_prompt=reduce_user,
                     settings=resolved_settings,
                     timeout_seconds=timeout_seconds,
+                    should_stop=should_stop,
+                    request_token=request_token,
                     retry_callback=(
                         (
                             lambda attempt, attempts, delay, _error: progress_callback(
@@ -1127,6 +1176,8 @@ def create_manual_brief(
     progress_callback: BriefProgressCallback | None = None,
     checkpoint_loader: BriefCheckpointLoader | None = None,
     checkpoint_saver: BriefCheckpointSaver | None = None,
+    should_stop: BriefShouldStop | None = None,
+    request_token: str | None = None,
 ) -> Brief:
     settings = settings or get_settings()
     if (start_at is None) != (end_at is None):
@@ -1154,40 +1205,238 @@ def create_manual_brief(
         progress_callback=progress_callback,
         checkpoint_loader=checkpoint_loader,
         checkpoint_saver=checkpoint_saver,
+        should_stop=should_stop,
+        request_token=request_token,
     )
 
 
-def run_due_schedules(
+def execute_brief_generation(
     db: Session,
     *,
-    at: datetime | None = None,
-) -> list[Brief]:
-    created: list[Brief] = []
-    for schedule in db.scalars(
-        select(BriefSchedule).where(BriefSchedule.enabled.is_(True)).order_by(BriefSchedule.id)
-    ):
-        latest_start, latest_end = schedule_window(schedule, at)
-        last_end = db.scalar(
-            select(func.max(Brief.end_at)).where(Brief.schedule_id == schedule.id)
+    job: Job,
+    settings: Settings,
+    brief_factory: Callable[
+        [
+            BriefProgressCallback | None,
+            BriefCheckpointLoader | None,
+            BriefCheckpointSaver | None,
+            BriefShouldStop | None,
+            str | None,
+        ],
+        Brief,
+    ],
+) -> dict:
+    """Run one brief generation job with progress and checkpoint support.
+
+    The factory receives the progress/checkpoint/stop callbacks and returns
+    the created Brief. Exceptions are recorded on the job before being
+    re-raised; an owner-requested stop raises BriefGenerationCancelled with
+    the job marked failed and ``result["stopped"]`` set, keeping the saved
+    checkpoints so the owner can resume or restart.
+    """
+    progress_lock = Lock()
+    progress_bind = db.get_bind()
+
+    def report_progress(
+        stage: str,
+        completed: int,
+        total: int,
+        message: str | None,
+    ) -> None:
+        with progress_lock:
+            with Session(bind=progress_bind) as progress_db:
+                current = progress_db.get(Job, job.id)
+                if current is None:
+                    return
+                current.result = {
+                    **(current.result or {}),
+                    "progress": {
+                        "stage": stage,
+                        "completed": completed,
+                        "total": total,
+                        "message": message,
+                    },
+                }
+                progress_db.commit()
+
+    def load_checkpoint(stage: str, prompt_hash: str) -> str | None:
+        return db.scalar(
+            select(BriefGenerationCheckpoint.content).where(
+                BriefGenerationCheckpoint.job_id == job.id,
+                BriefGenerationCheckpoint.stage == stage,
+                BriefGenerationCheckpoint.prompt_hash == prompt_hash,
+            )
         )
-        windows: list[tuple[datetime, datetime]] = []
-        if last_end is None:
-            windows.append((latest_start, latest_end))
+
+    def save_checkpoint(stage: str, prompt_hash: str, content: str) -> None:
+        checkpoint = db.scalar(
+            select(BriefGenerationCheckpoint).where(
+                BriefGenerationCheckpoint.job_id == job.id,
+                BriefGenerationCheckpoint.stage == stage,
+                BriefGenerationCheckpoint.prompt_hash == prompt_hash,
+            )
+        )
+        if checkpoint is None:
+            checkpoint = BriefGenerationCheckpoint(
+                job_id=job.id,
+                stage=stage,
+                prompt_hash=prompt_hash,
+                content=content,
+            )
+            db.add(checkpoint)
         else:
-            cursor = last_end.replace(tzinfo=UTC)
-            while cursor.replace(tzinfo=None) < latest_end:
-                next_end = _next_boundary(schedule, cursor)
-                windows.append(
-                    (
-                        cursor.astimezone(UTC).replace(tzinfo=None),
-                        next_end.astimezone(UTC).replace(tzinfo=None),
-                    )
+            checkpoint.content = content
+        db.commit()
+
+    def should_stop() -> bool:
+        with Session(bind=progress_bind) as check_db:
+            row = check_db.get(Job, job.id)
+            return bool(row and (row.payload or {}).get("stop_requested"))
+
+    def fail_job(message: str, *, stopped: bool = False) -> None:
+        db.rollback()
+        current = db.get(Job, job.id, populate_existing=True)
+        if current is None:
+            return
+        current.status = "failed"
+        current.error = message[:4000]
+        current.result = {
+            **(current.result or {}),
+            "stopped": stopped,
+        }
+        current.finished_at = utcnow()
+        db.commit()
+
+    try:
+        brief = brief_factory(
+            report_progress,
+            load_checkpoint,
+            save_checkpoint,
+            should_stop,
+            f"brief-{job.id}",
+        )
+    except BriefGenerationCancelled:
+        fail_job("Generation stopped by owner", stopped=True)
+        raise
+    except ValueError as exc:
+        fail_job(str(exc))
+        raise
+    except LLMConnectionError as exc:
+        fail_job(str(exc))
+        raise
+    except Exception as exc:
+        fail_job(str(exc))
+        raise
+    current = db.get(Job, job.id, populate_existing=True)
+    if current is not None:
+        current.status = "completed"
+        current.result = {
+            **(current.result or {}),
+            "progress": {
+                "stage": "finalizing",
+                "completed": 1,
+                "total": 1,
+            },
+            "brief_id": brief.id,
+        }
+        current.error = None
+        current.finished_at = utcnow()
+        db.execute(
+            delete(BriefGenerationCheckpoint).where(
+                BriefGenerationCheckpoint.job_id == job.id
+            )
+        )
+        db.commit()
+    return {"brief": brief}
+
+
+def brief_schedule_window_key(schedule_id: int, start_at: datetime, end_at: datetime) -> str:
+    return (
+        f"sched-{schedule_id}-"
+        f"{start_at:%Y%m%dT%H%M%SZ}-{end_at:%Y%m%dT%H%M%SZ}"
+    )
+
+
+def brief_generation_job_by_key(db: Session, idempotency_key: str) -> Job | None:
+    return db.scalar(
+        select(Job)
+        .where(
+            Job.kind == "brief_generation",
+            Job.payload["idempotency_key"].as_string() == idempotency_key,
+        )
+        .order_by(Job.created_at.desc(), Job.id.desc())
+        .limit(1)
+    )
+
+
+def _generate_scheduled_brief(
+    db: Session,
+    schedule: BriefSchedule,
+    start_at: datetime,
+    end_at: datetime,
+) -> Brief | None:
+    idempotency_key = brief_schedule_window_key(schedule.id, start_at, end_at)
+    existing_job = brief_generation_job_by_key(db, idempotency_key)
+    if existing_job is not None:
+        if existing_job.status == "running":
+            existing_brief = db.scalar(
+                select(Brief).where(
+                    Brief.schedule_id == schedule.id,
+                    Brief.start_at == start_at,
+                    Brief.end_at == end_at,
                 )
-                cursor = next_end
-        for start_at, end_at in windows:
-            if end_at > latest_end:
-                break
-            brief = create_brief(
+            )
+            if existing_brief is None:
+                raise RuntimeError("Brief generation is already running for this window")
+            return existing_brief
+        if (existing_job.result or {}).get("stopped"):
+            # The owner stopped this window; never auto-restart it. The owner
+            # resumes from checkpoints, restarts from scratch, or runs the
+            # schedule again manually.
+            return None
+    job = Job(
+        kind="brief_generation",
+        status="running",
+        payload={
+            "idempotency_key": idempotency_key,
+            "period": schedule.period,
+            "schedule_id": schedule.id,
+            "request": {
+                "schedule_id": schedule.id,
+                "period": schedule.period,
+                "start_at": start_at.isoformat(),
+                "end_at": end_at.isoformat(),
+                "filters": {
+                    "domain_ids": schedule.domain_ids,
+                    "feed_ids": schedule.feed_ids,
+                    "tag_ids": schedule.tag_ids,
+                    "domain_match": schedule.domain_match,
+                },
+                "title": f"{schedule.name} · {end_at.date().isoformat()}",
+                "idempotency_key": idempotency_key,
+            },
+        },
+        result={
+            "attempt": 1,
+            "progress": {
+                "stage": "preparing",
+                "completed": 0,
+                "total": 1,
+                "message": None,
+            },
+        },
+        started_at=utcnow(),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    settings = get_settings()
+    try:
+        result = execute_brief_generation(
+            db,
+            job=job,
+            settings=settings,
+            brief_factory=lambda progress, loader, saver, should_stop, request_token: create_brief(
                 db,
                 period=schedule.period,
                 start_at=start_at,
@@ -1199,11 +1448,63 @@ def run_due_schedules(
                     "domain_match": schedule.domain_match,
                 },
                 schedule_id=schedule.id,
+                idempotency_key=idempotency_key,
                 title=f"{schedule.name} · {end_at.date().isoformat()}",
+                settings=settings,
+                progress_callback=progress,
+                checkpoint_loader=loader,
+                checkpoint_saver=saver,
+                should_stop=should_stop,
+                request_token=request_token,
+            ),
+        )
+    except BriefGenerationCancelled:
+        raise
+    brief = result["brief"]
+    schedule.last_run_at = utcnow()
+    db.commit()
+    return brief
+
+
+def run_due_schedules(
+    db: Session,
+    *,
+    at: datetime | None = None,
+) -> list[Brief]:
+    """Generate the current window of every enabled schedule.
+
+    Only the most recently completed window is ever considered — there is no
+    historical backfill. A window that completed before the schedule was
+    created is skipped, so a plan set up mid-period starts at the next cutoff
+    instead of retroactively covering the just-ended period.
+    """
+    created: list[Brief] = []
+    for schedule in db.scalars(
+        select(BriefSchedule).where(BriefSchedule.enabled.is_(True)).order_by(BriefSchedule.id)
+    ):
+        latest_start, latest_end = schedule_window(schedule, at)
+        if latest_end <= schedule.created_at:
+            # The window ended before the schedule existed; do not backfill it.
+            continue
+        if (
+            db.scalar(
+                select(Brief.id).where(
+                    Brief.schedule_id == schedule.id,
+                    Brief.start_at == latest_start,
+                    Brief.end_at == latest_end,
+                )
             )
-            schedule.last_run_at = datetime.now(UTC).replace(tzinfo=None)
-            db.commit()
-            created.append(brief)
+            is not None
+        ):
+            continue
+        try:
+            brief = _generate_scheduled_brief(db, schedule, latest_start, latest_end)
+            if brief is not None:
+                created.append(brief)
+        except BriefGenerationCancelled:
+            # Owner stopped the generation; the job already records the
+            # stopped state and the saved checkpoints remain available.
+            continue
     return created
 
 

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from backend.app.llm import save_llm_connection
 from backend.app.models import Feed, NetworkProxyConfig
 from backend.app.network_proxy import (
+    _resolve_test_proxy_url,
     http_route_for_feed,
     http_route_for_global,
     http_route_for_llm_connection,
+    http_route_for_mode,
     http_route_for_translation_service,
     network_proxy_summary,
     save_network_proxy_config,
@@ -124,6 +127,182 @@ def test_proxy_url_rejects_embedded_credentials_and_unsupported_schemes():
             pass
         else:
             raise AssertionError(f"{value} should have been rejected")
+
+
+def test_custom_proxy_routes_fail_closed_when_configuration_is_unavailable(
+    db_factory, settings
+):
+    with db_factory() as db:
+        with pytest.raises(ValueError, match="custom proxy is not enabled"):
+            http_route_for_mode(db, "custom", settings)
+
+        feed = Feed(
+            title="Fail-closed feed",
+            url="https://feed.test/rss",
+            proxy_mode="custom",
+        )
+        connection = save_llm_connection(
+            db,
+            name="Fail-closed LLM",
+            base_url="https://llm.test/v1",
+            model="model",
+            api_key="secret",
+            settings=settings,
+        )
+        connection.proxy_mode = "custom"
+        db.add(feed)
+        db.commit()
+        with pytest.raises(ValueError, match="custom proxy is not enabled"):
+            http_route_for_feed(db, feed, settings)
+        with pytest.raises(ValueError, match="custom proxy is not enabled"):
+            http_route_for_llm_connection(db, connection, settings)
+
+        save_network_proxy_config(
+            db,
+            enabled=False,
+            url="http://disabled-proxy.test:7890",
+            username=None,
+            password=None,
+            clear_password=False,
+            global_mode="custom",
+            feed_modes={feed.id: "custom"},
+            llm_connection_modes={connection.id: "custom"},
+            translation_service_modes={
+                "google-gtx": "custom",
+                "deepl": "custom",
+                "google-cloud": "custom",
+            },
+            settings=settings,
+        )
+        db.commit()
+        for route in (
+            lambda: http_route_for_global(db, settings),
+            lambda: http_route_for_feed(db, feed, settings),
+            lambda: http_route_for_llm_connection(db, connection, settings),
+            lambda: http_route_for_translation_service(db, "deepl", settings),
+        ):
+            with pytest.raises(ValueError, match="custom proxy is not enabled"):
+                route()
+
+
+def test_saved_proxy_password_is_bound_to_url_and_username(db_factory, settings):
+    common = {
+        "enabled": True,
+        "global_mode": "direct",
+        "feed_modes": {},
+        "llm_connection_modes": {},
+        "translation_service_modes": {},
+        "settings": settings,
+    }
+    with db_factory() as db:
+        save_network_proxy_config(
+            db,
+            url="http://saved-proxy.test:7890",
+            username="saved-user",
+            password="saved-password",
+            clear_password=False,
+            **common,
+        )
+        db.commit()
+
+        same_target = _resolve_test_proxy_url(
+            db,
+            url="http://saved-proxy.test:7890",
+            username="saved-user",
+            password=None,
+            use_saved_password=True,
+            settings=settings,
+        )
+        assert same_target == (
+            "http://saved-user:saved-password@saved-proxy.test:7890"
+        )
+        with pytest.raises(ValueError, match="different proxy URL or username"):
+            _resolve_test_proxy_url(
+                db,
+                url="http://attacker.test:7890",
+                username="saved-user",
+                password=None,
+                use_saved_password=True,
+                settings=settings,
+            )
+        with pytest.raises(ValueError, match="different proxy URL or username"):
+            _resolve_test_proxy_url(
+                db,
+                url="http://saved-proxy.test:7890",
+                username="attacker-user",
+                password=None,
+                use_saved_password=True,
+                settings=settings,
+            )
+        explicit_draft = _resolve_test_proxy_url(
+            db,
+            url="http://new-proxy.test:7890",
+            username="new-user",
+            password="new-password",
+            use_saved_password=True,
+            settings=settings,
+        )
+        assert explicit_draft == "http://new-user:new-password@new-proxy.test:7890"
+
+        with pytest.raises(ValueError, match="requires a new password"):
+            save_network_proxy_config(
+                db,
+                url="http://new-proxy.test:7890",
+                username="new-user",
+                password=None,
+                clear_password=False,
+                **common,
+            )
+        db.rollback()
+        stored = db.get(NetworkProxyConfig, 1)
+        assert stored is not None
+        assert stored.url == "http://saved-proxy.test:7890"
+        assert stored.username == "saved-user"
+        assert stored.password_encrypted
+
+        save_network_proxy_config(
+            db,
+            url="http://cleared-proxy.test:7890",
+            username="cleared-user",
+            password=None,
+            clear_password=True,
+            **common,
+        )
+        db.commit()
+        stored = db.get(NetworkProxyConfig, 1)
+        assert stored is not None
+        assert stored.url == "http://cleared-proxy.test:7890"
+        assert stored.password_encrypted is None
+
+        save_network_proxy_config(
+            db,
+            url="http://cleared-proxy.test:7890",
+            username="cleared-user",
+            password="rebound-password",
+            clear_password=False,
+            **common,
+        )
+        db.commit()
+        save_network_proxy_config(
+            db,
+            url="http://replacement-proxy.test:7890",
+            username="replacement-user",
+            password="replacement-password",
+            clear_password=False,
+            **common,
+        )
+        db.commit()
+        rebound = _resolve_test_proxy_url(
+            db,
+            url="http://replacement-proxy.test:7890",
+            username="replacement-user",
+            password=None,
+            use_saved_password=True,
+            settings=settings,
+        )
+        assert rebound == (
+            "http://replacement-user:replacement-password@replacement-proxy.test:7890"
+        )
 
 
 def test_network_proxy_api_does_not_return_password(

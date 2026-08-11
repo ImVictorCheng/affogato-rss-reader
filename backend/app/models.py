@@ -266,6 +266,23 @@ class TranslationCache(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class AutoTagRecord(Base):
+    """One row per entry tracking whether automatic LLM tagging has run."""
+
+    __tablename__ = "auto_tag_records"
+    __table_args__ = (UniqueConstraint("entry_id", name="uq_auto_tag_entry"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entry_id: Mapped[int] = mapped_column(ForeignKey("entries.id", ondelete="CASCADE"), index=True)
+    source_hash: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    tag_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class Tag(Base):
     __tablename__ = "tags"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -346,6 +363,7 @@ class BriefSchedule(Base):
     period: Mapped[str] = mapped_column(String(20), index=True)
     timezone: Mapped[str] = mapped_column(String(80), default="UTC")
     cutoff_time: Mapped[str] = mapped_column(String(5), default="09:00")
+    start_time: Mapped[str | None] = mapped_column(String(5))
     weekday: Mapped[int | None] = mapped_column(Integer)
     month_day: Mapped[int | None] = mapped_column(Integer)
     year_month: Mapped[int | None] = mapped_column(Integer)

@@ -22,6 +22,7 @@ _login_attempt_lock = Lock()
 _login_attempts: dict[str, list[float]] = {}
 _LOGIN_WINDOW_SECONDS = 5 * 60
 _LOGIN_MAX_FAILURES = 8
+_LOGIN_MAX_TRACKED_CLIENTS = 4096
 
 
 def enforce_login_rate_limit(client_key: str) -> None:
@@ -32,7 +33,10 @@ def enforce_login_rate_limit(client_key: str) -> None:
             for timestamp in _login_attempts.get(client_key, [])
             if now - timestamp < _LOGIN_WINDOW_SECONDS
         ]
-        _login_attempts[client_key] = recent
+        if recent:
+            _login_attempts[client_key] = recent
+        else:
+            _login_attempts.pop(client_key, None)
         if len(recent) >= _LOGIN_MAX_FAILURES:
             retry_after = max(1, int(_LOGIN_WINDOW_SECONDS - (now - recent[0])))
             raise HTTPException(
@@ -44,6 +48,11 @@ def enforce_login_rate_limit(client_key: str) -> None:
 
 def record_login_failure(client_key: str) -> None:
     with _login_attempt_lock:
+        if client_key not in _login_attempts and len(_login_attempts) >= _LOGIN_MAX_TRACKED_CLIENTS:
+            # Bound attacker-controlled client identifiers. Dict order makes
+            # this a deterministic oldest-tracked eviction without another
+            # unbounded index.
+            _login_attempts.pop(next(iter(_login_attempts)))
         _login_attempts.setdefault(client_key, []).append(time.monotonic())
 
 

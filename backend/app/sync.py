@@ -25,7 +25,8 @@ from .models import (
 )
 from .translation import TRANSLATION_RECORD_PROVIDER, get_translation_record
 from .parsing import ParsedEntry, canonicalize_url, parse_feed, parse_untrusted_html
-from .network_proxy import http_route_for_feed
+from .network_proxy import http_route_for_feed, http_route_for_global
+from .safe_fetch import fetch_remote_document
 
 FEED_TYPES = {
     "application/rss+xml",
@@ -40,25 +41,48 @@ def validate_http_url(url: str) -> str:
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("Only absolute HTTP(S) URLs are supported")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Feed URLs must not contain credentials")
     return url
 
 
-def discover_feeds(url: str, settings: Settings | None = None) -> list[dict]:
+def discover_feeds(
+    url: str,
+    settings: Settings | None = None,
+    db: Session | None = None,
+) -> list[dict]:
     settings = settings or get_settings()
     validate_http_url(url)
+    route = http_route_for_global(db, settings) if db is not None else None
     with httpx.Client(
         timeout=settings.request_timeout_seconds,
-        follow_redirects=True,
+        follow_redirects=False,
         headers={"User-Agent": "AffogatoRSSReader/0.1 (+self-hosted)"},
-        trust_env=False,
+        proxy=route.proxy if route else None,
+        trust_env=route.trust_env if route else False,
     ) as client:
-        response = client.get(url)
-        response.raise_for_status()
-    content_type = response.headers.get("content-type", "").split(";")[0].lower()
-    if content_type in FEED_TYPES or response.content.lstrip().startswith((b"<?xml", b"<rss", b"<feed")):
-        metadata, _ = parse_feed(response.content, content_type)
-        return [{"url": str(response.url), "title": metadata["title"] or str(response.url), "site_url": metadata["site_url"] or url}]
-    soup = parse_untrusted_html(response.text)
+        document = fetch_remote_document(
+            client,
+            url,
+            max_bytes=settings.feed_max_response_bytes,
+            max_redirects=settings.feed_max_redirects,
+            allow_private_networks=settings.feed_allow_private_networks,
+            total_timeout_seconds=settings.feed_total_timeout_seconds,
+        )
+    content_type = document.headers.get("content-type", "").split(";")[0].lower()
+    if content_type in FEED_TYPES or document.content.lstrip().startswith((b"<?xml", b"<rss", b"<feed")):
+        metadata, _ = parse_feed(
+            document.content,
+            content_type,
+            max_entries=settings.feed_max_entries,
+        )
+        return [{"url": document.url, "title": metadata["title"] or document.url, "site_url": metadata["site_url"] or url}]
+    encoding = httpx.Response(
+        document.status_code,
+        headers=document.headers,
+        content=document.content,
+    ).encoding
+    soup = parse_untrusted_html(document.content.decode(encoding or "utf-8", errors="replace"))
     found: list[dict] = []
     seen: set[str] = set()
     for link in soup.find_all("link", href=True):
@@ -66,11 +90,16 @@ def discover_feeds(url: str, settings: Settings | None = None) -> list[dict]:
         media_type = str(link.get("type") or "").lower()
         if "alternate" not in rel or media_type not in FEED_TYPES:
             continue
-        feed_url = canonicalize_url(urljoin(str(response.url), link["href"]))
+        candidate = urljoin(document.url, link["href"])
+        try:
+            validate_http_url(candidate)
+        except ValueError:
+            continue
+        feed_url = canonicalize_url(candidate)
         if feed_url in seen:
             continue
         seen.add(feed_url)
-        found.append({"url": feed_url, "title": link.get("title") or feed_url, "site_url": str(response.url)})
+        found.append({"url": feed_url, "title": link.get("title") or feed_url, "site_url": document.url})
     return found
 
 
@@ -407,35 +436,48 @@ def sync_feed(
     client: httpx.Client | None = None,
 ) -> SyncRun:
     settings = settings or get_settings()
-    run = SyncRun(feed_id=feed.id, status="running")
+    feed_id = feed.id
+    run = SyncRun(feed_id=feed_id, status="running")
     db.add(run)
     feed.last_checked_at = utcnow()
     db.commit()
-    headers = {"User-Agent": "AffogatoRSSReader/0.1 (+self-hosted)"}
-    if feed.etag:
-        headers["If-None-Match"] = feed.etag
-    if feed.last_modified:
-        headers["If-Modified-Since"] = feed.last_modified
+    run_id = run.id
     owned_client = client is None
-    route = http_route_for_feed(db, feed, settings)
-    client = client or httpx.Client(
-        timeout=settings.request_timeout_seconds,
-        follow_redirects=True,
-        proxy=route.proxy,
-        trust_env=route.trust_env,
-    )
     try:
-        response = client.get(validate_http_url(feed.url), headers=headers)
-        run.http_status = response.status_code
-        if response.status_code == 304:
+        headers = {"User-Agent": "AffogatoRSSReader/0.1 (+self-hosted)"}
+        if feed.etag:
+            headers["If-None-Match"] = feed.etag
+        if feed.last_modified:
+            headers["If-Modified-Since"] = feed.last_modified
+        route = http_route_for_feed(db, feed, settings)
+        client = client or httpx.Client(
+            timeout=settings.request_timeout_seconds,
+            follow_redirects=False,
+            proxy=route.proxy,
+            trust_env=route.trust_env,
+        )
+        document = fetch_remote_document(
+            client,
+            validate_http_url(feed.url),
+            headers=headers,
+            max_bytes=settings.feed_max_response_bytes,
+            max_redirects=settings.feed_max_redirects,
+            allow_private_networks=settings.feed_allow_private_networks,
+            total_timeout_seconds=settings.feed_total_timeout_seconds,
+        )
+        run.http_status = document.status_code
+        if document.status_code == 304:
             run.status = "not_modified"
             feed.error_count = 0
             feed.last_error = None
             feed.last_success_at = utcnow()
             feed.next_fetch_at = _next_fetch(feed)
         else:
-            response.raise_for_status()
-            metadata, entries = parse_feed(response.content, response.headers.get("content-type"))
+            metadata, entries = parse_feed(
+                document.content,
+                document.headers.get("content-type"),
+                max_entries=settings.feed_max_entries,
+            )
             run.fetched_count = len(entries)
             translation_enabled = db.get(AppSetting, "translation_enabled")
             enabled = translation_enabled is None or translation_enabled.value.lower() == "true"
@@ -452,8 +494,8 @@ def sync_feed(
             # A fresh 200 response replaces the stored validators. Keeping an
             # old validator after the origin stops sending it can produce
             # incorrect conditional requests on later polls.
-            feed.etag = response.headers.get("etag")
-            feed.last_modified = response.headers.get("last-modified")
+            feed.etag = document.headers.get("etag")
+            feed.last_modified = document.headers.get("last-modified")
             feed.error_count = 0
             feed.last_error = None
             feed.last_success_at = utcnow()
@@ -465,28 +507,33 @@ def sync_feed(
         return run
     except Exception as exc:
         db.rollback()
-        run = db.get(SyncRun, run.id)
-        feed = db.get(Feed, feed.id)
-        assert run is not None and feed is not None
-        feed.error_count += 1
-        feed.last_error = str(exc)[:4000]
-        feed.next_fetch_at = _next_fetch(feed, failed=True)
-        run.status = "failed"
-        run.error = str(exc)[:4000]
-        run.finished_at = utcnow()
+        persisted_run = db.get(SyncRun, run_id)
+        if persisted_run is None:
+            raise
+        persisted_feed = db.get(Feed, feed_id)
+        error = str(exc)[:4000] or exc.__class__.__name__
+        if persisted_feed is None:
+            error = "Feed was deleted while synchronization was running"
+        else:
+            persisted_feed.error_count += 1
+            persisted_feed.last_error = error
+            persisted_feed.next_fetch_at = _next_fetch(persisted_feed, failed=True)
+        persisted_run.status = "failed"
+        persisted_run.error = error
+        persisted_run.finished_at = utcnow()
         db.commit()
-        return run
+        return persisted_run
     finally:
-        if owned_client:
+        if owned_client and client is not None:
             client.close()
 
 
-def sync_due_feeds(db: Session, settings: Settings | None = None, feed_id: int | None = None) -> list[SyncRun]:
+def sync_due_feeds(db: Session, settings: Settings | None = None, feed_id: int | None = None, *, force: bool = False) -> list[SyncRun]:
     settings = settings or get_settings()
     query = select(Feed).where(Feed.enabled.is_(True))
     if feed_id is not None:
         query = query.where(Feed.id == feed_id)
-    else:
+    elif not force:
         query = query.where((Feed.next_fetch_at.is_(None)) | (Feed.next_fetch_at <= utcnow()))
     feeds = list(db.scalars(query.order_by(Feed.id)))
     return [sync_feed(db, feed, settings) for feed in feeds]

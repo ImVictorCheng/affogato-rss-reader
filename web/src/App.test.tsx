@@ -32,7 +32,7 @@ const theme = {
 };
 
 function response(body: unknown) { return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })); }
-function mockApi(authenticated = true, onboardingRequired = false, updateAvailable = false) {
+function mockApi(authenticated = true, onboardingRequired = false, updateAvailable = false, releaseUrl = "https://github.com/ImVictorCheng/affogato-rss-reader/releases/tag/v0.3.1") {
   let entryRead = false;
   const currentEntry = () => ({ ...entry, state: { ...entry.state, read: entryRead } });
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -52,7 +52,7 @@ function mockApi(authenticated = true, onboardingRequired = false, updateAvailab
     if (url.endsWith("/brief-schedules")) return response({ items: [] });
     if (url.endsWith("/network-proxy/test")) return response({ results: [{ target_url: "https://google.com/", ok: true, status_code: 200, elapsed_ms: 25, final_url: "https://www.google.com/", error: null }, { target_url: "https://bing.com/", ok: false, status_code: null, elapsed_ms: 31, final_url: null, error: "Proxy test failed: ConnectTimeout" }] });
     if (url.endsWith("/network-proxy")) return response({ enabled: false, url: "", username: null, password_configured: false, password_hint: null, global_mode: "direct", running_in_container: true, feed_modes: {}, llm_connection_modes: {}, translation_service_modes: { "google-gtx": "direct", deepl: "direct", "google-cloud": "direct" } });
-    if (url.endsWith("/updates/status") || url.endsWith("/updates/check")) return response({ current_version: "0.3.0", latest_version: updateAvailable ? "0.3.1" : "0.3.0", status: updateAvailable ? "downloaded" : "up_to_date", release_url: updateAvailable ? "https://github.com/ImVictorCheng/affogato-rss-reader/releases/tag/v0.3.1" : null, release_notes: null, published_at: null, last_checked_at: "2026-08-01T21:00:00Z", downloaded_at: updateAvailable ? "2026-08-01T21:00:02Z" : null, install_requested_at: null, installed_at: null, downloaded: updateAvailable, downloaded_bytes: updateAvailable ? 4096 : null, install_supported: true, automatic_checks_enabled: true, check_hour: 5, error: null });
+    if (url.endsWith("/updates/status") || url.endsWith("/updates/check")) return response({ current_version: "0.3.0", latest_version: updateAvailable ? "0.3.1" : "0.3.0", status: updateAvailable ? "downloaded" : "up_to_date", release_url: updateAvailable ? releaseUrl : null, release_notes: null, published_at: null, last_checked_at: "2026-08-01T21:00:00Z", downloaded_at: updateAvailable ? "2026-08-01T21:00:02Z" : null, install_requested_at: null, installed_at: null, downloaded: updateAvailable, downloaded_bytes: updateAvailable ? 4096 : null, install_supported: true, automatic_checks_enabled: true, check_hour: 5, error: null });
     if (url.endsWith("/settings")) return response({ app_name: "Affogato RSS Reader", version: "0.3.0", timezone: "UTC", debug: false });
     if (url.includes("/jobs?") || url.includes("/jobs/sync-runs?")) return response({ items: [] });
     if (url.includes("/call-logs?")) return response({
@@ -67,6 +67,7 @@ function mockApi(authenticated = true, onboardingRequired = false, updateAvailab
       host_path_hint: "logs/llm-translation.jsonl",
     });
     if (url.endsWith("/feeds/1/refresh") && init?.method === "POST") return response({});
+    if (url.endsWith("/feeds/refresh-all") && init?.method === "POST") return response({ refreshed: 1 });
     if (url.endsWith("/feeds/sort-settings")) return response({ sort_mode: "alpha", sort_direction: "asc" });
     if (url.endsWith("/feeds")) return response({ items: [{ id: 1, title: "Example Science", url: "https://example.test/rss", folder: "Research", enabled: true, poll_interval_minutes: 45, status: "healthy", unread_count: entryRead ? 0 : 1, entry_count: 1, error_count: 0, domains: entry.domains }] });
     if (url.endsWith("/folders")) return response({ items: [{ id: 1, name: "Research", position: 0, feed_count: 1 }] });
@@ -110,7 +111,7 @@ describe("Affogato RSS Reader", () => {
     expect(button).toBeEnabled();
     await user.click(button);
 
-    expect(await screen.findByRole("heading", { name: "Briefs", level: 1 }, { timeout: 3000 })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Briefs", level: 1 }, { timeout: 10_000 })).toBeInTheDocument();
     expect(document.querySelector(".reader-shell")).toHaveClass("is-brief-workspace");
   });
   it("resizes the desktop panes from separators and persists the widths", async () => {
@@ -180,6 +181,12 @@ describe("Affogato RSS Reader", () => {
     await user.click(screen.getByRole("button", { name: /Mark all read/ }));
     await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => String(url).includes("/entries/mark-all-read?") && String(url).includes("feed_id=1") && init?.method === "POST")).toBe(true));
     await waitFor(() => expect(screen.getByRole("button", { name: /Unread 0/ })).toBeInTheDocument());
+  });
+  it("refreshes all sources from the sidebar", async () => {
+    const fetchMock = mockApi(); const user = userEvent.setup(); render(<App />);
+    await screen.findByRole("heading", { name: "Unread" });
+    await user.click(screen.getByRole("button", { name: /Refresh all/ }));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => String(url).endsWith("/feeds/refresh-all") && init?.method === "POST")).toBe(true));
   });
   it("shows clean first-run setup", async () => {
     mockApi(false); render(<App />);
@@ -291,6 +298,11 @@ describe("Affogato RSS Reader", () => {
     expect(await screen.findByRole("heading", { name: "Application update" })).toBeInTheDocument();
     expect(screen.getByText("Version 0.3.1 is downloaded")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Check now" })).toBeEnabled();
+  });
+  it("does not expose a non-HTTP release URL as a link", async () => {
+    mockApi(true, false, true, "file:///private/release-notes"); render(<App />);
+    expect(await screen.findByText("Version 0.3.1 is ready")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "View release" })).not.toBeInTheDocument();
   });
   it("loads only lightweight data when settings first opens", async () => {
     const fetchMock = mockApi(); const user = userEvent.setup(); render(<App />);

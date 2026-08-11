@@ -7,7 +7,11 @@ from sqlalchemy import func, select
 from backend.app import security
 from backend.app.call_logging import write_call_log
 from backend.app.config import get_settings
-from backend.app.llm import LLMConnectionError
+from backend.app.llm import (
+    LLMConnectionError,
+    decrypt_llm_api_key,
+    save_llm_connection,
+)
 from backend.app.models import (
     AppSetting,
     Brief,
@@ -72,6 +76,151 @@ def test_setup_login_session_and_csrf(api_client):
     assert client.get("/api/v1/feeds").status_code == 401
     assert client.post("/api/v1/auth/login", json={"password": "wrongpass"}).status_code == 401
     assert client.post("/api/v1/auth/login", json={"password": "reader88"}).status_code == 200
+
+
+def test_refresh_all_feeds_requires_auth_and_forces_sync(authenticated_client, monkeypatch):
+    client, _factory, headers = authenticated_client
+    calls: list[bool] = []
+
+    def fake_sync_due_feeds(_db, settings=None, feed_id=None, *, force=False):
+        calls.append(force)
+        return [object(), object()]
+
+    monkeypatch.setattr("backend.app.api.sync_due_feeds", fake_sync_due_feeds)
+    response = client.post("/api/v1/feeds/refresh-all", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"refreshed": 2}
+    assert calls == [True]
+    client.cookies.clear()
+    assert client.post("/api/v1/feeds/refresh-all").status_code == 401
+
+
+def test_brief_schedule_can_be_updated_and_deleted(authenticated_client):
+    client, _factory, headers = authenticated_client
+    created = client.post(
+        "/api/v1/brief-schedules",
+        json={
+            "name": "Morning", "period": "daily", "timezone": "Asia/Shanghai",
+            "cutoff_time": "09:00", "weekday": None, "month_day": None, "year_month": None,
+            "domain_ids": [], "feed_ids": [], "tag_ids": [], "domain_match": "any", "enabled": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["id"]
+
+    updated = client.patch(
+        f"/api/v1/brief-schedules/{schedule_id}",
+        json={"name": "Weekly", "period": "weekly", "cutoff_time": "07:30", "weekday": 1},
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    assert body["name"] == "Weekly"
+    assert body["period"] == "weekly"
+    assert body["cutoff_time"] == "07:30"
+    assert body["weekday"] == 1
+
+    listed = client.get("/api/v1/brief-schedules").json()["items"]
+    assert [schedule["name"] for schedule in listed] == ["Weekly"]
+    assert client.delete(
+        f"/api/v1/brief-schedules/{schedule_id}", headers=headers
+    ).status_code == 204
+    assert client.get("/api/v1/brief-schedules").json()["items"] == []
+
+
+def test_brief_schedule_rejects_invalid_timezone_on_update(authenticated_client):
+    client, _factory, headers = authenticated_client
+    created = client.post(
+        "/api/v1/brief-schedules",
+        json={"name": "X", "period": "daily", "timezone": "Asia/Shanghai", "cutoff_time": "09:00"},
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["id"]
+    assert client.patch(
+        f"/api/v1/brief-schedules/{schedule_id}",
+        json={"timezone": "Not/AZone"},
+        headers=headers,
+    ).status_code == 422
+
+
+def test_auto_tag_status_can_be_configured(authenticated_client):
+    client, _factory, headers = authenticated_client
+    initial = client.get("/api/v1/auto-tag/status")
+    assert initial.status_code == 200
+    assert initial.json()["enabled"] is False
+    connection = client.post(
+        "/api/v1/llm/connections",
+        json={
+            "name": "Tag LLM",
+            "base_url": "https://llm.example.test/v1",
+            "model": "tag-model",
+            "api_key": "tag-secret",
+        },
+        headers=headers,
+    ).json()
+    configured = client.patch(
+        "/api/v1/auto-tag/status",
+        json={"enabled": True, "create_new": True, "llm_connection_id": connection["id"]},
+        headers=headers,
+    )
+    assert configured.status_code == 200, configured.text
+    body = configured.json()
+    assert body["enabled"] is True
+    assert body["create_new"] is True
+    assert body["llm_connection_id"] == connection["id"]
+    assert body["configured"] is True
+    assert body["max_tags_per_entry"] == 5
+    assert client.get("/api/v1/auto-tag/status").json()["enabled"] is True
+    disabled = client.patch(
+        "/api/v1/auto-tag/status",
+        json={"enabled": False, "create_new": False, "llm_connection_id": connection["id"]},
+        headers=headers,
+    )
+    assert disabled.json()["enabled"] is False
+
+
+def test_brief_schedule_accepts_and_validates_start_time(authenticated_client):
+    client, _factory, headers = authenticated_client
+    created = client.post(
+        "/api/v1/brief-schedules",
+        json={
+            "name": "Window", "period": "daily", "timezone": "Asia/Shanghai",
+            "cutoff_time": "18:00", "start_time": "09:00",
+            "weekday": None, "month_day": None, "year_month": None,
+            "domain_ids": [], "feed_ids": [], "tag_ids": [], "domain_match": "any", "enabled": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["start_time"] == "09:00"
+    schedule_id = created.json()["id"]
+
+    updated = client.patch(
+        f"/api/v1/brief-schedules/{schedule_id}",
+        json={"start_time": "10:30"},
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["start_time"] == "10:30"
+
+    invalid = client.patch(
+        f"/api/v1/brief-schedules/{schedule_id}",
+        json={"start_time": "19:00"},
+        headers=headers,
+    )
+    assert invalid.status_code == 422
+    assert client.post(
+        "/api/v1/brief-schedules",
+        json={
+            "name": "Bad", "period": "daily", "timezone": "UTC",
+            "cutoff_time": "09:00", "start_time": "12:00",
+            "weekday": None, "month_day": None, "year_month": None,
+            "domain_ids": [], "feed_ids": [], "tag_ids": [], "domain_match": "any", "enabled": True,
+        },
+        headers=headers,
+    ).status_code == 422
 
 
 def test_folder_categories_are_persistent_and_manage_feed_assignments(authenticated_client):
@@ -171,6 +320,20 @@ def test_login_failures_are_rate_limited_per_client(api_client):
         limited = client.post("/api/v1/auth/login", json={"password": "reader88"})
         assert limited.status_code == 429
         assert int(limited.headers["Retry-After"]) > 0
+    finally:
+        with security._login_attempt_lock:
+            security._login_attempts.clear()
+
+
+def test_login_rate_limit_bounds_attacker_controlled_client_keys(monkeypatch):
+    monkeypatch.setattr(security, "_LOGIN_MAX_TRACKED_CLIENTS", 3)
+    with security._login_attempt_lock:
+        security._login_attempts.clear()
+    try:
+        for client_key in ("client-a", "client-b", "client-c", "client-d"):
+            security.record_login_failure(client_key)
+        with security._login_attempt_lock:
+            assert list(security._login_attempts) == ["client-b", "client-c", "client-d"]
     finally:
         with security._login_attempt_lock:
             security._login_attempts.clear()
@@ -467,6 +630,42 @@ def test_opml_import_rejects_excessive_nesting(authenticated_client):
     assert client.get("/api/v1/feeds").json()["items"] == []
 
 
+def test_opml_import_bounds_outline_count(authenticated_client, monkeypatch):
+    client, _factory, headers = authenticated_client
+    monkeypatch.setattr("backend.app.opml.MAX_OPML_OUTLINES", 2)
+    payload = b"""<?xml version="1.0"?><opml version="2.0"><body>
+      <outline text="One" xmlUrl="https://one.test/rss"/>
+      <outline text="Two" xmlUrl="https://two.test/rss"/>
+      <outline text="Three" xmlUrl="https://three.test/rss"/>
+    </body></opml>"""
+
+    response = client.post(
+        "/api/v1/feeds/opml",
+        files={"file": ("many.opml", payload, "text/x-opml")},
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    assert "more than 2 outlines" in response.json()["detail"]
+    assert client.get("/api/v1/feeds").json()["items"] == []
+
+
+def test_opml_import_drops_non_http_site_url(authenticated_client):
+    client, _factory, headers = authenticated_client
+    payload = b"""<?xml version="1.0"?><opml version="2.0"><body>
+      <outline text="Safe" xmlUrl="https://safe.test/rss" htmlUrl="javascript:alert(1)"/>
+    </body></opml>"""
+
+    response = client.post(
+        "/api/v1/feeds/opml",
+        files={"file": ("unsafe-site.opml", payload, "text/x-opml")},
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert client.get("/api/v1/feeds").json()["items"][0]["site_url"] is None
+
+
 def test_openapi_declares_public_contracts(api_client):
     client, _factory = api_client
     document = client.get("/openapi.json").json()
@@ -529,6 +728,108 @@ def test_llm_connection_can_be_tested_without_saving_key(
     with factory() as db:
         assert db.get(AppSetting, "translation_llm_api_key") is None
         assert db.scalar(select(func.count()).select_from(LLMConnection)) == 0
+
+
+def test_saved_llm_key_cannot_be_reused_with_a_different_base_url(
+    authenticated_client, settings, monkeypatch
+):
+    client, factory, headers = authenticated_client
+    with factory() as db:
+        connection = save_llm_connection(
+            db,
+            name="Bound LLM",
+            base_url="https://saved-llm.test/v1",
+            model="bound-model",
+            api_key="saved-llm-secret",
+            settings=settings,
+        )
+        db.commit()
+        connection_id = connection.id
+
+    captured: list[dict] = []
+
+    def probe(**kwargs):
+        captured.append(kwargs)
+        return "OK"
+
+    monkeypatch.setattr("backend.app.api.probe_llm_connection", probe)
+    same_target = client.post(
+        "/api/v1/llm/connections/test",
+        json={"connection_id": connection_id},
+        headers=headers,
+    )
+    assert same_target.status_code == 200, same_target.text
+    assert captured[-1]["base_url"] == "https://saved-llm.test/v1"
+    assert captured[-1]["api_key"] == "saved-llm-secret"
+
+    rejected_test = client.post(
+        "/api/v1/llm/connections/test",
+        json={
+            "connection_id": connection_id,
+            "base_url": "https://attacker.test/v1",
+        },
+        headers=headers,
+    )
+    assert rejected_test.status_code == 400
+    assert len(captured) == 1
+
+    explicit_test_key = client.post(
+        "/api/v1/llm/connections/test",
+        json={
+            "connection_id": connection_id,
+            "base_url": "https://new-llm.test/v1",
+            "api_key": "new-unsaved-key",
+        },
+        headers=headers,
+    )
+    assert explicit_test_key.status_code == 200, explicit_test_key.text
+    assert captured[-1]["base_url"] == "https://new-llm.test/v1"
+    assert captured[-1]["api_key"] == "new-unsaved-key"
+
+    rejected_update = client.patch(
+        f"/api/v1/llm/connections/{connection_id}",
+        json={"base_url": "https://new-llm.test/v1"},
+        headers=headers,
+    )
+    assert rejected_update.status_code == 400
+    with factory() as db:
+        stored = db.get(LLMConnection, connection_id)
+        assert stored is not None
+        assert stored.base_url == "https://saved-llm.test/v1"
+        assert decrypt_llm_api_key(stored, settings) == "saved-llm-secret"
+
+    cleared_update = client.patch(
+        f"/api/v1/llm/connections/{connection_id}",
+        json={
+            "base_url": "https://cleared-llm.test/v1",
+            "clear_api_key": True,
+        },
+        headers=headers,
+    )
+    assert cleared_update.status_code == 200, cleared_update.text
+    assert cleared_update.json()["api_key_configured"] is False
+
+    rebound_update = client.patch(
+        f"/api/v1/llm/connections/{connection_id}",
+        json={"api_key": "rebound-secret"},
+        headers=headers,
+    )
+    assert rebound_update.status_code == 200, rebound_update.text
+
+    replaced_update = client.patch(
+        f"/api/v1/llm/connections/{connection_id}",
+        json={
+            "base_url": "https://replacement-llm.test/v1",
+            "api_key": "replacement-secret",
+        },
+        headers=headers,
+    )
+    assert replaced_update.status_code == 200, replaced_update.text
+    with factory() as db:
+        stored = db.get(LLMConnection, connection_id)
+        assert stored is not None
+        assert stored.base_url == "https://replacement-llm.test/v1"
+        assert decrypt_llm_api_key(stored, settings) == "replacement-secret"
 
 
 def test_jobs_translation_settings_and_brief_contract(
@@ -667,6 +968,8 @@ def test_jobs_translation_settings_and_brief_contract(
         "message": None,
         "can_retry": False,
         "attempt": 1,
+        "stopped": False,
+        "schedule_id": None,
     }
     repeated = client.post(
         "/api/v1/briefs",
@@ -835,6 +1138,148 @@ def test_failed_brief_generation_retries_from_durable_checkpoint(
     assert completed["can_retry"] is False
     with factory() as db:
         assert db.scalar(select(func.count()).select_from(BriefGenerationCheckpoint)) == 0
+
+
+def test_schedule_run_now_generates_a_brief_with_a_progress_job(
+    authenticated_client, monkeypatch
+):
+    client, factory, headers = authenticated_client
+    monkeypatch.setattr(
+        "backend.app.briefs.complete_feature_chat",
+        lambda *args, **kwargs: "## 今日概览\n\n计划触发生成综合总结。",
+    )
+    created = client.post(
+        "/api/v1/brief-schedules",
+        json={
+            "name": "Run test", "period": "daily", "timezone": "Asia/Shanghai",
+            "cutoff_time": "09:00", "weekday": None, "month_day": None, "year_month": None,
+            "domain_ids": [], "feed_ids": [], "tag_ids": [], "domain_match": "any", "enabled": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["id"]
+
+    run = client.post(f"/api/v1/brief-schedules/{schedule_id}/run", headers=headers)
+    assert run.status_code == 200, run.text
+    assert run.json()["notes"].startswith("## 今日概览")
+    brief_id = run.json()["id"]
+
+    with factory() as db:
+        job = db.scalar(
+            select(Job).where(Job.kind == "brief_generation").order_by(Job.id.desc()).limit(1)
+        )
+        assert job is not None
+        assert job.status == "completed"
+        assert job.payload["period"] == "daily"
+        assert job.payload["schedule_id"] == schedule_id
+        assert db.get(Brief, brief_id).schedule_id == schedule_id
+
+    latest = client.get("/api/v1/briefs/generation-progress/latest?period=daily")
+    assert latest.status_code == 200
+    assert latest.json() is None
+
+
+def test_brief_generation_can_be_stopped_restarted_and_resumed(
+    authenticated_client, monkeypatch
+):
+    client, factory, headers = authenticated_client
+    calls = 0
+
+    def resumable_generation(db, period, **kwargs):
+        nonlocal calls
+        calls += 1
+        load_checkpoint = kwargs["checkpoint_loader"]
+        save_checkpoint = kwargs["checkpoint_saver"]
+        if calls == 1:
+            save_checkpoint("batch", "first-batch", "observation one")
+            raise LLMConnectionError("temporary 503", retryable=True)
+        assert load_checkpoint("batch", "first-batch") is None
+        brief = Brief(
+            period=period,
+            start_at=datetime(2026, 7, 27, 0),
+            end_at=datetime(2026, 7, 28, 0),
+            title="Restarted brief",
+            notes="## Restarted\n\nGenerated again from scratch.",
+            stats={"entries": 2, "analyzed_entries": 2},
+            filters={},
+            idempotency_key=kwargs["idempotency_key"],
+        )
+        db.add(brief)
+        db.commit()
+        db.refresh(brief)
+        return brief
+
+    monkeypatch.setattr(
+        "backend.app.api.create_manual_brief",
+        resumable_generation,
+    )
+    failed = client.post(
+        "/api/v1/briefs",
+        json={
+            "period": "daily",
+            "start_at": "2026-07-27T00:00:00Z",
+            "end_at": "2026-07-28T00:00:00Z",
+            "idempotency_key": "stop-restart-brief",
+        },
+        headers=headers,
+    )
+    assert failed.status_code == 502
+    progress = client.get(
+        "/api/v1/briefs/generation-progress/stop-restart-brief"
+    ).json()
+    assert progress["status"] == "failed"
+
+    restart = client.post(
+        "/api/v1/briefs/generation-progress/stop-restart-brief/restart",
+        headers=headers,
+    )
+    assert restart.status_code == 200
+    assert calls == 2
+    with factory() as db:
+        job = db.scalar(
+            select(Job).where(
+                Job.kind == "brief_generation",
+                Job.payload["idempotency_key"].as_string() == "stop-restart-brief",
+            )
+        )
+        assert job.status == "completed"
+        assert job.result["attempt"] == 2
+        assert job.payload.get("stop_requested") is False
+
+
+def test_stop_endpoint_marks_a_running_generation(authenticated_client):
+    client, factory, headers = authenticated_client
+    with factory() as db:
+        job = Job(
+            kind="brief_generation",
+            status="running",
+            payload={
+                "idempotency_key": "running-stop-test",
+                "period": "daily",
+                "request": {"period": "daily"},
+            },
+            result={"attempt": 1, "progress": {"stage": "preparing", "completed": 0, "total": 1}},
+            started_at=datetime(2026, 7, 28, 2),
+        )
+        db.add(job)
+        db.commit()
+    stopped = client.post(
+        "/api/v1/briefs/generation-progress/running-stop-test/stop",
+        headers=headers,
+    )
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "running"
+    with factory() as db:
+        row = db.get(Job, job.id)
+        assert row.payload["stop_requested"] is True
+    repeated = client.post(
+        "/api/v1/briefs/generation-progress/running-stop-test/stop",
+        headers=headers,
+    )
+    assert repeated.status_code == 200
+    with factory() as db:
+        assert db.get(Job, job.id).payload["stop_requested"] is True
 
 
 def test_uncategorized_filter_and_feed_url_reset(authenticated_client):

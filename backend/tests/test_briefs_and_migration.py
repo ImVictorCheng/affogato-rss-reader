@@ -27,7 +27,12 @@ from backend.app.briefs import (
     schedule_window,
 )
 from backend.app.config import get_settings
-from backend.app.llm import LLMConnectionError
+from backend.app.llm import (
+    LLMConnectionError,
+    LLMRequestCancelled,
+    abort_llm_requests,
+    stream_completion_text,
+)
 from backend.app.models import (
     Base,
     Brief,
@@ -226,7 +231,7 @@ def test_stream_progress_is_throttled_to_fifteen_seconds(monkeypatch):
     ]
 
 
-def test_domain_filtered_schedule_and_catchup_are_idempotent(
+def test_domain_filtered_schedule_generates_only_the_current_window(
     db_factory, monkeypatch
 ):
     monkeypatch.setattr(
@@ -247,6 +252,7 @@ def test_domain_filtered_schedule_and_catchup_are_idempotent(
             cutoff_time="09:00",
             domain_ids=[domain.id],
             domain_match="all",
+            created_at=datetime(2026, 7, 20),
         )
         db.add(schedule)
         db.commit()
@@ -256,10 +262,43 @@ def test_domain_filtered_schedule_and_catchup_are_idempotent(
         assert rows[0].stats["entries"] == 1
         repeated = run_due_schedules(db, at=at)
         assert repeated == []
+        # Missed windows are never backfilled: only the current window runs.
         later = run_due_schedules(
             db, at=datetime(2026, 7, 28, 10, tzinfo=ZoneInfo("UTC"))
         )
-        assert len(later) == 2
+        assert len(later) == 1
+
+
+def test_new_schedule_starts_from_the_next_cutoff(db_factory, monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.briefs.complete_feature_chat",
+        lambda *args, **kwargs: "## 概览\n\n首次周期总结。",
+    )
+    with db_factory() as db:
+        add_seen_entry(db, datetime(2026, 7, 25, 10))
+        # Schedule was created at 11:00 on 7/26, after that day's 09:00 cutoff.
+        schedule = BriefSchedule(
+            name="New plan",
+            period="daily",
+            timezone="UTC",
+            cutoff_time="09:00",
+            enabled=True,
+            created_at=datetime(2026, 7, 26, 11),
+        )
+        db.add(schedule)
+        db.commit()
+        # The window that ended at 09:00 on 7/26 completed before creation.
+        rows = run_due_schedules(
+            db, at=datetime(2026, 7, 26, 10, tzinfo=ZoneInfo("UTC"))
+        )
+        assert rows == []
+        # The first window to complete after creation is generated.
+        rows = run_due_schedules(
+            db, at=datetime(2026, 7, 27, 10, tzinfo=ZoneInfo("UTC"))
+        )
+        assert len(rows) == 1
+        assert rows[0].start_at == datetime(2026, 7, 26, 9)
+        assert rows[0].end_at == datetime(2026, 7, 27, 9)
 
 
 def test_brief_prompt_requires_synthesis_instead_of_article_list(db_factory):
@@ -400,6 +439,27 @@ def test_schedule_window_handles_dst():
     )
     assert start < end
     assert (end - start).total_seconds() in {23 * 3600, 24 * 3600, 25 * 3600}
+
+
+def test_daily_schedule_with_start_time_uses_custom_window():
+    schedule = BriefSchedule(
+        name="Custom window",
+        period="daily",
+        timezone="Asia/Shanghai",
+        cutoff_time="18:00",
+        start_time="09:00",
+    )
+    start, end = schedule_window(
+        schedule, datetime(2026, 8, 5, 12, 30, tzinfo=ZoneInfo("UTC"))
+    )
+    assert start == datetime(2026, 8, 5, 1, 0)
+    assert end == datetime(2026, 8, 5, 10, 0)
+    # Before today's cutoff the window is the previous completed day.
+    start, end = schedule_window(
+        schedule, datetime(2026, 8, 5, 9, 30, tzinfo=ZoneInfo("UTC"))
+    )
+    assert start == datetime(2026, 8, 4, 1, 0)
+    assert end == datetime(2026, 8, 4, 10, 0)
 
 
 def test_initial_alembic_migration_matches_models(tmp_path: Path, monkeypatch):
@@ -545,5 +605,39 @@ def test_proxy_migrations_preserve_links_and_repair_arxiv_orphans(
         ).fetchone()[0] == "direct"
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == "0012"
+        ).fetchone()[0] == "0014"
     get_settings.cache_clear()
+
+
+def test_stream_completion_aborts_on_stop_check():
+    response = type("FakeResponse", (), {"iter_lines": lambda self: iter(["data: x"])})()
+    calls = {"n": 0}
+
+    def stop_check():
+        calls["n"] += 1
+        return True
+
+    try:
+        stream_completion_text(response, stop_check=stop_check)
+        raise AssertionError("expected LLMRequestCancelled")
+    except LLMRequestCancelled:
+        assert calls["n"] >= 1
+
+
+def test_abort_llm_requests_closes_registered_clients(monkeypatch):
+    import backend.app.llm as llm_module
+
+    closed = []
+
+    class FakeClient:
+        def close(self):
+            closed.append(True)
+
+    first = FakeClient()
+    second = FakeClient()
+    with llm_module._active_clients_lock:
+        llm_module._active_clients.setdefault("token-1", set()).update([first, second])
+    assert llm_module.abort_llm_requests("token-1") == 2
+    assert len(closed) == 2
+    with llm_module._active_clients_lock:
+        assert "token-1" not in llm_module._active_clients

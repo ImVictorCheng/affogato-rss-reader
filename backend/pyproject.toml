@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=75", "wheel"]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "affogato-rss-reader"
-version = "0.3.1"
+version = "0.4.0"
 description = "A self-hosted bilingual RSS/Atom reader with domain spaces and briefs."
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ requires-python = ">=3.12"
 dependencies = [
   "alembic>=1.14,<2",
   "beautifulsoup4>=4.12,<5",
-  "cryptography>=45,<50",
+  "cryptography>=50,<51",
   "defusedxml>=0.7.1,<1",
   "fastapi>=0.115,<1",
   "feedparser>=6.0.11,<7",

@@ -35,17 +35,19 @@ full CI as a quality gate before building and publishing images.
 
    The preflight mirrors CI: static checks, the Python 3.12/3.14 backend
    matrix, the web suite and Playwright E2E, amd64/arm64 image builds, the
-   Grype High/Critical gate, container smoke tests, release bundle
-   generation, and the source SBOM. It requires Docker Desktop with Linux
+   Grype High/Critical gate, container smoke tests, release Compose structural
+   validation, and the source SBOM. It requires Docker Desktop with Linux
    container mode and network access.
 
 3. **Squash onto `main` with a non-personal identity.** Never use a personal
-   name or email for `main` commits:
+   name or email for `main` commits. Use the current LLM model name as
+   `user.name` and `ImVictorCheng@users.noreply.github.com` as `user.email`
+   (for example, `ChatGPT 5.6 Luna`):
 
    ```console
    git checkout main
    git merge --squash dev
-   git -c user.name=deepseek -c user.email=20416460+ImVictorCheng@users.noreply.github.com commit -m "release: prepare X.Y.Z"
+   git -c user.name="<LLM model name>" -c user.email=ImVictorCheng@users.noreply.github.com commit -m "release: prepare X.Y.Z"
    ```
 
 4. **Push `main` and tag.** Pushing `main` triggers CI. Then create and push
@@ -53,17 +55,17 @@ full CI as a quality gate before building and publishing images.
 
    ```console
    git push origin main
-   git -c user.name=deepseek -c user.email=20416460+ImVictorCheng@users.noreply.github.com tag -a vX.Y.Z -m "vX.Y.Z"
+   git -c user.name="<LLM model name>" -c user.email=ImVictorCheng@users.noreply.github.com tag -a vX.Y.Z -m "vX.Y.Z"
    git push origin vX.Y.Z
    ```
 
-   Do **not** push `dev`. If CI or Release fails after the tag was pushed,
-   fix on `dev`, squash to `main` again, push `main`, and force-move the tag:
+   Do **not** push `dev`. Published tags and release versions are immutable. If
+   CI or Release fails after a tag has published any image or asset, fix on
+   `dev`, prepare the next patch version, squash it to `main`, and create a new
+   tag. Never force-move or reuse the failed version tag.
 
-   ```console
-   git -c user.name=deepseek -c user.email=20416460+ImVictorCheng@users.noreply.github.com tag -f -a vX.Y.Z -m "vX.Y.Z"
-   git push --force origin vX.Y.Z
-   ```
+   For example, a published but failed `v1.2.3` must be replaced by a newly
+   prepared `v1.2.4`; do not move `v1.2.3`.
 
 5. **Merge `main` back into `dev`** to keep the branches aligned. `dev` stays
    local-only unless a push is explicitly requested:
@@ -80,12 +82,41 @@ gh release view vX.Y.Z
 ```
 
 Expected assets: `affogato-rss-reader-X.Y.Z.tar.gz`,
-`affogato-rss-reader-compose-X.Y.Z.yaml`,
+`affogato-rss-reader-compose-v2-X.Y.Z.yaml`,
 `affogato-rss-reader-source.spdx.json`, and `SHA256SUMS`.
+
+## Local development instance
+
+A separate published instance runs outside this repository on port `8787` for
+daily use; never touch it. For development, spin up an isolated temporary
+instance **always** on port `8788` with its own data:
+
+- Project name and port come from the repo-local `.env` (gitignored):
+  `COMPOSE_PROJECT_NAME=affogato-rss-reader-dev` and
+  `AFFOGATO_RSS_READER_PORT=8788`. Volumes are scoped by project name, so
+  `affogato-rss-reader-dev_*` never collide with the production `affogato-rss-reader_*`.
+- Data lives in the gitignored `./data` bind mount; secrets, update-control
+  and logs are separate volumes/dirs under the dev project. The dev `updater`
+  service is disabled via the `release-updates` profile.
+- Rebuild from source (frontend + backend) and (re)start as needed:
+
+  ```console
+  docker compose -f compose.yaml -f compose.dev.yaml build
+  docker compose -f compose.yaml -f compose.dev.yaml up -d
+  ```
+
+  Verify: `docker compose -p affogato-rss-reader-dev ps` and
+  `Invoke-WebRequest http://127.0.0.1:8788/api/v1/health`. Clean up when done:
+
+  ```console
+  docker compose -p affogato-rss-reader-dev down -v --remove-orphans
+  ```
+
+- First login uses `docker compose -p affogato-rss-reader-dev exec reader affogato-rss-reader initial-password`.
 
 ## Notes
 
 - All repository text files must be UTF-8 without a BOM; run
   `python scripts/check_utf8.py` before committing.
-- The local preflight writes bundles under the ignored `.local-backups/`
-  directory and must never replace artifacts produced by GitHub Actions.
+- The local preflight writes its source SBOM under the ignored `.local-backups/`
+  directory and must never replace release artifacts produced by GitHub Actions.

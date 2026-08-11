@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import stat
 
 from backend.app import call_logging
 from backend.app.call_logging import write_call_log
@@ -37,3 +39,8 @@ def test_call_log_rotation_obeys_configured_size_and_backup_count(settings):
     assert path.with_name(f"{path.name}.1").is_file()
     assert path.with_name(f"{path.name}.2").is_file()
     assert not path.with_name(f"{path.name}.3").exists()
+    if os.name != "nt":
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.with_name(f"{path.name}.1").stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.with_name(f"{path.name}.2").stat().st_mode) == 0o600

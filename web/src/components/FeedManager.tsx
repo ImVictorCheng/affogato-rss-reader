@@ -7,7 +7,7 @@ import { ComboBox, EmptyState, ErrorNotice, Modal, SelectMenu, Toggle } from "./
 
 type Tab = "feeds" | "add" | "opml" | "categories";
 
-export function FeedManager({ locale, feeds, folders, domains, onClose, onChanged, notify }: {
+export function FeedManager({ locale, feeds, folders, domains, onClose, onChanged, notify, embedded = false }: {
   locale: Locale;
   feeds: Feed[];
   folders: Folder[];
@@ -15,6 +15,7 @@ export function FeedManager({ locale, feeds, folders, domains, onClose, onChange
   onClose: () => void;
   onChanged: () => Promise<void>;
   notify: (message: string, tone?: "success" | "error") => void;
+  embedded?: boolean;
 }) {
   const zh = locale === "zh-CN";
   const [tab, setTab] = useState<Tab>("feeds");
@@ -301,7 +302,8 @@ export function FeedManager({ locale, feeds, folders, domains, onClose, onChange
     }
   }
 
-  return <Modal title={t(locale, "feedManager")} eyebrow="SOURCE MANAGEMENT" onClose={onClose} wide>
+  const manager = (
+    <>
     <div className="modal-tabs">
       {(["feeds", "add", "opml", "categories"] as Tab[]).map((item) => (
         <button
@@ -415,7 +417,10 @@ export function FeedManager({ locale, feeds, folders, domains, onClose, onChange
               {domains.length > 0
                 ? <fieldset className="domain-picker domain-picker--compact">
                   <legend>{t(locale, "domains")}</legend>
-                  {domains.map((domain) => <label key={domain.id}><input type="checkbox" checked={editDomainIds.includes(domain.id)} onChange={() => setEditDomainIds((current) => current.includes(domain.id) ? current.filter((id) => id !== domain.id) : [...current, domain.id])} />{domain.name}</label>)}
+                  <div className="domain-picker__options">{domains.map((domain) => {
+                    const selected = editDomainIds.includes(domain.id);
+                    return <label className={selected ? "is-selected" : ""} key={domain.id}><input type="checkbox" checked={selected} onChange={() => setEditDomainIds((current) => current.includes(domain.id) ? current.filter((id) => id !== domain.id) : [...current, domain.id])} /><span className="domain-picker__color" style={{ backgroundColor: domain.color || "#2bc7c3" }} /><span>{domain.name}</span><small aria-hidden="true">✓</small></label>;
+                  })}</div>
                 </fieldset>
                 : <p className="muted">{zh ? "尚未创建领域分类，可以在“分类管理”中创建。" : "No domain categories yet. Create one under Categories."}</p>}
               <div className="feed-classification-editor__actions">
@@ -436,14 +441,17 @@ export function FeedManager({ locale, feeds, folders, domains, onClose, onChange
         <div className="field"><span>{t(locale, "folder")}</span><ComboBox value={folder} onChange={setFolder} options={folderOptions} label={t(locale, "folder")} placeholder={zh ? "输入或选择文件夹" : "Type or choose a folder"} /></div>
         <div className="field"><span>{t(locale, "interval")}</span><SelectMenu value={String(interval)} onChange={(value) => setInterval(Number(value))} label={t(locale, "interval")} options={[30, 45, 60, 120, 360].map((minutes) => ({ value: String(minutes), label: `${minutes} min` }))} /></div>
       </div>
-      {domains.length > 0 && <fieldset className="domain-picker"><legend>{t(locale, "domains")}</legend>{domains.map((domain) => <label key={domain.id}><input type="checkbox" checked={domainIds.includes(domain.id)} onChange={() => setDomainIds((current) => current.includes(domain.id) ? current.filter((id) => id !== domain.id) : [...current, domain.id])} />{domain.name}</label>)}</fieldset>}
+      {domains.length > 0 && <fieldset className="domain-picker"><legend>{t(locale, "domains")}</legend><div className="domain-picker__options">{domains.map((domain) => {
+        const selected = domainIds.includes(domain.id);
+        return <label className={selected ? "is-selected" : ""} key={domain.id}><input type="checkbox" checked={selected} onChange={() => setDomainIds((current) => current.includes(domain.id) ? current.filter((id) => id !== domain.id) : [...current, domain.id])} /><span className="domain-picker__color" style={{ backgroundColor: domain.color || "#2bc7c3" }} /><span>{domain.name}</span><small aria-hidden="true">✓</small></label>;
+      })}</div></fieldset>}
       <div className="form-actions"><button className="button button--primary" disabled={busy}>{t(locale, "addAndSync")}</button></div>
     </form>}
 
     {tab === "opml" && <div className="opml-panel">
       {error && <ErrorNotice message={error} compact />}
-      <div className="opml-card"><span className="opml-card__mark">IN</span><div><h3>{t(locale, "importOpml")}</h3><p>{zh ? "文件夹和 Affogato RSS Reader 领域关联会一并导入。" : "Folders and Affogato RSS Reader domain associations are preserved."}</p><button className="button button--primary" onClick={() => file.current?.click()}>{t(locale, "importOpml")}</button><input ref={file} hidden type="file" accept=".opml,.xml" onChange={(event) => void importOpml(event)} /></div></div>
-      <div className="opml-card"><span className="opml-card__mark">OUT</span><div><h3>{t(locale, "exportOpml")}</h3><button className="button button--secondary" onClick={() => void api.downloadOpml().then((blob) => downloadBlob(blob, "affogato-rss-reader-subscriptions.opml"))}>{t(locale, "exportOpml")}</button></div></div>
+      <div className="opml-card"><span className="opml-card__mark">IN</span><h3>{t(locale, "importOpml")}</h3><button className="button button--primary" onClick={() => file.current?.click()}>{t(locale, "importOpml")}</button><input ref={file} hidden type="file" accept=".opml,.xml" onChange={(event) => void importOpml(event)} /></div>
+      <div className="opml-card"><span className="opml-card__mark">OUT</span><h3>{t(locale, "exportOpml")}</h3><button className="button button--secondary" onClick={() => void api.downloadOpml().then((blob) => downloadBlob(blob, "affogato-rss-reader-subscriptions.opml"))}>{t(locale, "exportOpml")}</button></div>
     </div>}
 
     {tab === "categories" && <div className="category-manager">
@@ -482,5 +490,10 @@ export function FeedManager({ locale, feeds, folders, domains, onClose, onChange
         </div>)}
       </section>
     </div>}
-  </Modal>;
+    </>
+  );
+  if (embedded) {
+    return <div className="feed-manager-embedded">{manager}</div>;
+  }
+  return <Modal title={t(locale, "feedManager")} eyebrow="SOURCE MANAGEMENT" onClose={onClose} wide>{manager}</Modal>;
 }

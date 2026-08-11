@@ -184,6 +184,77 @@ export function SelectMenu<T extends string>({ value, options, onChange, label, 
   </div>;
 }
 
+export function MultiSelectMenu({ value, options, onChange, label, placeholder, compact = false, disabled = false }: {
+  value: string[];
+  options: DropdownOption<string>[];
+  onChange: (value: string[]) => void;
+  label: string;
+  placeholder?: string;
+  compact?: boolean;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+  const menuId = `${useId()}-menu`;
+  const labels = value
+    .map((item) => options.find((option) => option.value === item)?.label)
+    .filter((item): item is string => Boolean(item));
+  const triggerLabel = labels.length === 0
+    ? (placeholder || label)
+    : labels.length <= 2
+      ? labels.join(", ")
+      : `${labels.slice(0, 2).join(", ")} +${labels.length - 2}`;
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !root.current?.contains(event.target)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    return () => document.removeEventListener("pointerdown", closeOutside);
+  }, [open]);
+  return <div className={`app-dropdown ${compact ? "app-dropdown--compact" : ""} ${open ? "is-open" : ""}`} ref={root}>
+    <button
+      type="button"
+      className="app-dropdown__trigger"
+      role="combobox"
+      aria-label={label}
+      aria-haspopup="listbox"
+      aria-expanded={open}
+      aria-controls={menuId}
+      disabled={disabled}
+      onClick={() => setOpen((current) => !current)}
+      onKeyDown={(event) => {
+        if (event.key === "ArrowDown") { event.preventDefault(); setOpen(true); }
+        if (event.key === "Escape") setOpen(false);
+      }}
+    >
+      <span className={labels.length ? "" : "is-placeholder"}>{triggerLabel}</span>
+      <span className="app-dropdown__arrow" aria-hidden="true" />
+    </button>
+    {open && (
+      <div className="app-dropdown__menu" id={menuId} role="listbox" aria-label={label} aria-multiselectable="true">
+        {options.map((option) => {
+          const selected = value.includes(option.value);
+          return (
+            <button
+              type="button"
+              className={`app-dropdown__option ${selected ? "is-selected" : ""}`}
+              role="option"
+              aria-selected={selected}
+              key={option.value}
+              onClick={() => onChange(selected ? value.filter((item) => item !== option.value) : [...value, option.value])}
+            >
+              <span className="app-dropdown__check" aria-hidden="true">{selected ? "✓" : ""}</span>
+              <span className="app-dropdown__option-label">{option.label}</span>
+              {option.meta && <small>{option.meta}</small>}
+            </button>
+          );
+        })}
+      </div>
+    )}
+  </div>;
+}
+
 export function ComboBox({ value, options, onChange, label, placeholder, disabled = false }: {
   value: string;
   options: DropdownOption<string>[];

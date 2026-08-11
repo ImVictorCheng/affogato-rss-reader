@@ -9,6 +9,8 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .http_security import normalize_allowed_hosts
+
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = BACKEND_DIR.parent
@@ -23,13 +25,20 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Affogato RSS Reader"
-    version: str = "0.3.1"
+    version: str = "0.4.0"
     api_prefix: str = "/api/v1"
     data_dir: Path = Field(default=BACKEND_DIR / "data")
     database_url: str | None = None
     timezone: str = "UTC"
     auth_mode: Literal["owner", "none"] = "owner"
     debug: bool = False
+    allowed_hosts: str = "localhost,127.0.0.1,::1"
+    max_request_body_bytes: int = Field(
+        default=3 * 1024 * 1024,
+        ge=64 * 1024,
+        le=100 * 1024 * 1024,
+    )
+    request_body_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     session_days: int = Field(default=30, ge=1, le=3650)
     cookie_secure: bool = False
     scheduler_enabled: bool = True
@@ -58,6 +67,16 @@ class Settings(BaseSettings):
     translation_max_attempts: int = Field(default=4, ge=1, le=10)
     translation_retry_base_seconds: float = Field(default=2.0, ge=0, le=60)
     request_timeout_seconds: float = Field(default=25.0, gt=0, le=300)
+    feed_max_response_bytes: int = Field(
+        default=5 * 1024 * 1024,
+        ge=64 * 1024,
+        le=100 * 1024 * 1024,
+    )
+    feed_max_redirects: int = Field(default=5, ge=0, le=20)
+    feed_max_entries: int = Field(default=1000, ge=1, le=10_000)
+    feed_total_timeout_seconds: float = Field(default=60.0, gt=0, le=900)
+    feed_allow_private_networks: bool = False
+    llm_max_concurrent_requests: int = Field(default=2, ge=1, le=16)
     llm_summary_timeout_seconds: float = Field(default=30.0, gt=0, le=900)
     brief_batch_concurrency: int = Field(default=2, ge=1, le=8)
     brief_llm_max_attempts: int = Field(default=4, ge=1, le=10)
@@ -110,7 +129,16 @@ class Settings(BaseSettings):
     def valid_backup_counts(self) -> "Settings":
         if self.backup_min_count > self.backup_max_count:
             raise ValueError("backup_min_count must not exceed backup_max_count")
+        allowed_hosts = self.effective_allowed_hosts
+        if self.auth_mode == "none" and any(
+            host == "*" or host.startswith("*.") for host in allowed_hosts
+        ):
+            raise ValueError("no-auth mode requires an explicit allowed-host list")
         return self
+
+    @property
+    def effective_allowed_hosts(self) -> tuple[str, ...]:
+        return normalize_allowed_hosts(self.allowed_hosts.split(","))
 
     @property
     def effective_database_url(self) -> str:

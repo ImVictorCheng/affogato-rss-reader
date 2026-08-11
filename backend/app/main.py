@@ -10,8 +10,14 @@ from fastapi.staticfiles import StaticFiles
 
 from .api import router
 from .bootstrap import ensure_initial_owner, initial_owner_password_path
+from .call_logging import prepare_call_log_path
 from .config import get_settings
 from .db import init_database
+from .http_security import (
+    HostBoundaryMiddleware,
+    RequestBodyLimitMiddleware,
+    SecurityHeadersMiddleware,
+)
 from .scheduler import Scheduler
 
 
@@ -23,12 +29,13 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_database(settings=settings)
+    prepare_call_log_path(settings)
     initial_password = ensure_initial_owner(settings)
     if initial_password:
-        logger.warning("INITIAL OWNER PASSWORD: %s", initial_password)
         logger.warning(
-            "Use this password once to activate the owner, or retrieve it with "
-            "`affogato-rss-reader initial-password`. It is also stored at %s until activation.",
+            "An initial owner password was created. Retrieve it with "
+            "`affogato-rss-reader initial-password`; it is stored only in the "
+            "mode-0600 file at %s until activation.",
             initial_owner_password_path(settings),
         )
     background_enabled = settings.scheduler_enabled or settings.update_check_enabled
@@ -49,6 +56,22 @@ app = FastAPI(
         "cross-domain views, optional translation, and deterministic briefs."
     ),
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    max_bytes=settings.max_request_body_bytes,
+    timeout_seconds=settings.request_body_timeout_seconds,
+)
+app.add_middleware(
+    HostBoundaryMiddleware,
+    allowed_hosts=settings.effective_allowed_hosts,
+)
+app.add_middleware(
+    SecurityHeadersMiddleware,
+    api_prefix=settings.api_prefix,
 )
 app.include_router(router, prefix=settings.api_prefix)
 

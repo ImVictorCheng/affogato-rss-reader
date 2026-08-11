@@ -14,7 +14,11 @@ from .briefs import brief_markdown, create_manual_brief, run_due_schedules
 from .config import get_settings
 from .db import SessionLocal, init_database
 from .jobs import (
-    enqueue_maintenance,
+    BACKUP_KIND,
+    BRIEF_KIND,
+    FEED_SYNC_KIND,
+    TRANSLATION_KIND,
+    enqueue_job,
     recover_interrupted_jobs,
     recover_interrupted_operations,
     run_queued_jobs,
@@ -229,7 +233,8 @@ def run_jobs(
         operations = recover_interrupted_operations(db)
         recovered = recover_interrupted_jobs(db)
         if enqueue:
-            enqueue_maintenance(db, reason="cli")
+            for kind in (BACKUP_KIND, FEED_SYNC_KIND, TRANSLATION_KIND, BRIEF_KIND):
+                enqueue_job(db, kind, reason="cli")
         rows = run_queued_jobs(db, get_settings(), limit=limit)
     typer.echo(
         f"recovered={recovered} recovered_syncs={operations['sync_runs']} "

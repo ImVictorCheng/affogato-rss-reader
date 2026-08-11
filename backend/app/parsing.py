@@ -21,6 +21,16 @@ ARXIV_RE = re.compile(
 )
 DOI_RE = re.compile(r"(10\.\d{4,9}/[-._;()/:A-Z0-9]+)", re.IGNORECASE)
 TRACKING_PARAMS = {"utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "ref", "source"}
+MAX_ENTRY_URL_CHARS = 4_096
+MAX_ENTRY_GUID_CHARS = 4_096
+MAX_ENTRY_TITLE_CHARS = 2_000
+MAX_ENTRY_SUMMARY_CHARS = 500_000
+MAX_ENTRY_CONTENT_CHARS = 1_000_000
+MAX_ENTRY_AUTHORS = 100
+MAX_ENTRY_AUTHOR_CHARS = 500
+MAX_ENTRY_CATEGORIES = 100
+MAX_ENTRY_CATEGORY_CHARS = 200
+MAX_FEED_TITLE_CHARS = 500
 
 
 @dataclass(slots=True)
@@ -93,13 +103,19 @@ def clean_html(value: str | None) -> str:
     return " ".join(soup.get_text(" ", strip=True).split())
 
 
+def _bounded(value: str, *, label: str, max_chars: int) -> str:
+    if len(value) > max_chars:
+        raise ValueError(f"Feed {label} exceeds the {max_chars}-character limit")
+    return value
+
+
 def canonicalize_url(value: str | None) -> str:
     if not value:
         return ""
     try:
         parts = urlsplit(value.strip())
-        if parts.scheme.lower() not in {"http", "https"}:
-            return value.strip()
+        if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+            return ""
         host = (parts.hostname or "").lower()
         port = parts.port
         netloc = host
@@ -109,7 +125,7 @@ def canonicalize_url(value: str | None) -> str:
         path = parts.path.rstrip("/") or "/"
         return urlunsplit((parts.scheme.lower(), netloc, path, query, ""))
     except ValueError:
-        return value.strip()
+        return ""
 
 
 def normalize_doi(value: str | None) -> str | None:
@@ -158,30 +174,82 @@ def _arxiv_metadata(entry: Any, url: str, guid: str | None) -> tuple[str | None,
     return None, None, None
 
 
-def parse_feed(content: bytes, content_type: str | None = None) -> tuple[dict, list[ParsedEntry]]:
+def parse_feed(
+    content: bytes,
+    content_type: str | None = None,
+    *,
+    max_entries: int | None = None,
+) -> tuple[dict, list[ParsedEntry]]:
     parsed = feedparser.parse(content, response_headers={"content-type": content_type or ""})
     if parsed.bozo and not parsed.entries:
         raise ValueError(f"Invalid feed: {parsed.bozo_exception}")
+    if max_entries is not None and len(parsed.entries) > max_entries:
+        raise ValueError(f"Feed contains more than {max_entries} entries")
     output: list[ParsedEntry] = []
     for item in parsed.entries:
         url = str(_get(item, "link", "id") or "").strip()
         if not url:
             continue
-        title = clean_html(str(_get(item, "title") or "(untitled)"))
-        summary = clean_html(str(_get(item, "summary", "description") or ""))
+        _bounded(url, label="entry URL", max_chars=MAX_ENTRY_URL_CHARS)
+        title = _bounded(
+            clean_html(str(_get(item, "title") or "(untitled)")),
+            label="entry title",
+            max_chars=MAX_ENTRY_TITLE_CHARS,
+        )
+        summary = _bounded(
+            clean_html(str(_get(item, "summary", "description") or "")),
+            label="entry summary",
+            max_chars=MAX_ENTRY_SUMMARY_CHARS,
+        )
         content_items = item.get("content") or []
-        content = clean_html(content_items[0].get("value")) if content_items else None
+        content = (
+            _bounded(
+                clean_html(content_items[0].get("value")),
+                label="entry content",
+                max_chars=MAX_ENTRY_CONTENT_CHARS,
+            )
+            if content_items
+            else None
+        )
         guid = str(_get(item, "id", "guid") or "") or None
+        if guid:
+            _bounded(guid, label="entry GUID", max_chars=MAX_ENTRY_GUID_CHARS)
+        raw_authors = item.get("authors") or []
+        if len(raw_authors) > MAX_ENTRY_AUTHORS:
+            raise ValueError(f"Feed entry has more than {MAX_ENTRY_AUTHORS} authors")
         authors = [
-            clean_html(str(author.get("name") or ""))
-            for author in (item.get("authors") or [])
+            _bounded(
+                clean_html(str(author.get("name") or "")),
+                label="author name",
+                max_chars=MAX_ENTRY_AUTHOR_CHARS,
+            )
+            for author in raw_authors
             if author.get("name")
         ]
         if not authors and item.get("author"):
             authors = [part.strip() for part in re.split(r",|;|\band\b", clean_html(item.author)) if part.strip()]
+            if len(authors) > MAX_ENTRY_AUTHORS:
+                raise ValueError(f"Feed entry has more than {MAX_ENTRY_AUTHORS} authors")
+            authors = [
+                _bounded(
+                    author,
+                    label="author name",
+                    max_chars=MAX_ENTRY_AUTHOR_CHARS,
+                )
+                for author in authors
+            ]
+        raw_categories = item.get("tags") or []
+        if len(raw_categories) > MAX_ENTRY_CATEGORIES:
+            raise ValueError(
+                f"Feed entry has more than {MAX_ENTRY_CATEGORIES} categories"
+            )
         categories = sorted({
-            str(tag.get("term")).strip()
-            for tag in (item.get("tags") or [])
+            _bounded(
+                str(tag.get("term")).strip(),
+                label="category",
+                max_chars=MAX_ENTRY_CATEGORY_CHARS,
+            )
+            for tag in raw_categories
             if tag.get("term")
         })
         arxiv_id, arxiv_base, arxiv_version = _arxiv_metadata(item, url, guid)
@@ -213,8 +281,15 @@ def parse_feed(content: bytes, content_type: str | None = None) -> tuple[dict, l
                 updated_at=struct_time_to_datetime(_get(item, "updated_parsed", "modified_parsed")),
             )
         )
+    feed_title = _bounded(
+        clean_html(str(parsed.feed.get("title", ""))),
+        label="title",
+        max_chars=MAX_FEED_TITLE_CHARS,
+    )
+    raw_site_url = str(parsed.feed.get("link", ""))
+    _bounded(raw_site_url, label="site URL", max_chars=MAX_ENTRY_URL_CHARS)
     metadata = {
-        "title": clean_html(str(parsed.feed.get("title", ""))),
-        "site_url": canonicalize_url(str(parsed.feed.get("link", ""))),
+        "title": feed_title,
+        "site_url": canonicalize_url(raw_site_url),
     }
     return metadata, output

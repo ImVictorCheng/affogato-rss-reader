@@ -16,6 +16,7 @@ backend/data/
 backend/static/
 web/node_modules/
 web/dist/
+web/public/vendor/mathjax/
 web/test-results/
 playwright-report/
 *.db

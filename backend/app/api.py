@@ -4,8 +4,7 @@ import re
 from datetime import datetime
 from datetime import timezone
 from time import perf_counter
-from threading import Lock
-from typing import Annotated, Literal
+from typing import Annotated, Callable, Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Cookie, Depends, File, HTTPException, Query, Request, Response, UploadFile
@@ -16,16 +15,27 @@ from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings
 from .bootstrap import remove_initial_owner_password
+from .auto_tag import auto_tag_status, configure_auto_tag
 from .call_logging import read_call_logs
 from .db import get_db
 from .briefs import (
+    BriefCheckpointLoader,
+    BriefCheckpointSaver,
+    BriefGenerationCancelled,
+    BriefProgressCallback,
+    BriefShouldStop,
+    brief_generation_job_by_key,
     brief_item_count,
     brief_markdown,
+    brief_schedule_window_key,
+    create_brief,
     create_manual_brief,
+    execute_brief_generation,
     read_brief_rule,
     reset_brief_rule,
     run_due_schedules,
     save_brief_rule,
+    schedule_window,
 )
 from .models import (
     AppSetting,
@@ -112,6 +122,8 @@ from .schemas import (
     TagListOut,
     TagOut,
     TagWithCountOut,
+    AutoTagStatusOut,
+    AutoTagToggle,
     TranslationRetry,
     TranslationStatusOut,
     TranslationTest,
@@ -137,6 +149,7 @@ from .llm import (
     BRIEF_FEATURE,
     LLMConnectionError,
     LLMConnectionInUseError,
+    abort_llm_requests,
     bind_llm_connection,
     decrypt_llm_api_key,
     delete_llm_connection,
@@ -163,7 +176,7 @@ from .security import (
     verify_password,
 )
 from .secrets import SecretKeyError
-from .sync import discover_feeds, sync_feed
+from .sync import discover_feeds, sync_due_feeds, sync_feed
 from .translation import (
     TranslationConfigurationError,
     TranslationError,
@@ -958,10 +971,11 @@ def discover_feed(
     body: DiscoverBody,
     _owner: Owner = Depends(current_owner),
     _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict:
     try:
-        return {"items": discover_feeds(str(body.url), settings)}
+        return {"items": discover_feeds(str(body.url), settings, db)}
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Feed discovery failed: {exc}") from exc
 
@@ -1085,6 +1099,16 @@ def refresh_feed(
     if feed is None:
         raise not_found("Feed")
     sync_feed(db, feed, settings)
+
+
+@router.post("/feeds/refresh-all")
+def refresh_all_feeds(
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict[str, int]:
+    runs = sync_due_feeds(db, settings, force=True)
+    return {"refreshed": len(runs)}
 
 
 @router.patch("/feeds/{feed_id}", response_model=FeedOut)
@@ -1452,6 +1476,49 @@ def toggle_translation(
     return get_translation_status(_owner=db.get(Owner, 1), db=db)  # type: ignore[arg-type]
 
 
+@router.get("/auto-tag/status", response_model=AutoTagStatusOut)
+def get_auto_tag_status(
+    _owner: Owner = Depends(current_owner),
+    db: Session = Depends(get_db),
+) -> dict:
+    data = auto_tag_status(db)
+    counts = data.pop("counts")
+    return {
+        **data,
+        "pending_count": counts["pending"],
+        "running_count": counts["running"],
+        "complete_count": counts["complete"],
+        "failed_count": counts["failed"],
+    }
+
+
+@router.patch("/auto-tag/status", response_model=AutoTagStatusOut)
+def set_auto_tag_status(
+    body: AutoTagToggle,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        configure_auto_tag(
+            db,
+            enabled=body.enabled,
+            create_new=body.create_new,
+            llm_connection_id=body.llm_connection_id,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    data = auto_tag_status(db)
+    counts = data.pop("counts")
+    return {
+        **data,
+        "pending_count": counts["pending"],
+        "running_count": counts["running"],
+        "complete_count": counts["complete"],
+        "failed_count": counts["failed"],
+    }
+
+
 @router.post("/translations/test", response_model=TranslationTestOut)
 def test_translation(
     body: TranslationTest,
@@ -1536,6 +1603,20 @@ def test_llm_connection(
         connection.base_url if connection else None
     )
     model = body.model or (connection.model if connection else None)
+    if (
+        connection is not None
+        and connection.api_key_encrypted
+        and body.api_key is None
+        and body.base_url is not None
+        and str(body.base_url).rstrip("/") != connection.base_url.rstrip("/")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Testing a different LLM base URL requires a new API key; "
+                "the saved key is bound to its existing URL"
+            ),
+        )
     try:
         api_key = body.api_key or (
             decrypt_llm_api_key(connection, settings) if connection else None
@@ -1591,6 +1672,9 @@ def update_llm_connection(
         )
         db.commit()
         db.refresh(connection)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="LLM connection name already exists") from exc
@@ -1824,6 +1908,19 @@ def serialize_brief(db: Session, brief: Brief) -> dict:
     }
 
 
+def _validate_schedule_window_times(start_time: str | None, cutoff_time: str) -> None:
+    """Reject a daily start time that is not earlier than the cutoff (end) time."""
+    if not start_time:
+        return
+    def minutes(value: str) -> int:
+        return int(value[:2]) * 60 + int(value[3:])
+    if minutes(start_time) >= minutes(cutoff_time):
+        raise HTTPException(
+            status_code=422,
+            detail="start_time must be earlier than cutoff_time",
+        )
+
+
 def serialize_brief_schedule(schedule: BriefSchedule) -> dict:
     return {
         "id": schedule.id,
@@ -1831,6 +1928,7 @@ def serialize_brief_schedule(schedule: BriefSchedule) -> dict:
         "period": schedule.period,
         "timezone": schedule.timezone,
         "cutoff_time": schedule.cutoff_time,
+        "start_time": schedule.start_time,
         "weekday": schedule.weekday,
         "month_day": schedule.month_day,
         "year_month": schedule.year_month,
@@ -1962,6 +2060,8 @@ def _serialize_brief_generation_progress(job: Job) -> dict:
         "message": job.error if job.status == "failed" else progress.get("message"),
         "can_retry": job.status == "failed" and isinstance(request_payload, dict),
         "attempt": max(1, int(result.get("attempt", 1))),
+        "stopped": bool(result.get("stopped", False)),
+        "schedule_id": (job.payload or {}).get("schedule_id"),
     }
 
 
@@ -2003,79 +2103,19 @@ def get_brief_generation_progress(
     return _serialize_brief_generation_progress(job)
 
 
-def _execute_brief_generation(
+def _manual_brief_factory(
     db: Session,
-    *,
-    job: Job,
     body: BriefCreate,
     settings: Settings,
-) -> dict:
-    progress_lock = Lock()
-    progress_bind = db.get_bind()
-
-    def report_progress(
-        stage: str,
-        completed: int,
-        total: int,
-        message: str | None,
-    ) -> None:
-        with progress_lock:
-            with Session(bind=progress_bind) as progress_db:
-                current = progress_db.get(Job, job.id)
-                if current is None:
-                    return
-                current.result = {
-                    **(current.result or {}),
-                    "progress": {
-                        "stage": stage,
-                        "completed": completed,
-                        "total": total,
-                        "message": message,
-                    },
-                }
-                progress_db.commit()
-
-    def load_checkpoint(stage: str, prompt_hash: str) -> str | None:
-        return db.scalar(
-            select(BriefGenerationCheckpoint.content).where(
-                BriefGenerationCheckpoint.job_id == job.id,
-                BriefGenerationCheckpoint.stage == stage,
-                BriefGenerationCheckpoint.prompt_hash == prompt_hash,
-            )
-        )
-
-    def save_checkpoint(stage: str, prompt_hash: str, content: str) -> None:
-        checkpoint = db.scalar(
-            select(BriefGenerationCheckpoint).where(
-                BriefGenerationCheckpoint.job_id == job.id,
-                BriefGenerationCheckpoint.stage == stage,
-                BriefGenerationCheckpoint.prompt_hash == prompt_hash,
-            )
-        )
-        if checkpoint is None:
-            checkpoint = BriefGenerationCheckpoint(
-                job_id=job.id,
-                stage=stage,
-                prompt_hash=prompt_hash,
-                content=content,
-            )
-            db.add(checkpoint)
-        else:
-            checkpoint.content = content
-        db.commit()
-
-    def fail_job(message: str) -> None:
-        db.rollback()
-        current = db.get(Job, job.id)
-        if current is None:
-            return
-        current.status = "failed"
-        current.error = message[:4000]
-        current.finished_at = utcnow()
-        db.commit()
-
-    try:
-        brief = create_manual_brief(
+) -> Callable[[BriefProgressCallback | None, BriefCheckpointLoader | None, BriefCheckpointSaver | None, BriefShouldStop | None, str | None], Brief]:
+    def factory(
+        progress_callback: BriefProgressCallback | None,
+        checkpoint_loader: BriefCheckpointLoader | None,
+        checkpoint_saver: BriefCheckpointSaver | None,
+        should_stop: BriefShouldStop | None,
+        request_token: str | None,
+    ) -> Brief:
+        return create_manual_brief(
             db,
             body.period,
             at=body.at,
@@ -2089,43 +2129,34 @@ def _execute_brief_generation(
             },
             idempotency_key=body.idempotency_key,
             settings=settings,
-            progress_callback=report_progress,
-            checkpoint_loader=load_checkpoint,
-            checkpoint_saver=save_checkpoint,
+            progress_callback=progress_callback,
+            checkpoint_loader=checkpoint_loader,
+            checkpoint_saver=checkpoint_saver,
+            should_stop=should_stop,
+            request_token=request_token,
         )
-    except ValueError as exc:
-        fail_job(str(exc))
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except LLMConnectionError as exc:
-        fail_job(str(exc))
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except Exception as exc:
-        fail_job(str(exc))
-        raise
+
+    return factory
+
+
+def _execute_brief_generation(
+    db: Session,
+    *,
+    job: Job,
+    body: BriefCreate,
+    settings: Settings,
+) -> dict:
+    result = execute_brief_generation(
+        db,
+        job=job,
+        settings=settings,
+        brief_factory=_manual_brief_factory(db, body, settings),
+    )
+    brief = result["brief"]
     if body.title and brief.title != body.title:
         brief.title = body.title.strip()
         db.commit()
-    current = db.get(Job, job.id)
-    if current is not None:
-        current.status = "completed"
-        current.result = {
-            **(current.result or {}),
-            "progress": {
-                "stage": "finalizing",
-                "completed": 1,
-                "total": 1,
-            },
-            "brief_id": brief.id,
-        }
-        current.error = None
-        current.finished_at = utcnow()
-        db.execute(
-            delete(BriefGenerationCheckpoint).where(
-                BriefGenerationCheckpoint.job_id == job.id
-            )
-        )
-        db.commit()
-    return serialize_brief(db, brief)
+    return result
 
 
 @router.post("/briefs", status_code=201, response_model=BriefOut)
@@ -2173,7 +2204,91 @@ def generate_brief(
     db.add(job)
     db.commit()
     db.refresh(job)
-    return _execute_brief_generation(db, job=job, body=body, settings=settings)
+    try:
+        result = _execute_brief_generation(db, job=job, body=body, settings=settings)
+    except BriefGenerationCancelled as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Brief generation was stopped by the owner.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LLMConnectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return serialize_brief(db, result["brief"])
+
+
+def _run_brief_generation_from_job(
+    db: Session,
+    *,
+    job: Job,
+    settings: Settings,
+    from_scratch: bool = False,
+) -> dict:
+    """Re-run a failed brief generation from its saved request payload.
+
+    ``from_scratch`` clears the saved checkpoints first so the LLM starts
+    over; otherwise the previous batches are resumed from checkpoints.
+    """
+    request_payload = (job.payload or {}).get("request")
+    if not isinstance(request_payload, dict):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This task was created before resumable checkpoints were enabled "
+                "and cannot continue from its previous batches."
+            ),
+        )
+    payload = dict(job.payload or {})
+    payload["stop_requested"] = False
+    job.payload = payload
+    if from_scratch:
+        db.execute(
+            delete(BriefGenerationCheckpoint).where(
+                BriefGenerationCheckpoint.job_id == job.id
+            )
+        )
+        db.commit()
+    result = dict(job.result or {})
+    result["attempt"] = max(1, int(result.get("attempt", 1))) + 1
+    result["stopped"] = False
+    result["progress"] = {
+        **(result.get("progress") or {}),
+        "message": (
+            "Restarting from scratch"
+            if from_scratch
+            else "Resuming from saved checkpoints"
+        ),
+    }
+    job.result = result
+    job.status = "running"
+    job.error = None
+    job.started_at = utcnow()
+    job.finished_at = None
+    db.commit()
+    if job.payload.get("schedule_id"):
+        brief = _execute_scheduled_brief_generation(db, job=job, settings=settings)
+    else:
+        try:
+            body = BriefCreate.model_validate(request_payload)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="The saved brief request is no longer valid.",
+            ) from exc
+        try:
+            result = _execute_brief_generation(db, job=job, body=body, settings=settings)
+        except BriefGenerationCancelled as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="Brief generation was stopped by the owner.",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except LLMConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        brief = result["brief"]
+    return serialize_brief(db, brief)
 
 
 @router.post(
@@ -2197,35 +2312,60 @@ def retry_brief_generation(
         if brief is None:
             raise not_found("Brief")
         return serialize_brief(db, brief)
-    request_payload = (job.payload or {}).get("request")
-    if not isinstance(request_payload, dict):
+    return _run_brief_generation_from_job(db, job=job, settings=settings)
+
+
+@router.post(
+    "/briefs/generation-progress/{idempotency_key}/restart",
+    response_model=BriefOut,
+)
+def restart_brief_generation(
+    idempotency_key: str,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    job = _brief_generation_job(db, idempotency_key)
+    if job is None:
+        raise not_found("Brief generation")
+    if job.status == "running":
+        raise HTTPException(status_code=409, detail="Brief generation is still running.")
+    if job.status == "completed":
+        brief_id = (job.result or {}).get("brief_id")
+        brief = db.get(Brief, brief_id) if brief_id else None
+        if brief is None:
+            raise not_found("Brief")
+        return serialize_brief(db, brief)
+    return _run_brief_generation_from_job(
+        db, job=job, settings=settings, from_scratch=True
+    )
+
+
+@router.post(
+    "/briefs/generation-progress/{idempotency_key}/stop",
+    response_model=BriefGenerationProgressOut,
+)
+def stop_brief_generation(
+    idempotency_key: str,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    job = _brief_generation_job(db, idempotency_key)
+    if job is None:
+        raise not_found("Brief generation")
+    if job.status != "running":
         raise HTTPException(
             status_code=409,
-            detail=(
-                "This task was created before resumable checkpoints were enabled "
-                "and cannot continue from its previous batches."
-            ),
+            detail="Brief generation is not running.",
         )
-    try:
-        body = BriefCreate.model_validate(request_payload)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail="The saved brief request is no longer valid.",
-        ) from exc
-    result = dict(job.result or {})
-    result["attempt"] = max(1, int(result.get("attempt", 1))) + 1
-    result["progress"] = {
-        **(result.get("progress") or {}),
-        "message": "Resuming from saved checkpoints",
-    }
-    job.result = result
-    job.status = "running"
-    job.error = None
-    job.started_at = utcnow()
-    job.finished_at = None
+    payload = dict(job.payload or {})
+    payload["stop_requested"] = True
+    job.payload = payload
     db.commit()
-    return _execute_brief_generation(db, job=job, body=body, settings=settings)
+    # Preemptively close any in-flight LLM request so the running thread
+    # aborts immediately instead of waiting for the next cooperative check.
+    abort_llm_requests(f"brief-{job.id}")
+    return _serialize_brief_generation_progress(job)
 
 
 @router.get("/briefs/{brief_id}", response_model=BriefDetailOut)
@@ -2299,6 +2439,139 @@ def export_brief(
     )
 
 
+def _execute_scheduled_brief_generation(
+    db: Session,
+    *,
+    job: Job,
+    settings: Settings,
+) -> Brief:
+    request_payload = (job.payload or {}).get("request")
+    schedule_id = (job.payload or {}).get("schedule_id")
+    idempotency_key = str(job.payload.get("idempotency_key", ""))
+    period = str(request_payload.get("period", "daily"))
+    start_at = datetime.fromisoformat(str(request_payload["start_at"]))
+    end_at = datetime.fromisoformat(str(request_payload["end_at"]))
+    filters = dict(request_payload.get("filters") or {})
+    title = request_payload.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = None
+
+    def factory(
+        progress_callback: BriefProgressCallback | None,
+        checkpoint_loader: BriefCheckpointLoader | None,
+        checkpoint_saver: BriefCheckpointSaver | None,
+        should_stop: BriefShouldStop | None,
+        request_token: str | None,
+    ) -> Brief:
+        return create_brief(
+            db,
+            period=period,
+            start_at=start_at,
+            end_at=end_at,
+            filters=filters,
+            schedule_id=schedule_id,
+            idempotency_key=idempotency_key,
+            title=title,
+            settings=settings,
+            progress_callback=progress_callback,
+            checkpoint_loader=checkpoint_loader,
+            checkpoint_saver=checkpoint_saver,
+            should_stop=should_stop,
+            request_token=request_token,
+        )
+
+    try:
+        result = execute_brief_generation(
+            db,
+            job=job,
+            settings=settings,
+            brief_factory=factory,
+        )
+    except BriefGenerationCancelled:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except LLMConnectionError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    schedule = db.get(BriefSchedule, schedule_id) if schedule_id else None
+    if schedule is not None:
+        schedule.last_run_at = utcnow()
+        db.commit()
+    return result["brief"]
+
+
+@router.post("/brief-schedules/{schedule_id}/run", response_model=BriefOut)
+def run_brief_schedule(
+    schedule_id: int,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    schedule = db.get(BriefSchedule, schedule_id)
+    if schedule is None:
+        raise not_found("Brief schedule")
+    if not schedule.enabled:
+        raise HTTPException(status_code=409, detail="The schedule is disabled.")
+    start_at, end_at = schedule_window(schedule)
+    idempotency_key = brief_schedule_window_key(schedule.id, start_at, end_at)
+    existing_job = brief_generation_job_by_key(db, idempotency_key)
+    if existing_job is not None:
+        if existing_job.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail="This schedule is already generating its current brief.",
+            )
+        if existing_job.status == "completed":
+            brief_id = (existing_job.result or {}).get("brief_id")
+            brief = db.get(Brief, brief_id) if brief_id else None
+            if brief is not None:
+                return serialize_brief(db, brief)
+    job = Job(
+        kind="brief_generation",
+        status="running",
+        payload={
+            "idempotency_key": idempotency_key,
+            "period": schedule.period,
+            "schedule_id": schedule.id,
+            "request": {
+                "schedule_id": schedule.id,
+                "period": schedule.period,
+                "start_at": start_at.isoformat(),
+                "end_at": end_at.isoformat(),
+                "filters": {
+                    "domain_ids": schedule.domain_ids,
+                    "feed_ids": schedule.feed_ids,
+                    "tag_ids": schedule.tag_ids,
+                    "domain_match": schedule.domain_match,
+                },
+                "title": f"{schedule.name} · {end_at.date().isoformat()}",
+                "idempotency_key": idempotency_key,
+            },
+        },
+        result={
+            "attempt": 1,
+            "progress": {
+                "stage": "preparing",
+                "completed": 0,
+                "total": 1,
+                "message": None,
+            },
+        },
+        started_at=utcnow(),
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+    try:
+        brief = _execute_scheduled_brief_generation(db, job=job, settings=settings)
+    except BriefGenerationCancelled as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="Brief generation was stopped by the owner.",
+        ) from exc
+    return serialize_brief(db, brief)
+
+
 @router.get("/brief-schedules", response_model=BriefScheduleListOut)
 def list_brief_schedules(
     _owner: Owner = Depends(current_owner),
@@ -2318,6 +2591,7 @@ def create_brief_schedule(
         ZoneInfo(body.timezone)
     except Exception as exc:
         raise HTTPException(status_code=422, detail="Invalid timezone") from exc
+    _validate_schedule_window_times(body.start_time, body.cutoff_time)
     schedule = BriefSchedule(**body.model_dump())
     db.add(schedule)
     db.commit()
@@ -2341,6 +2615,10 @@ def update_brief_schedule(
             ZoneInfo(changes["timezone"])
         except Exception as exc:
             raise HTTPException(status_code=422, detail="Invalid timezone") from exc
+    _validate_schedule_window_times(
+        changes.get("start_time", schedule.start_time),
+        changes.get("cutoff_time", schedule.cutoff_time),
+    )
     for key, value in changes.items():
         setattr(schedule, key, value)
     db.commit()

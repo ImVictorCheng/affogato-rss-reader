@@ -7,15 +7,14 @@ import { AuthScreen } from "./components/AuthScreen";
 import { Brand, BrandProvider, ErrorNotice, Spinner, Toast } from "./components/Common";
 import { EntryDetail } from "./components/EntryDetail";
 import { EntryList } from "./components/EntryList";
-import { FeedManager } from "./components/FeedManager";
 import { LazyLoadBoundary } from "./components/LazyLoadBoundary";
 import { OnboardingWizard } from "./components/OnboardingWizard";
 import { SettingsModal } from "./components/SettingsModal";
 import { Sidebar, UNCATEGORIZED_FOLDER } from "./components/Sidebar";
 import type { AuthStatus, Domain, DomainMatch, Entry, EntryState, Feed, Folder, FolderSortMode, LanguageMode, Locale, MobilePane, ReaderView, SortDirection, SourceSortSettings, Tag, ThemeConfig, UpdateStatus } from "./types";
-import { errorText } from "./utils";
+import { errorText, safeHttpUrl } from "./utils";
 
-type ModalName = "feeds" | "settings" | null;
+type ModalName = "settings" | null;
 type WorkspaceName = "reader" | "briefs";
 type Notice = { message: string; tone: "success" | "error"; key: number };
 type PaneWidths = { sidebar: number; list: number };
@@ -203,6 +202,7 @@ function ReaderApp({ auth, locale, onLocale, onSignedOut, onDebugReset, onTheme 
   const [workspace, setWorkspace] = useState<WorkspaceName>("reader");
   const [notice, setNotice] = useState<Notice | null>(null);
   const [refreshingSource, setRefreshingSource] = useState(false);
+  const [refreshingAll, setRefreshingAll] = useState(false);
   const [markingAllRead, setMarkingAllRead] = useState(false);
   const [paneWidths, setPaneWidths] = useState<PaneWidths>(() => fitPaneWidths(savedPaneWidths(), window.innerWidth));
   const [sidebarCollapsed, setSidebarCollapsed] = useState(savedSidebarCollapsed);
@@ -373,6 +373,19 @@ function ReaderApp({ auth, locale, onLocale, onSignedOut, onDebugReset, onTheme 
       setRefreshingSource(false);
     }
   }
+  async function refreshAllFeeds() {
+    if (refreshingAll) return;
+    setRefreshingAll(true);
+    try {
+      const result = await api.refreshAllFeeds();
+      await Promise.all([loadEntries(), loadNavigation()]);
+      notify(locale === "zh-CN" ? `已刷新 ${result.refreshed} 个订阅源` : `Refreshed ${result.refreshed} sources`);
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setRefreshingAll(false);
+    }
+  }
   async function updateSourceSort(sortMode: FolderSortMode, sortDirection: SortDirection) {
     const previous = sourceSort;
     const next = { sort_mode: sortMode, sort_direction: sortDirection };
@@ -428,7 +441,10 @@ function ReaderApp({ auth, locale, onLocale, onSignedOut, onDebugReset, onTheme 
       if (key === "s") void updateState(detailEntry, { starred: !detailEntry.state.starred });
       if (key === "l") void updateState(detailEntry, { later: !detailEntry.state.later });
       if (key === "a") void updateState(detailEntry, { archived: !detailEntry.state.archived });
-      if (key === "o") window.open(detailEntry.url, "_blank", "noopener,noreferrer");
+      if (key === "o") {
+        const url = safeHttpUrl(detailEntry.url);
+        if (url) window.open(url, "_blank", "noopener,noreferrer");
+      }
     }
     window.addEventListener("keydown", keydown); return () => window.removeEventListener("keydown", keydown);
   }, [detailEntry, entries, modal, open, updateState]);
@@ -454,14 +470,14 @@ function ReaderApp({ auth, locale, onLocale, onSignedOut, onDebugReset, onTheme 
 
   return <div ref={readerShell} style={layoutStyle} className={`reader-shell mobile-pane--${mobilePane} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""} ${workspace === "briefs" ? "is-brief-workspace" : ""}`}>
     {appUpdate && (appUpdate.downloaded || ["available_manual", "download_failed", "install_failed"].includes(appUpdate.status)) && <aside className={`update-banner update-banner--${appUpdate.status}`} role="status">
-      <div><span className="eyebrow">UPDATE</span><strong>{appUpdate.downloaded ? (locale === "zh-CN" ? `版本 ${appUpdate.latest_version} 已准备好` : `Version ${appUpdate.latest_version} is ready`) : (locale === "zh-CN" ? "发现新版本" : "A new version is available")}</strong>{appUpdate.error && <small>{appUpdate.error}</small>}</div>
+      <div><span className="eyebrow">UPDATE</span><strong>{appUpdate.downloaded ? (locale === "zh-CN" ? `版本 ${appUpdate.latest_version} 已准备好` : `Version ${appUpdate.latest_version} is ready`) : (locale === "zh-CN" ? "发现新版本" : "A new version is available")}</strong>{appUpdate.error && <small>{appUpdate.error}</small>}{appUpdate.downloaded && !appUpdate.install_supported && <small>{locale === "zh-CN" ? "自动安装等待独立签名清单验证，请从 Release 页面手动更新。" : "Automatic installation awaits independently signed release manifests; update manually from the Release page."}</small>}</div>
       <div className="update-banner__actions">
-        {appUpdate.downloaded && <button type="button" className="button button--primary button--small" disabled={installingUpdate || !appUpdate.install_supported} onClick={() => void installAvailableUpdate()}>{installingUpdate ? (locale === "zh-CN" ? "正在重启…" : "Restarting…") : (locale === "zh-CN" ? "安装并重启" : "Install and restart")}</button>}
-        {appUpdate.release_url && <a className="button button--secondary button--small" href={appUpdate.release_url} target="_blank" rel="noreferrer">{locale === "zh-CN" ? "查看版本" : "View release"}</a>}
+        {appUpdate.downloaded && appUpdate.install_supported && <button type="button" className="button button--primary button--small" disabled={installingUpdate} onClick={() => void installAvailableUpdate()}>{installingUpdate ? (locale === "zh-CN" ? "正在重启…" : "Restarting…") : (locale === "zh-CN" ? "安装并重启" : "Install and restart")}</button>}
+        {safeHttpUrl(appUpdate.release_url) && <a className="button button--secondary button--small" href={safeHttpUrl(appUpdate.release_url) ?? undefined} target="_blank" rel="noreferrer">{locale === "zh-CN" ? "查看版本" : "View release"}</a>}
         <button type="button" className="icon-button" aria-label={locale === "zh-CN" ? "暂时关闭更新提示" : "Dismiss update notice"} onClick={() => setAppUpdate(null)}>×</button>
       </div>
     </aside>}
-    <header className="mobile-header"><button className="icon-button icon-button--dark" onClick={() => setMobilePane("navigation")}>☰</button><Brand compact /><button className="icon-button icon-button--dark" onClick={() => setModal("settings")}>⚙</button></header><Sidebar locale={locale} feeds={feeds} folders={sourceFolders} domains={domains} tags={tags} activeView={view} activeFeedId={feedId} activeFolder={folder} activeTagId={tagId} activeDomainIds={domainIds} domainMatch={domainMatch} resultCount={total} authMode={auth.mode} sortMode={sourceSort.sort_mode} sortDirection={sourceSort.sort_direction} briefsActive={workspace === "briefs"} onSelectView={(value) => { showReader(); setView(value); clearSourceFilters(); }} onSelectFeed={(id) => { showReader(); setFeedId(id); setFolder(null); setTagId(null); setView("all"); }} onSelectFolder={(value) => { showReader(); setFolder(value); setFeedId(null); setTagId(null); setView("all"); }} onSelectTag={(id) => { showReader(); setTagId(id); setFeedId(null); setFolder(null); setView("all"); }} onToggleDomain={(id) => { showReader(); setDomainIds((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]); }} onDomainMatch={setDomainMatch} onClearDomains={() => setDomainIds([])} onSourceSort={(mode, direction) => void updateSourceSort(mode, direction)} onReorderFeeds={(name, ids) => void reorderSourceFeeds(name, ids)} onManageFeeds={() => setModal("feeds")} onOpenBriefs={() => { setWorkspace("briefs"); setMobilePane("list"); }} onOpenSettings={() => setModal("settings")} onLogout={() => void logout()} />
+    <header className="mobile-header"><button className="icon-button icon-button--dark" onClick={() => setMobilePane("navigation")}>☰</button><Brand compact /><button className="icon-button icon-button--dark" onClick={() => setModal("settings")}>⚙</button></header><Sidebar locale={locale} feeds={feeds} folders={sourceFolders} domains={domains} tags={tags} activeView={view} activeFeedId={feedId} activeFolder={folder} activeTagId={tagId} activeDomainIds={domainIds} domainMatch={domainMatch} resultCount={total} authMode={auth.mode} sortMode={sourceSort.sort_mode} sortDirection={sourceSort.sort_direction} briefsActive={workspace === "briefs"} onSelectView={(value) => { showReader(); setView(value); clearSourceFilters(); }} onSelectFeed={(id) => { showReader(); setFeedId(id); setFolder(null); setTagId(null); setView("all"); }} onSelectFolder={(value) => { showReader(); setFolder(value); setFeedId(null); setTagId(null); setView("all"); }} onSelectTag={(id) => { showReader(); setTagId(id); setFeedId(null); setFolder(null); setView("all"); }} onToggleDomain={(id) => { showReader(); setDomainIds((items) => items.includes(id) ? items.filter((item) => item !== id) : [...items, id]); }} onDomainMatch={setDomainMatch} onClearDomains={() => setDomainIds([])}     onSourceSort={(mode, direction) => void updateSourceSort(mode, direction)} onReorderFeeds={(name, ids) => void reorderSourceFeeds(name, ids)} onRefreshAll={() => void refreshAllFeeds()} refreshingAll={refreshingAll} onOpenBriefs={() => { setWorkspace("briefs"); setMobilePane("list"); }} onOpenSettings={() => setModal("settings")} onLogout={() => void logout()} />
     <button
       type="button"
       className="sidebar-collapse-toggle"
@@ -480,7 +496,6 @@ function ReaderApp({ auth, locale, onLocale, onSignedOut, onDebugReset, onTheme 
       <EntryDetail locale={locale} entry={detailEntry} loading={detailLoading} error="" languageMode={languageMode} allTags={tags} allDomains={domains} onLanguageMode={setLanguageMode} onState={(state) => detailEntry && void updateState(detailEntry, state)} onAddTag={(tag) => void addTag(tag)} onRemoveTag={(tag) => void removeTag(tag)} onCreateTag={createTag} onDomains={(ids) => void setEntryDomains(ids)} onBack={() => setMobilePane("list")} onRetry={() => detailEntry && void api.entry(detailEntry.id).then(setDetailEntry)} />
     </>}
     {mobilePane === "navigation" && <button className="mobile-nav-scrim" onClick={() => setMobilePane("list")} aria-label="Close navigation" />}
-    {modal === "feeds" && <FeedManager locale={locale} feeds={feeds} folders={sourceFolders} domains={domains} onClose={() => setModal(null)} onChanged={async () => { await loadNavigation(); await loadEntries(); }} notify={notify} />}
     {modal === "settings" && <SettingsModal locale={locale} auth={auth} onLocale={onLocale} onClose={() => setModal(null)} onLogout={() => void logout()} onDebugReset={onDebugReset} onBrandChanged={onTheme} onInstallUpdate={installAvailableUpdate} notify={notify} />}
     {notice && <Toast key={notice.key} message={notice.message} tone={notice.tone} onDismiss={() => setNotice(null)} />}
   </div>;

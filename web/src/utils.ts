@@ -38,6 +38,17 @@ export function formatArxivIdentifier(id?: string | null, version?: number | nul
   return `arXiv:${/v\d+$/i.test(normalized) || !version ? normalized : `${normalized}v${version}`}`;
 }
 
+export function safeHttpUrl(value?: string | null): string | null {
+  if (!value?.trim()) return null;
+  try {
+    const base = globalThis.location?.href || "http://localhost/";
+    const parsed = new URL(value, base);
+    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 export function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");

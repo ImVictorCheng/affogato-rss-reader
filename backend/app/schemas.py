@@ -366,6 +366,9 @@ class BriefScheduleCreate(BaseModel):
     period: Literal["daily", "weekly", "monthly", "yearly"]
     timezone: str = Field(default="UTC", max_length=80)
     cutoff_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    start_time: str | None = Field(
+        default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$"
+    )
     weekday: int | None = Field(default=None, ge=0, le=6)
     month_day: int | None = Field(default=None, ge=1, le=31)
     year_month: int | None = Field(default=None, ge=1, le=12)
@@ -378,8 +381,12 @@ class BriefScheduleCreate(BaseModel):
 
 class BriefScheduleUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
+    period: Literal["daily", "weekly", "monthly", "yearly"] | None = None
     timezone: str | None = Field(default=None, max_length=80)
     cutoff_time: str | None = Field(
+        default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$"
+    )
+    start_time: str | None = Field(
         default=None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$"
     )
     weekday: int | None = Field(default=None, ge=0, le=6)
@@ -735,6 +742,8 @@ class BriefGenerationProgressOut(APIModel):
     message: str | None = None
     can_retry: bool = False
     attempt: int = 1
+    stopped: bool = False
+    schedule_id: int | None = None
 
 
 class BriefDetailOut(BriefOut):
@@ -763,6 +772,7 @@ class BriefScheduleOut(APIModel):
     period: str
     timezone: str
     cutoff_time: str
+    start_time: str | None = None
     weekday: int | None
     month_day: int | None
     year_month: int | None
@@ -778,6 +788,26 @@ class BriefScheduleOut(APIModel):
 
 class BriefScheduleListOut(APIModel):
     items: list[BriefScheduleOut]
+
+
+class AutoTagToggle(BaseModel):
+    enabled: bool
+    create_new: bool = False
+    llm_connection_id: int | None = None
+
+
+class AutoTagStatusOut(APIModel):
+    enabled: bool
+    create_new: bool
+    llm_connection_id: int | None
+    llm_connection_name: str | None
+    model: str | None
+    configured: bool
+    max_tags_per_entry: int
+    pending_count: int
+    running_count: int
+    complete_count: int
+    failed_count: int
 
 
 class AppSettingsOut(APIModel):
@@ -805,6 +835,7 @@ class UpdateStatusOut(APIModel):
     downloaded: bool
     downloaded_bytes: int | None
     install_supported: bool
+    install_unavailable_reason: str | None
     automatic_checks_enabled: bool
     check_hour: int
     error: str | None
