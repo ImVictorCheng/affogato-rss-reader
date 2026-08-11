@@ -179,7 +179,13 @@ def check_audit_gates() -> list[str]:
     preflight_commands = (
         "python -m pip_audit --requirement /workspace/requirements.lock --progress-spinner off",
         "python -m bandit -r /workspace/backend/app --severity-level high --confidence-level high",
-        'Invoke-Native "npm" @("audit", "--audit-level=high")',
+        'Invoke-NativeWithRetry "npm" @(',
+        '"audit", "--audit-level=high",',
+        '"--fetch-timeout=60000"',
+        '"--fetch-retries=1"',
+        '"--fetch-retry-mintimeout=5000"',
+        '"--fetch-retry-maxtimeout=10000"',
+        ") -Attempts 2",
     )
     for command in preflight_commands:
         if command not in preflight_text:
@@ -215,6 +221,7 @@ def check_release_promotion() -> list[str]:
         'immutable_candidate="${STAGING_IMAGE_NAME}@${reader_digest}"',
         'imagetools inspect --raw "$immutable_candidate"',
         'docker pull --platform linux/amd64 "$immutable_candidate"',
+        'docker image rm "$immutable_candidate"',
         'docker pull --platform linux/arm64 "$immutable_candidate"',
         'vnd.docker.reference.type',
         'vnd.docker.reference.digest',

@@ -221,6 +221,7 @@ jobs:
                   )] | length) == 1)
           ' "$manifest_file"
           docker pull --platform linux/amd64 "$immutable_candidate"
+          docker image rm "$immutable_candidate"
           docker pull --platform linux/arm64 "$immutable_candidate"
           echo "reader-digest=$reader_digest" >> "$GITHUB_OUTPUT"
 

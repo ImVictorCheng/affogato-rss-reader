@@ -29,7 +29,7 @@ Affogato RSS Reader 是一个自部署通用RSS阅读器。你可以手动添加
 
 ### 快速启动
 
-需要 Docker Desktop 或 Docker Engine + Compose。下载 GitHub Release 中的`affogato-rss-reader-0.4.2.tar.gz` 并解压后：
+需要 Docker Desktop 或 Docker Engine + Compose。下载 GitHub Release 中的`affogato-rss-reader-0.4.3.tar.gz` 并解压后：
 
 从 0.3.1 或更早版本迁移时，替换 Compose 前先停止并删除旧版高权限更新助手：
 

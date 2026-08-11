@@ -75,7 +75,12 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
-      - run: npm audit --audit-level=high
+      - run: >-
+          npm audit --audit-level=high
+          --fetch-timeout=60000
+          --fetch-retries=1
+          --fetch-retry-mintimeout=5000
+          --fetch-retry-maxtimeout=10000
       - run: npm run check:ui
       - run: npm run typecheck
       - run: npm test

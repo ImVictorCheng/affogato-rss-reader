@@ -155,7 +155,13 @@ pytest /workspace/backend/tests --cov=backend.app --cov-report=term-missing --ba
         Push-Location (Join-Path $ProjectRoot "web")
         try {
             Invoke-Native "npm" @("ci")
-            Invoke-Native "npm" @("audit", "--audit-level=high")
+            Invoke-NativeWithRetry "npm" @(
+                "audit", "--audit-level=high",
+                "--fetch-timeout=60000",
+                "--fetch-retries=1",
+                "--fetch-retry-mintimeout=5000",
+                "--fetch-retry-maxtimeout=10000"
+            ) -Attempts 2
             Invoke-Native "npm" @("run", "check:ui")
             Invoke-Native "npm" @("run", "typecheck")
             Invoke-Native "npm" @("test")

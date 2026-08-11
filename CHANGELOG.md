@@ -4,6 +4,15 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-08-11
+
+### Fixed
+
+- Pull each candidate platform through a separate temporary Docker image reference so
+  multi-platform verification cannot collide in the local image store
+- Bound and retry npm advisory requests so a stalled registry cannot hang release
+  preflight or CI indefinitely
+
 ## [0.4.2] - 2026-08-11
 
 ### Fixed
