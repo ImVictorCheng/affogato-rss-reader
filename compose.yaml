@@ -1,13 +1,13 @@
 name: affogato-rss-reader
 
-x-reader-image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
+x-reader-image: ghcr.io/OWNER/affogato-rss-reader:0.4.1@READER_DIGEST
 x-affogato-release:
-  version: "0.4.0"
+  version: "0.4.1"
   reader-digest: READER_DIGEST
 
 services:
   log-init:
-    image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.1@READER_DIGEST
     user: "0:0"
     restart: "no"
     command:
@@ -27,7 +27,7 @@ services:
       - /app/secrets
 
   reader:
-    image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.1@READER_DIGEST
     restart: unless-stopped
     depends_on:
       log-init:
@@ -95,7 +95,7 @@ services:
       - ./logs:/app/logs
 
   updater:
-    image: ghcr.io/OWNER/affogato-rss-reader:0.4.0@READER_DIGEST
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.1@READER_DIGEST
     profiles: ["release-updates"]
     user: "0:0"
     command: ["python", "-m", "backend.app.update_runner"]

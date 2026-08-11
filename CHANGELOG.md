@@ -4,6 +4,8 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-11
+
 ### Security
 
 - Bind published ports to loopback by default and enforce explicit Host, request-body,
@@ -15,6 +17,11 @@ All notable changes are documented here. This project follows Semantic Versionin
   trust root; update checks and verified asset downloads remain available
 - Canonicalize strictly allowlisted Compose data before any future privileged install,
   and atomically claim small, exact-schema update requests before processing them
+
+### Fixed
+
+- Preserve the combined MIT and Apache-2.0 OCI license metadata on staged release
+  images so exact-digest smoke tests and published metadata agree
 
 ## [0.4.0] - 2026-08-02
 

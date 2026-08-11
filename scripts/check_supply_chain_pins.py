@@ -232,6 +232,11 @@ def check_release_promotion() -> list[str]:
         errors.append(f"{workflow}: unverified platform images must be pushed only to staging")
     if text.count("--metadata-file") < 2:
         errors.append(f"{workflow}: candidate creation and final promotion must record metadata")
+    license_label = "org.opencontainers.image.licenses=MIT AND Apache-2.0"
+    if text.count(license_label) < 2:
+        errors.append(
+            f"{workflow}: build and promotion metadata must preserve: {license_label}"
+        )
     return errors
 
 
