@@ -10,7 +10,7 @@ ARG VITE_API_BASE_URL=/api/v1
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build
 
-FROM python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS wheel-builder
+FROM python:3.15.0rc1-alpine3.24@sha256:4b4340819382ffdbc0d87233b441daf617eec784e43458f8f5cb4d5e3b7d1838 AS wheel-builder
 WORKDIR /src
 RUN python -m pip install --no-cache-dir build==1.3.0
 COPY README.md LICENSE ./
@@ -19,7 +19,7 @@ RUN rm -rf ./backend/static && mkdir -p ./backend/static
 COPY --from=web-builder /src/web/dist/ ./backend/static/
 RUN python -m build --wheel --outdir /wheels ./backend
 
-FROM python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS runtime
+FROM python:3.15.0rc1-alpine3.24@sha256:4b4340819382ffdbc0d87233b441daf617eec784e43458f8f5cb4d5e3b7d1838 AS runtime
 ARG VERSION=0.4.4
 ARG VCS_REF=unknown
 ARG SOURCE_URL=https://github.com/OWNER/affogato-rss-reader
