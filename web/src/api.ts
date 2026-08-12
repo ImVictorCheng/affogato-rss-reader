@@ -131,7 +131,10 @@ class ApiClient {
     return this.request<UpdateStatus>("/updates/status");
   }
   checkForUpdates() {
-    return this.request<UpdateStatus>("/updates/check", { method: "POST" });
+    return this.request<UpdateStatus>("/updates/check", {
+      method: "POST",
+      signal: AbortSignal.timeout(30_000),
+    });
   }
   installUpdate() {
     return this.request<UpdateStatus>("/updates/install", { method: "POST" });

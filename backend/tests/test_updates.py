@@ -146,7 +146,8 @@ def test_digest_schema_requires_manual_migration_from_legacy_asset(db_factory, s
         status = check_for_updates(db, enabled, client=client)
 
     assert status["status"] == "available_manual"
-    assert "compatible automatic-update asset" in status["error"]
+    assert "compatible automatic-update asset" in status["message"]
+    assert status["error"] is None
     assert not (enabled.data_dir / "updates" / "0.3.1" / "compose.yaml").exists()
 
 
@@ -172,6 +173,45 @@ def test_update_check_304_requeues_download_when_helper_recovers(db_factory, set
     request = json.loads((control / "download-request.json").read_text(encoding="utf-8"))
     assert request["version"] == "0.3.1"
     assert request["compose_digest"].startswith("sha256:")
+
+
+def test_manual_update_check_runs_when_automatic_checks_are_disabled(db_factory, settings):
+    disabled = settings.model_copy(update={"update_check_enabled": False, "version": "0.3.0"})
+    updates = disabled.data_dir / "updates"
+    updates.mkdir(parents=True, exist_ok=True)
+    (updates / "state.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "current_version": "0.3.0",
+                "latest_version": "0.3.0",
+                "status": "disabled",
+                "error": "The update request failed (ConnectError).",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with update_client(disabled, version="0.3.0") as client, db_factory() as db:
+        status = check_for_updates(db, disabled, client=client)
+
+    assert status["status"] == "up_to_date"
+    assert status["automatic_checks_enabled"] is False
+    assert status["error"] is None
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        (httpx.ConnectError("[Errno 111] Connection refused"), "refused"),
+        (httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING]"), "TLS handshake"),
+        (httpx.ConnectTimeout("timed out"), "timed out"),
+    ],
+)
+def test_update_network_errors_are_actionable(exc, expected):
+    from backend.app.updates import _safe_request_error
+
+    assert expected in _safe_request_error(exc)
 
 
 def test_install_request_is_fail_closed_until_signed_manifests_exist(db_factory, settings):

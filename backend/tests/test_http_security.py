@@ -224,6 +224,37 @@ def test_host_boundary_accepts_exact_wildcard_ip_and_port() -> None:
     assert seen == ["localhost:8787", "reader.example.test", "127.0.0.1", "[::1]:8787"]
 
 
+def test_host_boundary_accepts_private_network_ips_without_accepting_dns_names() -> None:
+    async def downstream(_scope, _receive, send) -> None:
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    app = HostBoundaryMiddleware(
+        downstream,
+        allowed_hosts=Settings().effective_allowed_hosts,
+    )
+    for host in (
+        "127.0.0.1:8788",
+        "10.1.2.3:8788",
+        "172.16.84.145:8788",
+        "192.168.1.9:8788",
+        "[fd00::1234]:8788",
+    ):
+        output = _invoke(
+            app,
+            _scope(headers=[(b"host", host.encode())]),
+            [{"type": "http.request", "body": b"", "more_body": False}],
+        )
+        assert _status(output) == 204
+
+    rejected = _invoke(
+        app,
+        _scope(headers=[(b"host", b"attacker.example")]),
+        [{"type": "http.request", "body": b"", "more_body": False}],
+    )
+    assert _status(rejected) == 400
+
+
 @pytest.mark.parametrize(
     "host",
     [
@@ -292,12 +323,23 @@ def test_allow_any_still_requires_one_well_formed_host_header() -> None:
 
 
 def test_allowed_host_patterns_are_normalized_and_validated() -> None:
-    assert normalize_allowed_hosts(["LOCALHOST.", "*.Example.Test", "[::1]"]) == (
+    assert normalize_allowed_hosts(
+        ["LOCALHOST.", "*.Example.Test", "[::1]", "192.168.1.42/24", "fd00::1/8"]
+    ) == (
         "localhost",
         "*.example.test",
         "::1",
+        "192.168.1.0/24",
+        "fd00::/8",
     )
-    for invalid in ("bad*host", "example.test:8787", "bad/host", "bad host"):
+    for invalid in (
+        "bad*host",
+        "example.test:8787",
+        "bad/host",
+        "bad host",
+        "192.168.0.0/99",
+        "example.test/24",
+    ):
         with pytest.raises(ValueError):
             normalize_allowed_hosts([invalid])
     with pytest.raises(ValueError, match="Wildcard IP"):

@@ -7,7 +7,7 @@ services:
     build:
       context: .
       args:
-        VERSION: 0.4.3
+        VERSION: 0.4.4
     environment:
       AFFOGATO_RSS_READER_UPDATE_CHECK_ENABLED: "false"
     volumes:

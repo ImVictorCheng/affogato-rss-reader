@@ -444,7 +444,7 @@ export interface AppSettings {
 export interface UpdateStatus {
   current_version: string;
   latest_version: string;
-  status: string;
+  status: "idle" | "disabled" | "checking" | "up_to_date" | "check_failed" | "available_manual" | "downloading" | "download_failed" | "downloaded" | "installing" | "install_failed";
   release_url?: string | null;
   release_notes?: string | null;
   published_at?: string | null;
@@ -458,6 +458,7 @@ export interface UpdateStatus {
   install_unavailable_reason?: string | null;
   automatic_checks_enabled: boolean;
   check_hour: number;
+  message?: string | null;
   error?: string | null;
 }
 

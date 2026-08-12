@@ -457,4 +457,6 @@ def test_custom_proxy_test_uses_form_values_and_disables_system_environment(
     assert [result["target_url"] for result in dual_result["results"]] == [
         "https://google.com/",
         "https://bing.com/",
+        "https://api.github.com/zen",
+        "https://github.com/",
     ]

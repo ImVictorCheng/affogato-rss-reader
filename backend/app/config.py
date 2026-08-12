@@ -14,6 +14,10 @@ from .http_security import normalize_allowed_hosts
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = BACKEND_DIR.parent
+DEFAULT_ALLOWED_HOSTS = (
+    "localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,"
+    "192.168.0.0/16,169.254.0.0/16,::1/128,fc00::/7,fe80::/10"
+)
 
 
 class Settings(BaseSettings):
@@ -25,14 +29,14 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "Affogato RSS Reader"
-    version: str = "0.4.3"
+    version: str = "0.4.4"
     api_prefix: str = "/api/v1"
     data_dir: Path = Field(default=BACKEND_DIR / "data")
     database_url: str | None = None
     timezone: str = "UTC"
     auth_mode: Literal["owner", "none"] = "owner"
     debug: bool = False
-    allowed_hosts: str = "localhost,127.0.0.1,::1"
+    allowed_hosts: str = DEFAULT_ALLOWED_HOSTS
     max_request_body_bytes: int = Field(
         default=3 * 1024 * 1024,
         ge=64 * 1024,

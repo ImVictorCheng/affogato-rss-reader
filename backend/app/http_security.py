@@ -206,6 +206,13 @@ def normalize_allowed_hosts(values: Sequence[str]) -> tuple[str, ...]:
         if value == "*":
             normalized.append(value)
             continue
+        if "/" in value:
+            try:
+                network = ipaddress.ip_network(value, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"Invalid allowed host network: {raw}") from exc
+            normalized.append(network.with_prefixlen)
+            continue
         wildcard = value.startswith("*.")
         host_value = value[2:] if wildcard else value
         if host_value.startswith("[") and host_value.endswith("]"):
@@ -233,6 +240,14 @@ class HostBoundaryMiddleware:
         self.app = app
         self.allowed_hosts = normalize_allowed_hosts(allowed_hosts)
         self.allow_any = "*" in self.allowed_hosts
+        self.allowed_networks = tuple(
+            ipaddress.ip_network(pattern)
+            for pattern in self.allowed_hosts
+            if "/" in pattern
+        )
+        self.allowed_host_patterns = tuple(
+            pattern for pattern in self.allowed_hosts if "/" not in pattern
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in {"http", "websocket"}:
@@ -250,6 +265,10 @@ class HostBoundaryMiddleware:
             await _send_error(send, 400, "Invalid Host header", close=True)
             return
         host = _host_from_header(host_values[0])
+        try:
+            host_ip = ipaddress.ip_address(host) if host is not None else None
+        except ValueError:
+            host_ip = None
         allowed = host is not None and (
             self.allow_any
             or any(
@@ -259,7 +278,11 @@ class HostBoundaryMiddleware:
                     and host.endswith(pattern[1:])
                     and host != pattern[2:]
                 )
-                for pattern in self.allowed_hosts
+                for pattern in self.allowed_host_patterns
+            )
+            or (
+                host_ip is not None
+                and any(host_ip in network for network in self.allowed_networks)
             )
         )
         if not allowed:

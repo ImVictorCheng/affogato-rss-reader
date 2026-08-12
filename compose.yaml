@@ -1,13 +1,13 @@
 name: affogato-rss-reader
 
-x-reader-image: ghcr.io/OWNER/affogato-rss-reader:0.4.3@READER_DIGEST
+x-reader-image: ghcr.io/OWNER/affogato-rss-reader:0.4.4@READER_DIGEST
 x-affogato-release:
-  version: "0.4.3"
+  version: "0.4.4"
   reader-digest: READER_DIGEST
 
 services:
   log-init:
-    image: ghcr.io/OWNER/affogato-rss-reader:0.4.3@READER_DIGEST
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.4@READER_DIGEST
     user: "0:0"
     restart: "no"
     command:
@@ -27,7 +27,7 @@ services:
       - /app/secrets
 
   reader:
-    image: ghcr.io/OWNER/affogato-rss-reader:0.4.3@READER_DIGEST
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.4@READER_DIGEST
     restart: unless-stopped
     depends_on:
       log-init:
@@ -36,7 +36,7 @@ services:
       - "${AFFOGATO_RSS_READER_BIND_ADDRESS:-127.0.0.1}:${AFFOGATO_RSS_READER_PORT:-8787}:8787"
     environment:
       FORWARDED_ALLOW_IPS: "${AFFOGATO_RSS_READER_FORWARDED_ALLOW_IPS:-127.0.0.1}"
-      AFFOGATO_RSS_READER_ALLOWED_HOSTS: "${AFFOGATO_RSS_READER_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      AFFOGATO_RSS_READER_ALLOWED_HOSTS: "${AFFOGATO_RSS_READER_ALLOWED_HOSTS:-localhost,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1/128,fc00::/7,fe80::/10}"
       AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES: "${AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES:-3145728}"
       AFFOGATO_RSS_READER_REQUEST_BODY_TIMEOUT_SECONDS: "${AFFOGATO_RSS_READER_REQUEST_BODY_TIMEOUT_SECONDS:-30}"
       AFFOGATO_RSS_READER_FEED_MAX_RESPONSE_BYTES: "${AFFOGATO_RSS_READER_FEED_MAX_RESPONSE_BYTES:-5242880}"
@@ -95,7 +95,7 @@ services:
       - ./logs:/app/logs
 
   updater:
-    image: ghcr.io/OWNER/affogato-rss-reader:0.4.3@READER_DIGEST
+    image: ghcr.io/OWNER/affogato-rss-reader:0.4.4@READER_DIGEST
     profiles: ["release-updates"]
     user: "0:0"
     command: ["python", "-m", "backend.app.update_runner"]

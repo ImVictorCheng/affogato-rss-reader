@@ -4,6 +4,17 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-08-12
+
+### Fixed
+
+- Keep manual update checks available when scheduled checks are disabled, clear stale
+  state, and report rate limits, proxy failures, and timeouts as actionable errors
+- Distinguish failed checks from successful and manual-update states in the web UI,
+  bound manual checks with a timeout, and test the actual GitHub proxy route
+- Restore direct access through private and link-local IP addresses with a CIDR-aware
+  Host boundary while keeping DNS hostnames explicit against DNS rebinding
+
 ## [0.4.3] - 2026-08-11
 
 ### Fixed

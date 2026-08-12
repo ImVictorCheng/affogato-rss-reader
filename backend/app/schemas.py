@@ -838,4 +838,5 @@ class UpdateStatusOut(APIModel):
     install_unavailable_reason: str | None
     automatic_checks_enabled: bool
     check_hour: int
+    message: str | None
     error: str | None

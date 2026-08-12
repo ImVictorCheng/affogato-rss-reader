@@ -17,7 +17,12 @@ from .secrets import SecretCipher, secret_hint
 SUPPORTED_PROXY_SCHEMES = {"http", "https", "socks5"}
 PROXY_MODES = {"custom", "system", "direct"}
 TRANSLATION_PROXY_SERVICES = ("google-gtx", "deepl", "google-cloud")
-PROXY_TEST_TARGETS = ("https://google.com/", "https://bing.com/")
+PROXY_TEST_TARGETS = (
+    "https://google.com/",
+    "https://bing.com/",
+    "https://api.github.com/zen",
+    "https://github.com/",
+)
 _PASSWORD_CONTEXT = "network_proxy:1:password"
 
 

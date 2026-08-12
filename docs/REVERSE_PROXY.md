@@ -19,6 +19,12 @@ Replace `reader.example.com` with every hostname or IP clients use in the URL;
 comma-separate multiple values. Do not use a wildcard on an Internet-facing
 deployment.
 
+For direct LAN access without a reverse proxy, set the bind address to
+`0.0.0.0`. Private, link-local, and loopback IP literals are accepted by the
+default Host boundary, so clients can open the machine's LAN IP without a
+machine-specific allowlist. DNS names—including mDNS and local computer
+names—must still be added explicitly to `AFFOGATO_RSS_READER_ALLOWED_HOSTS`.
+
 Replace the example CIDR with the subnet or exact address from which the proxy
 connects to the container. For the default Compose network, inspect it with:
 

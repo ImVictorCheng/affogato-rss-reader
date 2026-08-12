@@ -32,7 +32,7 @@ const theme = {
 };
 
 function response(body: unknown) { return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } })); }
-function mockApi(authenticated = true, onboardingRequired = false, updateAvailable = false, releaseUrl = "https://github.com/ImVictorCheng/affogato-rss-reader/releases/tag/v0.3.1") {
+function mockApi(authenticated = true, onboardingRequired = false, updateAvailable = false, releaseUrl = "https://github.com/ImVictorCheng/affogato-rss-reader/releases/tag/v0.3.1", updateFailure = false) {
   let entryRead = false;
   const currentEntry = () => ({ ...entry, state: { ...entry.state, read: entryRead } });
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -52,7 +52,7 @@ function mockApi(authenticated = true, onboardingRequired = false, updateAvailab
     if (url.endsWith("/brief-schedules")) return response({ items: [] });
     if (url.endsWith("/network-proxy/test")) return response({ results: [{ target_url: "https://google.com/", ok: true, status_code: 200, elapsed_ms: 25, final_url: "https://www.google.com/", error: null }, { target_url: "https://bing.com/", ok: false, status_code: null, elapsed_ms: 31, final_url: null, error: "Proxy test failed: ConnectTimeout" }] });
     if (url.endsWith("/network-proxy")) return response({ enabled: false, url: "", username: null, password_configured: false, password_hint: null, global_mode: "direct", running_in_container: true, feed_modes: {}, llm_connection_modes: {}, translation_service_modes: { "google-gtx": "direct", deepl: "direct", "google-cloud": "direct" } });
-    if (url.endsWith("/updates/status") || url.endsWith("/updates/check")) return response({ current_version: "0.3.0", latest_version: updateAvailable ? "0.3.1" : "0.3.0", status: updateAvailable ? "downloaded" : "up_to_date", release_url: updateAvailable ? releaseUrl : null, release_notes: null, published_at: null, last_checked_at: "2026-08-01T21:00:00Z", downloaded_at: updateAvailable ? "2026-08-01T21:00:02Z" : null, install_requested_at: null, installed_at: null, downloaded: updateAvailable, downloaded_bytes: updateAvailable ? 4096 : null, install_supported: true, automatic_checks_enabled: true, check_hour: 5, error: null });
+    if (url.endsWith("/updates/status") || url.endsWith("/updates/check")) return response({ current_version: "0.3.0", latest_version: updateAvailable ? "0.3.1" : "0.3.0", status: updateFailure && url.endsWith("/updates/check") ? "check_failed" : updateAvailable ? "downloaded" : "up_to_date", release_url: updateAvailable ? releaseUrl : null, release_notes: null, published_at: null, last_checked_at: "2026-08-01T21:00:00Z", downloaded_at: updateAvailable ? "2026-08-01T21:00:02Z" : null, install_requested_at: null, installed_at: null, downloaded: updateAvailable, downloaded_bytes: updateAvailable ? 4096 : null, install_supported: true, automatic_checks_enabled: true, check_hour: 5, message: null, error: updateFailure && url.endsWith("/updates/check") ? "The selected update proxy refused the connection." : null });
     if (url.endsWith("/settings")) return response({ app_name: "Affogato RSS Reader", version: "0.3.0", timezone: "UTC", debug: false });
     if (url.includes("/jobs?") || url.includes("/jobs/sync-runs?")) return response({ items: [] });
     if (url.includes("/call-logs?")) return response({
@@ -298,6 +298,16 @@ describe("Affogato RSS Reader", () => {
     expect(await screen.findByRole("heading", { name: "Application update" })).toBeInTheDocument();
     expect(screen.getByText("Version 0.3.1 is downloaded")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Check now" })).toBeEnabled();
+  });
+  it("reports a business-level update check failure instead of a success", async () => {
+    mockApi(true, false, false, undefined, true); const user = userEvent.setup(); render(<App />);
+    await screen.findByRole("heading", { name: "Unread" });
+    await user.click(screen.getByRole("button", { name: /Settings/ }));
+    await user.click(await screen.findByRole("button", { name: /Account & system/ }));
+    await user.click(await screen.findByRole("button", { name: "Check now" }));
+    expect(await screen.findByText("Update check failed")).toBeInTheDocument();
+    expect(screen.getAllByText("The selected update proxy refused the connection.").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Update check completed.")).not.toBeInTheDocument();
   });
   it("does not expose a non-HTTP release URL as a link", async () => {
     mockApi(true, false, true, "file:///private/release-notes"); render(<App />);

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -33,6 +34,7 @@ AUTOMATIC_INSTALL_UNAVAILABLE_REASON = (
 _VERSION_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 _STATE_LOCK = threading.RLock()
 _CHECK_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 class UpdateError(RuntimeError):
@@ -91,6 +93,7 @@ def _default_state(settings: Settings) -> dict[str, Any]:
         "request_id": None,
         "download_request_id": None,
         "images_downloaded_version": None,
+        "message": None,
         "error": None,
     }
 
@@ -120,8 +123,10 @@ def _read_state(settings: Settings) -> dict[str, Any]:
         return state
     state.update(stored)
     state["current_version"] = settings.version
-    if not settings.update_check_enabled:
-        state["status"] = "disabled"
+    # UPDATE_CHECK_ENABLED controls startup and scheduled checks only. Keep
+    # accepting manual checks, and normalize state written by older releases.
+    if state.get("status") == "disabled":
+        state["status"] = "check_failed" if state.get("error") else "idle"
     return state
 
 
@@ -300,6 +305,7 @@ def _public_status(settings: Settings, state: dict[str, Any]) -> dict[str, Any]:
         "install_unavailable_reason": AUTOMATIC_INSTALL_UNAVAILABLE_REASON,
         "automatic_checks_enabled": settings.update_check_enabled,
         "check_hour": settings.update_check_hour,
+        "message": state.get("message"),
         "error": state.get("error"),
     }
 
@@ -377,7 +383,27 @@ def _download_asset(
 
 def _safe_request_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
+        if (
+            exc.response.status_code == 403
+            and exc.response.headers.get("x-ratelimit-remaining") == "0"
+        ):
+            return "GitHub API rate limit exceeded. Try again after the limit resets."
         return f"GitHub returned HTTP {exc.response.status_code} while checking for updates."
+    if isinstance(exc, httpx.ProxyError):
+        return "The configured proxy rejected the update request."
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "The update connection timed out. Check the selected network route."
+    if isinstance(exc, httpx.ReadTimeout):
+        return "GitHub did not respond before the update request timed out."
+    if isinstance(exc, httpx.ConnectError):
+        detail = str(exc).lower()
+        if "ssl" in detail or "tls" in detail or "eof" in detail:
+            return "The update connection was interrupted during the TLS handshake. Check the selected proxy route."
+        if "name or service" in detail or "getaddrinfo" in detail or "nodename" in detail:
+            return "The update host could not be resolved. Check DNS and the selected network route."
+        if "refused" in detail or "10061" in detail:
+            return "The selected update proxy or network endpoint refused the connection."
+        return "The update connection could not be established. Check the selected network route."
     if isinstance(exc, httpx.HTTPError):
         return f"The update request failed ({exc.__class__.__name__})."
     return str(exc)[:1000] or exc.__class__.__name__
@@ -437,10 +463,11 @@ def _request_image_download(
         state.update(
             status="available_manual",
             download_request_id=None,
-            error=(
+            message=(
                 "The update helper is not running, so the container images "
                 "could not be downloaded automatically."
             ),
+            error=None,
         )
 
 
@@ -451,8 +478,6 @@ def check_for_updates(
     client: httpx.Client | None = None,
 ) -> dict[str, Any]:
     settings = settings or get_settings()
-    if not settings.update_check_enabled:
-        return update_status(settings)
     if not _CHECK_LOCK.acquire(blocking=False):
         return update_status(settings)
     owns_client = client is None
@@ -460,7 +485,7 @@ def check_for_updates(
         previous = _consume_download_result(settings, _read_state(settings))
         previous = _consume_install_result(settings, previous)
         previous_status = str(previous.get("status") or "idle")
-        previous.update(status="checking", error=None)
+        previous.update(status="checking", message=None, error=None)
         _write_state(settings, previous)
     try:
         route = http_route_for_global(db, settings)
@@ -486,7 +511,7 @@ def check_for_updates(
                     ) <= parse_version(settings.version)
                 except ValueError:
                     already_current = False
-                state.update(last_checked_at=checked_at, error=None)
+                state.update(last_checked_at=checked_at, message=None, error=None)
                 if already_current:
                     state.update(status="up_to_date")
                 elif _asset_is_valid(settings, state):
@@ -532,6 +557,7 @@ def check_for_updates(
             "published_at": release.get("published_at"),
             "last_checked_at": checked_at,
             "github_etag": response.headers.get("etag"),
+            "message": None,
             "error": None,
         }
         if latest_tuple <= current_tuple:
@@ -566,7 +592,8 @@ def check_for_updates(
                 state.update(
                     common,
                     status="available_manual",
-                    error="This release does not contain a compatible automatic-update asset.",
+                    message="This release requires a manual update because it does not contain a compatible automatic-update asset.",
+                    error=None,
                 )
                 _write_state(settings, state)
                 return _public_status(settings, state)
@@ -614,11 +641,16 @@ def check_for_updates(
         OSError,
         json.JSONDecodeError,
     ) as exc:
+        route_name = "system" if "route" in locals() and route.trust_env else (
+            "custom" if "route" in locals() and route.proxy else "direct"
+        )
+        logger.exception("Update check failed while using the %s network route", route_name)
         with _STATE_LOCK:
             state = _read_state(settings)
             state.update(
                 status="downloaded" if _asset_is_valid(settings, state) else "check_failed",
                 last_checked_at=_iso_now(),
+                message=None,
                 error=_safe_request_error(exc),
             )
             _write_state(settings, state)

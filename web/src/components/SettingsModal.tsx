@@ -14,6 +14,26 @@ const TRANSLATION_PROXY_TARGETS: { id: TranslationProxyService; name: string; me
   { id: "deepl", name: "DeepL API", meta: "api.deepl.com" },
   { id: "google-cloud", name: "Google Cloud Translation", meta: "translation.googleapis.com" },
 ];
+const UPDATE_FAILURES = new Set<UpdateStatus["status"]>(["check_failed", "download_failed", "install_failed"]);
+
+function updateStatusLabel(update: UpdateStatus, locale: Locale): string {
+  const zh = locale === "zh-CN";
+  if (update.downloaded) return zh ? `版本 ${update.latest_version} 已下载` : `Version ${update.latest_version} is downloaded`;
+  const labels: Record<UpdateStatus["status"], [string, string]> = {
+    idle: ["尚未检查更新", "Updates have not been checked"],
+    disabled: ["自动检查已关闭", "Automatic checks are disabled"],
+    checking: ["正在检查更新…", "Checking for updates…"],
+    up_to_date: ["当前已是最新版本", "You are up to date"],
+    check_failed: ["更新检查失败", "Update check failed"],
+    available_manual: ["发现新版本，需要手动更新", "A new version is available for manual update"],
+    downloading: ["正在准备更新镜像", "Preparing update images"],
+    download_failed: ["更新镜像下载失败", "Update image download failed"],
+    downloaded: ["更新已下载", "Update downloaded"],
+    installing: ["正在安装更新", "Installing update"],
+    install_failed: ["更新安装失败", "Update installation failed"],
+  };
+  return labels[update.status][zh ? 0 : 1];
+}
 
 export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDebugReset, onBrandChanged, onInstallUpdate, notify }: {
   locale: Locale; auth: AuthStatus; onLocale: (locale: Locale) => void; onClose: () => void; onLogout: () => void;
@@ -112,10 +132,11 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     }
     if (settingsPage === "account") {
       setLoading(true);
-      void Promise.all([api.settings(), api.updateStatus()])
-        .then(([settings, update]) => { setSettings(settings); setAppUpdate(update); })
+      void api.settings()
+        .then(setSettings)
         .catch((caught) => setError(errorText(caught)))
         .finally(() => setLoading(false));
+      void api.updateStatus().then(setAppUpdate).catch(() => setAppUpdate(null));
       return;
     }
     if (settingsPage === "llm") {
@@ -392,9 +413,12 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     try {
       const update = await api.checkForUpdates();
       setAppUpdate(update);
-      notify(update.downloaded
+      notify(UPDATE_FAILURES.has(update.status) || update.error
+        ? (update.error || (locale === "zh-CN" ? "更新检查失败。" : "Update check failed."))
+        : update.downloaded
         ? (locale === "zh-CN" ? `版本 ${update.latest_version} 已下载。` : `Version ${update.latest_version} is downloaded.`)
-        : (locale === "zh-CN" ? "更新检查已完成。" : "Update check completed."));
+        : (locale === "zh-CN" ? "更新检查已完成。" : "Update check completed."),
+        UPDATE_FAILURES.has(update.status) || update.error ? "error" : "success");
     } catch (caught) {
       notify(errorText(caught), "error");
     } finally {
@@ -680,7 +704,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
         <Toggle checked={proxyEnabled} onChange={setProxyEnabled} label={proxyEnabled ? "On" : "Off"} />
       </div>
       <p className="provider-warning">{locale === "zh-CN" ? "此开关只控制自定义代理。每个订阅源、LLM 连接和翻译服务都可以独立选择自定义代理、系统代理或直连。" : "This switch controls only the custom proxy. Each feed, LLM connection, and translation provider can independently use the custom proxy, system proxy, or a direct connection."}</p>
-      {networkProxy?.running_in_container && <div className="proxy-docker-notice"><strong>{locale === "zh-CN" ? "Docker 运行提示" : "Docker setup"}</strong><p>{locale === "zh-CN" ? "代理运行在宿主机时，地址使用 " : "When the proxy runs on the host, use "}<code>http://host.docker.internal:7890</code>{locale === "zh-CN" ? "，不要使用 127.0.0.1。" : ", not 127.0.0.1."}</p></div>}
+      {networkProxy?.running_in_container && <div className="proxy-docker-notice"><strong>{locale === "zh-CN" ? "Docker 运行提示" : "Docker setup"}</strong><p>{locale === "zh-CN" ? "代理运行在宿主机时，地址使用 " : "When the proxy runs on the host, use "}<code>http://host.docker.internal:7890</code>{locale === "zh-CN" ? "，不要使用 127.0.0.1。宿主代理还必须开启 Allow LAN 或监听 Docker 可达接口，并用防火墙限制访问范围。" : ", not 127.0.0.1. The host proxy must also enable Allow LAN or listen on a Docker-reachable interface; restrict access with the firewall."}</p></div>}
       <div className="proxy-settings__connection">
         <label className="field"><span>{locale === "zh-CN" ? "代理地址" : "Proxy URL"}</span><input value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} placeholder="http://127.0.0.1:7890" /></label>
         <label className="field"><span>{locale === "zh-CN" ? "用户名（可选）" : "Username (optional)"}</span><input autoComplete="off" value={proxyUsername} onChange={(event) => setProxyUsername(event.target.value)} /></label>
@@ -893,14 +917,10 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       <div className="section-heading"><div><span className="eyebrow">APPLICATION UPDATE</span><h3>{locale === "zh-CN" ? "应用更新" : "Application update"}</h3></div><span className="update-settings__version">v{appUpdate?.current_version || settings?.version}</span></div>
       <p>{locale === "zh-CN" ? `应用会在启动时和每天 ${String(appUpdate?.check_hour ?? 5).padStart(2, "0")}:00 自动检查并校验 Release 资产。可选更新助手会按摘要预拉镜像；在独立签名清单验证上线前，安装必须按 Release 说明手动完成。` : `The application checks on startup and every day at ${String(appUpdate?.check_hour ?? 5).padStart(2, "0")}:00 and verifies the Release asset. The optional helper can pre-pull the digest-pinned image; installation remains manual until independently signed release manifests are verified.`}</p>
       {appUpdate && <div className={`update-status-card update-status-card--${appUpdate.status}`}>
-        <strong>{appUpdate.downloaded
-          ? (locale === "zh-CN" ? `版本 ${appUpdate.latest_version} 已下载` : `Version ${appUpdate.latest_version} is downloaded`)
-          : appUpdate.status === "up_to_date"
-            ? (locale === "zh-CN" ? "当前已是最新版本" : "You are up to date")
-            : appUpdate.status === "checking"
-              ? (locale === "zh-CN" ? "正在检查更新…" : "Checking for updates…")
-              : (locale === "zh-CN" ? `更新状态：${appUpdate.status}` : `Update status: ${appUpdate.status}`)}</strong>
+        <strong>{updateStatusLabel(appUpdate, locale)}</strong>
         <small>{locale === "zh-CN" ? "上次检查" : "Last checked"}：{formatDateTime(appUpdate.last_checked_at, locale)}</small>
+        {!appUpdate.automatic_checks_enabled && <p>{locale === "zh-CN" ? "自动检查已关闭；仍可使用“立即检查”手动查询。" : "Automatic checks are disabled; Check now remains available."}</p>}
+        {appUpdate.message && <p>{appUpdate.message}</p>}
         {appUpdate.error && <p className="update-status-card__error">{appUpdate.error}</p>}
         {appUpdate.downloaded && !appUpdate.install_supported && <p>{locale === "zh-CN" ? "自动安装当前安全停用：尚未建立独立签名清单信任根。请从 Release 页面手动安装。" : "Automatic installation is fail-closed until an independently signed manifest trust root is available. Install manually from the Release page."}</p>}
       </div>}

@@ -22,7 +22,7 @@ import httpx
 import yaml
 from dotenv import dotenv_values
 
-from .config import Settings
+from .config import DEFAULT_ALLOWED_HOSTS, Settings
 from .updates import parse_version
 
 
@@ -157,7 +157,7 @@ def _expected_reader_environment(settings: Settings) -> dict[str, str]:
     return {
         "FORWARDED_ALLOW_IPS": "${AFFOGATO_RSS_READER_FORWARDED_ALLOW_IPS:-127.0.0.1}",
         "AFFOGATO_RSS_READER_ALLOWED_HOSTS": (
-            "${AFFOGATO_RSS_READER_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+            "${AFFOGATO_RSS_READER_ALLOWED_HOSTS:-" + DEFAULT_ALLOWED_HOSTS + "}"
         ),
         "AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES": (
             "${AFFOGATO_RSS_READER_MAX_REQUEST_BODY_BYTES:-3145728}"
