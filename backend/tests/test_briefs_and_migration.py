@@ -605,7 +605,93 @@ def test_proxy_migrations_preserve_links_and_repair_arxiv_orphans(
         ).fetchone()[0] == "direct"
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == "0014"
+        ).fetchone()[0] == "0015"
+    get_settings.cache_clear()
+
+
+def test_governed_auto_tag_migration_preserves_legacy_links_and_pauses_growth(
+    tmp_path: Path,
+    monkeypatch,
+):
+    database = tmp_path / "governed-auto-tags.db"
+    monkeypatch.setenv(
+        "AFFOGATO_RSS_READER_DATABASE_URL", f"sqlite:///{database.as_posix()}"
+    )
+    monkeypatch.setenv("AFFOGATO_RSS_READER_DATA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    command.upgrade(config, "0014")
+
+    with closing(sqlite3.connect(database)) as connection:
+        connection.executescript(
+            """
+            INSERT INTO works(id,dedup_key,created_at)
+            VALUES(1,'url:https://migration.test/tag','2026-08-01');
+            INSERT INTO entries(
+                id,work_id,version_key,title,summary,url,authors,categories,
+                source_hash,created_at,updated_at
+            ) VALUES(
+                1,1,'default','Migration tag article','Summary',
+                'https://migration.test/tag','[]','[]','source-hash',
+                '2026-08-01','2026-08-01'
+            );
+            INSERT INTO tags(id,name,color) VALUES(1,'ＱＥＣ!!!','#123456');
+            INSERT INTO entry_tags(id,entry_id,tag_id) VALUES(1,1,1);
+            INSERT INTO auto_tag_records(
+                id,entry_id,source_hash,status,attempts,last_error,next_retry_at,
+                tag_ids,created_at,updated_at
+            ) VALUES(
+                1,1,'source-hash','complete',1,NULL,NULL,'[1]',
+                '2026-08-01','2026-08-01'
+            );
+            INSERT INTO app_settings(key,value,updated_at)
+            VALUES
+                ('auto_tag_create_new','true','2026-08-01'),
+                ('auto_tag_enabled','true','2026-08-01');
+            """
+        )
+        # U+FB03 is one code point in the legacy VARCHAR(120) name but expands
+        # to three ASCII characters under NFKC. The new VARCHAR(240)
+        # normalized key must not make this otherwise valid legacy row abort
+        # a PostgreSQL migration.
+        connection.execute(
+            "INSERT INTO tags(id,name,color) VALUES(2,?,NULL)",
+            ("\ufb03" * 120,),
+        )
+        connection.commit()
+
+    command.upgrade(config, "head")
+    with closing(sqlite3.connect(database)) as connection:
+        tag = connection.execute(
+            """SELECT normalized_name,description,origin,auto_assignable
+               FROM tags WHERE id=1"""
+        ).fetchone()
+        assert tag == ("qec", "", "legacy", 1)
+        expanded_tag = connection.execute(
+            """SELECT length(name),normalized_name,origin
+               FROM tags WHERE id=2"""
+        ).fetchone()
+        assert expanded_tag == (120, None, "legacy")
+        assert connection.execute(
+            "SELECT source FROM entry_tag_sources WHERE entry_tag_id=1"
+        ).fetchone()[0] == "legacy"
+        assert connection.execute(
+            "SELECT policy_version FROM auto_tag_records WHERE id=1"
+        ).fetchone()[0] is None
+        settings = dict(
+            connection.execute(
+                """SELECT key,value FROM app_settings
+                   WHERE key IN ('auto_tag_enabled','auto_tag_preview_required')"""
+            )
+        )
+        assert settings == {
+            "auto_tag_enabled": "false",
+            "auto_tag_preview_required": "true",
+        }
+        assert connection.execute(
+            "SELECT version_num FROM alembic_version"
+        ).fetchone()[0] == "0015"
     get_settings.cache_clear()
 
 

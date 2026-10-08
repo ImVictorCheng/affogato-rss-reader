@@ -5,7 +5,8 @@ param(
     [switch]$SkipVulnerabilityScan,
     [switch]$SkipE2E,
     [switch]$AllowDirty,
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [string]$GrypeDatabaseArchive = ""
 )
 
 Set-StrictMode -Version Latest
@@ -76,8 +77,17 @@ try {
         throw "The release preflight requires a clean worktree. Commit first or pass -AllowDirty while developing."
     }
 
+    if (-not $OutputDirectory) {
+        $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $OutputDirectory = Join-Path $ProjectRoot ".local-backups\release-preflight-$Version-$Stamp"
+    }
+    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
+        New-Item -ItemType Directory -Path $OutputDirectory -ErrorAction Stop | Out-Null
+    }
+    $OutputDirectory = (Resolve-Path -LiteralPath $OutputDirectory).Path
+
     Invoke-Section "Static release checks" {
-        Invoke-Native $Python @("scripts/check_version.py")
+        Invoke-Native $Python @("scripts/check_version.py", "--release")
         Invoke-Native $Python @("scripts/check_utf8.py")
         Invoke-Native $Python @("scripts/check_supply_chain_pins.py")
         Invoke-Native $Python @("-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_*.py")
@@ -179,6 +189,36 @@ pytest /workspace/backend/tests --cov=backend.app --cov-report=term-missing --ba
         $GrypeDbVolume = "affogato-preflight-grype-db-{0}" -f (Get-Random)
         Invoke-Section "Refresh the pinned Grype database" {
             Invoke-Native "docker" @("volume", "create", $GrypeDbVolume)
+            if ($GrypeDatabaseArchive) {
+                $GrypeDatabaseArchivePath = (Get-Item -LiteralPath $GrypeDatabaseArchive -ErrorAction Stop)
+                if ($GrypeDatabaseArchivePath.PSIsContainer) {
+                    throw "GrypeDatabaseArchive must be a database archive file."
+                }
+                $GrypeDatabaseMetadata = Invoke-RestMethod -Uri "https://grype.anchore.io/databases/v6/latest.json" -TimeoutSec 60
+                $GrypeExpectedChecksum = $GrypeDatabaseMetadata.checksum
+                if ($GrypeExpectedChecksum -notmatch '^sha256:[0-9a-f]{64}$') {
+                    throw "Official Grype database metadata has an invalid checksum."
+                }
+                $GrypeArchiveChecksum = "sha256:" + (Get-FileHash -LiteralPath $GrypeDatabaseArchivePath.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($GrypeArchiveChecksum -ne $GrypeExpectedChecksum) {
+                    throw "GrypeDatabaseArchive does not match the current official database checksum."
+                }
+                # A local archive can seed the cache on slow networks. The online
+                # update below still runs, and scan-time hash/age checks stay enabled.
+                Invoke-Native "docker" @(
+                    "run", "--rm",
+                    "--network", "none",
+                    "--read-only",
+                    "--cap-drop", "ALL",
+                    "--security-opt", "no-new-privileges:true",
+                    "--mount", "type=volume,source=$GrypeDbVolume,target=/grype-db",
+                    "--mount", "type=bind,source=$($GrypeDatabaseArchivePath.FullName),target=/db-seed.tar.zst,readonly",
+                    "--tmpfs", "/tmp:rw,noexec,nosuid,nodev",
+                    "--env", "GRYPE_DB_CACHE_DIR=/grype-db",
+                    $GrypeImage,
+                    "db", "import", "/db-seed.tar.zst"
+                )
+            }
             Invoke-NativeWithRetry "docker" @(
                 "run", "--rm",
                 "--read-only",
@@ -279,6 +319,12 @@ print(f"image catalog ok: {len(artifacts)} packages, {len(grype['matches'])} vul
                         (Join-Path $ScanOutput "grype.json")
                     )
                 } finally {
+                    foreach ($ScanReport in @("syft.json", "grype.json")) {
+                        $ScanReportPath = Join-Path $ScanOutput $ScanReport
+                        if (Test-Path -LiteralPath $ScanReportPath -PathType Leaf) {
+                            Copy-Item -LiteralPath $ScanReportPath -Destination (Join-Path $OutputDirectory "$Architecture-$ScanReport") -Force
+                        }
+                    }
                     Remove-Item -LiteralPath $ScanArchive -Force -ErrorAction SilentlyContinue
                     Remove-Item -LiteralPath $ScanCheckScript -Force -ErrorAction SilentlyContinue
                     if ((Test-Path -LiteralPath $ScanOutput) -and
@@ -298,14 +344,6 @@ print(f"image catalog ok: {len(artifacts)} packages, {len(grype['matches'])} vul
             )
         }
         $Port += 1
-    }
-
-    if (-not $OutputDirectory) {
-        $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-        $OutputDirectory = Join-Path $ProjectRoot ".local-backups\release-preflight-$Version-$Stamp"
-    }
-    if (-not (Test-Path -LiteralPath $OutputDirectory)) {
-        New-Item -ItemType Directory -Path $OutputDirectory -ErrorAction Stop | Out-Null
     }
 
     Invoke-Section "Release structure and source SBOM" {

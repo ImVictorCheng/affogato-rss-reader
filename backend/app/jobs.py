@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
-from .auto_tag import auto_tag_due, auto_tag_pending
+from .auto_tag import auto_tag_due, auto_tag_pending, run_auto_tag_preview
 from .backup import backup_once_daily
 from .config import Settings, get_settings
 from .briefs import brief_schedule_window_key, run_due_schedules, schedule_window
@@ -26,7 +26,15 @@ TRANSLATION_KIND = "translation"
 BRIEF_KIND = "brief"
 BACKUP_KIND = "backup"
 AUTO_TAG_KIND = "auto_tag"
-SUPPORTED_KINDS = {FEED_SYNC_KIND, TRANSLATION_KIND, BRIEF_KIND, BACKUP_KIND, AUTO_TAG_KIND}
+AUTO_TAG_PREVIEW_KIND = "auto_tag_preview"
+SUPPORTED_KINDS = {
+    FEED_SYNC_KIND,
+    TRANSLATION_KIND,
+    BRIEF_KIND,
+    BACKUP_KIND,
+    AUTO_TAG_KIND,
+    AUTO_TAG_PREVIEW_KIND,
+}
 
 
 def recover_interrupted_operations(db: Session) -> dict[str, int]:
@@ -52,8 +60,19 @@ def recover_interrupted_operations(db: Session) -> dict[str, int]:
         translation.status = "pending"
         translation.last_error = "Recovered after process restart"
         translation.next_retry_at = None
+    auto_tags = list(
+        db.scalars(select(AutoTagRecord).where(AutoTagRecord.status == "running"))
+    )
+    for record in auto_tags:
+        record.status = "pending"
+        record.last_error = "Recovered after process restart"
+        record.next_retry_at = None
     db.commit()
-    return {"sync_runs": len(sync_runs), "translations": len(translations)}
+    return {
+        "sync_runs": len(sync_runs),
+        "translations": len(translations),
+        "auto_tags": len(auto_tags),
+    }
 
 
 def feed_sync_due(db: Session, settings: Settings | None = None) -> bool:
@@ -193,18 +212,24 @@ def enqueue_job(
     reason: str | None = None,
 ) -> Job:
     """Queue one background job, avoiding duplicate queued/running work of the same kind."""
-    existing = db.scalar(
-        select(Job)
-        .where(
-            Job.kind == kind,
-            Job.status.in_(("queued", "running")),
+    payload = dict(payload or {})
+    existing_query = select(Job).where(
+        Job.kind == kind,
+        Job.status.in_(("queued", "running")),
+    )
+    if kind == AUTO_TAG_PREVIEW_KIND and payload.get("preview_id") is not None:
+        # Preview requests are independently addressable. Deduplicate retries
+        # for one preview without preventing a second preview from queuing.
+        existing_query = existing_query.where(
+            Job.payload["preview_id"].as_integer() == int(payload["preview_id"])
         )
+    existing = db.scalar(
+        existing_query
         .order_by(Job.id)
         .limit(1)
     )
     if existing is not None:
         return existing
-    payload = dict(payload or {})
     if reason:
         payload["reason"] = reason
     job = Job(
@@ -317,7 +342,7 @@ def _execute_single_kind(db: Session, job: Job, settings: Settings) -> None:
             "backup",
             {"created": path is not None, "path": str(path) if path else None},
         )
-    elif job.kind == "auto_tag":
+    elif job.kind == AUTO_TAG_KIND:
         rows = auto_tag_pending(
             db,
             limit=max(1, min(int(payload.get("limit", 10)), 100)),
@@ -332,6 +357,22 @@ def _execute_single_kind(db: Session, job: Job, settings: Settings) -> None:
                 "complete": sum(row.status == "complete" for row in rows),
                 "failed": sum(row.status == "failed" for row in rows),
             },
+        )
+    elif job.kind == AUTO_TAG_PREVIEW_KIND:
+        if payload.get("preview_id") is None:
+            raise ValueError("auto_tag_preview jobs require preview_id")
+        preview_id = int(payload["preview_id"])
+        preview = run_auto_tag_preview(db, preview_id)
+        preview_status = (
+            preview.get("status")
+            if isinstance(preview, dict)
+            else getattr(preview, "status", None)
+        )
+        _record_result(
+            db,
+            job,
+            "auto_tag_preview",
+            {"preview_id": preview_id, "status": preview_status},
         )
     else:
         raise ValueError(f"Unsupported job kind: {job.kind}")

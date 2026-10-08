@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from backend.app.parsing import (
+    MAX_ENTRY_AUTHORS_CHARS,
     MAX_ENTRY_TITLE_CHARS,
     canonicalize_url,
     clean_html,
@@ -58,6 +59,62 @@ def test_parse_arxiv_atom_version_announce_categories_and_doi():
     assert entry.announce_type == "replace"
     assert entry.categories == ["physics.atom-ph", "quant-ph"]
     assert entry.doi == "10.1234/abc.5"
+
+
+def test_parse_arxiv_rss_creator_as_opaque_credit_text():
+    expected_authors = [f"Researcher {index}" for index in range(1, 170)]
+    creator = ", ".join(expected_authors)
+    assert len(creator) > 500
+    rss = f"""<?xml version="1.0"?>
+    <rss version="2.0"
+         xmlns:arxiv="http://arxiv.org/schemas/atom"
+         xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <channel><title>quant-ph updates on arXiv.org</title>
+        <item>
+          <guid>oai:arXiv.org:2506.03998v2</guid>
+          <title>Large collaboration</title>
+          <link>https://arxiv.org/abs/2506.03998v2</link>
+          <arxiv:announce_type>replace</arxiv:announce_type>
+          <dc:creator>{creator}</dc:creator>
+        </item>
+      </channel>
+    </rss>""".encode()
+
+    _, entries = parse_feed(rss, "application/rss+xml")
+
+    assert entries[0].authors == [creator]
+
+
+def test_parse_atom_preserves_source_author_elements():
+    atom = b"""<?xml version="1.0"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <title>Atom sample</title>
+      <entry>
+        <id>https://example.test/paper</id><title>Paper</title>
+        <link href="https://example.test/paper"/>
+        <author><name>Smith, Alice</name></author>
+        <author><name>Example Research and Development</name></author>
+      </entry>
+    </feed>"""
+
+    _, entries = parse_feed(atom, "application/atom+xml")
+
+    assert entries[0].authors == ["Smith, Alice", "Example Research and Development"]
+
+
+def test_parse_feed_bounds_aggregate_author_data():
+    credit_chars = 500
+    author_count = MAX_ENTRY_AUTHORS_CHARS // (credit_chars + 3) + 1
+    repeated_authors = "".join(
+        f"<author><name>{'x' * credit_chars}</name></author>"
+        for _ in range(author_count)
+    )
+    aggregate_atom = f"""<feed xmlns="http://www.w3.org/2005/Atom">
+      <title>Atom sample</title><entry><id>https://example.test/two</id>
+      <title>Paper</title><link href="https://example.test/two"/>
+      {repeated_authors}</entry></feed>""".encode()
+    with pytest.raises(ValueError, match="author data exceeds"):
+        parse_feed(aggregate_atom, "application/atom+xml")
 
 
 def test_normalizers():

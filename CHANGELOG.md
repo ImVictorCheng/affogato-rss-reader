@@ -4,6 +4,38 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-08
+
+### Added
+
+- Automatic tagging now prefers a controlled topic library instead of creating
+  one-off tags for individual articles. New topics remain candidates until they
+  have broad support, and each article receives only a few confident tags.
+- Settings now provides a cleanup preview, a cross-source 50-article trial,
+  candidate support information, tag merging, and explicit approval before
+  processing historical articles.
+
+### Changed
+
+- Automatic tagging processes articles in batches and sends only titles and
+  summaries to the configured LLM, reducing calls and matching the privacy notice.
+
+### Fixed
+
+- Inline math formulas now render correctly in original and translated article
+  titles in both the article list and detail view.
+- Source-provided author credits are preserved for large collaborations without
+  inventing individual names or causing synchronization failures.
+
+### Internal
+
+- Hardened automatic-tag concurrency, migrations, and stale-result handling, and
+  refreshed release checks, container security, dependencies, and test stability.
+- Updated vulnerable web dependencies and added a local scanner database seed
+  option for release preflight on slow networks without skipping security checks.
+- Refreshed the Python runtime base and zlib security patch, removed obsolete
+  scanner exceptions, and retained image scan reports for release diagnostics.
+
 ## [0.4.4] - 2026-08-12
 
 ### Fixed

@@ -10,6 +10,7 @@ export type TranslationProvider = "google-gtx" | "custom-llm" | "deepl" | "googl
 export type TranslationFallbackMode = "automatic" | "manual";
 export type ProxyMode = "custom" | "system" | "direct";
 export type TranslationProxyService = "google-gtx" | "deepl" | "google-cloud";
+export type AutoTagGrowthMode = "closed" | "threshold";
 
 export interface SourceSortSettings {
   sort_mode: FolderSortMode;
@@ -81,6 +82,10 @@ export interface Tag {
   id: number;
   name: string;
   color?: string | null;
+  description?: string;
+  aliases?: string[];
+  origin?: "manual" | "legacy" | "auto_promoted" | string;
+  auto_assignable?: boolean;
   entry_count?: number;
 }
 
@@ -237,15 +242,109 @@ export interface TranslationStatus {
 export interface AutoTagStatus {
   enabled: boolean;
   create_new: boolean;
+  growth_mode: AutoTagGrowthMode;
   llm_connection_id?: number | null;
   llm_connection_name?: string | null;
   model?: string | null;
   configured: boolean;
   max_tags_per_entry: number;
+  promotion_threshold: number;
+  support_window_days: number;
+  canonical_language: "en";
+  min_confidence: number;
+  preview_required: boolean;
+  proposal_count: number;
+  promoted_count: number;
+  estimated_calls: number;
+  outdated_count: number;
+  needs_rebuild: boolean;
   pending_count: number;
   running_count: number;
   complete_count: number;
   failed_count: number;
+}
+
+export interface AutoTagSettingsInput {
+  enabled: boolean;
+  create_new?: boolean;
+  growth_mode: AutoTagGrowthMode;
+  llm_connection_id?: number | null;
+  max_tags_per_entry: number;
+  promotion_threshold: number;
+  support_window_days: number;
+  canonical_language: "en";
+}
+
+export interface AutoTagPreviewTopic {
+  kind: "tag" | "proposal" | "new";
+  id?: number | null;
+  name: string;
+  confidence: number;
+}
+
+export interface AutoTagPreviewResult {
+  entry_id: number;
+  title: string;
+  topics: AutoTagPreviewTopic[];
+}
+
+export interface AutoTagPreview {
+  id: number;
+  status: string;
+  sample_size: number;
+  entry_ids: number[];
+  results: AutoTagPreviewResult[];
+  metrics: Record<string, unknown>;
+  last_error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface AutoTagCleanupItem {
+  tag_id: number;
+  name: string;
+  total_count: number;
+  inferred_auto_count: number;
+  legacy_count: number;
+  manual_count: number;
+  auto_count: number;
+  feed_count: number;
+  schedule_count: number;
+  deletable: boolean;
+}
+
+export interface AutoTagCleanupPreview {
+  items: AutoTagCleanupItem[];
+  inferred_auto_association_count: number;
+  review_token: string;
+  reviewed: boolean;
+}
+
+export interface AutoTagCleanupResult {
+  removed_tag_ids?: number[];
+  kept_tag_ids?: number[];
+  removed_count?: number;
+  removed_association_count?: number;
+  [key: string]: unknown;
+}
+
+export interface AutoTagProposal {
+  id: number;
+  name: string;
+  description: string;
+  status: string;
+  support_count: number;
+  promoted_tag_id?: number | null;
+  aliases: string[];
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface AutoTagProposalList {
+  items: AutoTagProposal[];
+  total: number;
+  offset?: number;
+  limit?: number;
 }
 
 export interface TranslationSettingsInput {

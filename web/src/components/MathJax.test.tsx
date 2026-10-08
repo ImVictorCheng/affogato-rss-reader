@@ -129,6 +129,16 @@ describe("MathJax rendering", () => {
     expect(mathJax.typesetPromise).toHaveBeenCalledTimes(2);
   });
 
+  it("uses an inline scope when embedded in a heading", async () => {
+    const mathJax = mockMathJax();
+    render(<h1><MathJaxScope source="Energy $E=mc^2$" inline>Energy $E=mc^2$</MathJaxScope></h1>);
+
+    const scope = screen.getByText("Energy $E=mc^2$");
+    expect(scope.tagName).toBe("SPAN");
+    expect(scope.parentElement?.tagName).toBe("H1");
+    await waitFor(() => expect(mathJax.typesetPromise).toHaveBeenCalledWith([scope]));
+  });
+
   it("keeps raw TeX readable when MathJax rejects a formula", async () => {
     mockMathJax({ reject: true });
     render(<MathJaxScope source="$broken{$"><p>$broken&#123;$</p></MathJaxScope>);

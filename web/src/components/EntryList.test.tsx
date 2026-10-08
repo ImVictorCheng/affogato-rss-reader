@@ -1,7 +1,8 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Entry } from "../types";
 import { EntryList } from "./EntryList";
+import { resetMathJaxForTests } from "./MathJax";
 
 const entry: Entry = {
   id: 9,
@@ -17,7 +18,11 @@ const entry: Entry = {
   domains: [],
 };
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  delete window.MathJax;
+  resetMathJaxForTests();
+});
 
 describe("EntryList read tracking", () => {
   it("marks an unread card after it was visible and then leaves the scroll viewport", () => {
@@ -120,5 +125,56 @@ describe("EntryList read tracking", () => {
     rendered.rerender(<EntryList {...props} activeFeedId={2} />);
 
     expect(list.scrollTop).toBe(0);
+  });
+
+  it("typesets both displayed titles in a bilingual card", async () => {
+    const typesetPromise = vi.fn().mockResolvedValue(undefined);
+    window.MathJax = {
+      startup: { promise: Promise.resolve() },
+      typesetClear: vi.fn(),
+      typesetPromise,
+    };
+    const formulaEntry = {
+      ...entry,
+      title: "Energy $E=mc^2$",
+      translated_title: "能量 \\(E=mc^2\\)",
+    };
+
+    render(<EntryList
+      locale="en"
+      title="Unread"
+      subtitle="LIBRARY"
+      entries={[formulaEntry]}
+      total={1}
+      loading={false}
+      error=""
+      activeId={null}
+      activeFeedId={null}
+      languageMode="bilingual"
+      selectedIds={new Set()}
+      query=""
+      hasMore={false}
+      canRefreshSource={false}
+      refreshingSource={false}
+      markingAllRead={false}
+      unreadOnly
+      onQuery={vi.fn()}
+      onLanguageMode={vi.fn()}
+      onOpen={vi.fn()}
+      onSelect={vi.fn()}
+      onSelectAll={vi.fn()}
+      onClearSelection={vi.fn()}
+      onState={vi.fn()}
+      onBulkState={vi.fn()}
+      onRefreshSource={vi.fn()}
+      onToggleUnread={vi.fn()}
+      onMarkAllRead={vi.fn()}
+      onRetry={vi.fn()}
+      onLoadMore={vi.fn()}
+    />);
+
+    expect(screen.getByText(formulaEntry.translated_title).closest("h3")).toBeInTheDocument();
+    expect(screen.getByText(formulaEntry.title).closest(".entry-card__original")).toBeInTheDocument();
+    await waitFor(() => expect(typesetPromise).toHaveBeenCalledTimes(2));
   });
 });

@@ -241,13 +241,17 @@ export function rehypeMathJaxSource() {
   return (tree: HastNode) => transformMathNodes(tree);
 }
 
-export function MathJaxScope({ source, enabled = containsMath(source), children }: {
+export function MathJaxScope({ source, enabled = containsMath(source), inline = false, children }: {
   source: string;
   enabled?: boolean;
+  inline?: boolean;
   children: ReactNode;
 }) {
-  const root = useRef<HTMLDivElement>(null);
+  const root = useRef<HTMLElement>(null);
   const shouldTypeset = enabled && typesetWorkIsBounded(source);
+  const setRoot = (element: HTMLDivElement | HTMLSpanElement | null) => {
+    root.current = element;
+  };
 
   useEffect(() => {
     const element = root.current;
@@ -268,7 +272,9 @@ export function MathJaxScope({ source, enabled = containsMath(source), children 
     };
   }, [shouldTypeset, source]);
 
-  return <div className="mathjax-scope" key={source} ref={root}>{children}</div>;
+  return inline
+    ? <span className="mathjax-scope" key={source} ref={setRoot}>{children}</span>
+    : <div className="mathjax-scope" key={source} ref={setRoot}>{children}</div>;
 }
 
 export function resetMathJaxForTests() {

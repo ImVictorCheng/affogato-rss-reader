@@ -25,7 +25,14 @@ logger = logging.getLogger(__name__)
 # One long-lived worker per background kind. A slow or hanging worker only
 # delays its own kind: brief generation is never blocked behind a stalled
 # translation pass, and vice versa.
-WORKER_KINDS = ("backup", "sync", "translation", "brief", "auto_tag")
+WORKER_KINDS = (
+    "backup",
+    "sync",
+    "translation",
+    "brief",
+    "auto_tag",
+    "auto_tag_preview",
+)
 DUE_CHECKS: tuple[tuple[str, object], ...] = (
     ("backup", backup_due),
     ("sync", feed_sync_due),

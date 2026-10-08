@@ -4,6 +4,7 @@ from datetime import datetime
 
 from sqlalchemy import func, select
 
+from backend.app import api as api_module
 from backend.app import security
 from backend.app.call_logging import write_call_log
 from backend.app.config import get_settings
@@ -14,18 +15,27 @@ from backend.app.llm import (
 )
 from backend.app.models import (
     AppSetting,
+    AutoTagPreview,
+    AutoTagRecord,
+    AutoTagSuppression,
     Brief,
     BriefGenerationCheckpoint,
+    BriefSchedule,
     Domain,
     Entry,
     EntryDomain,
     EntryFeed,
     EntryTag,
+    EntryTagSource,
     Feed,
+    FeedTag,
     Job,
     LLMConnection,
     SyncRun,
     Tag,
+    TagAlias,
+    TagProposal,
+    TagProposalAlias,
     Translation,
     Work,
 )
@@ -162,23 +172,734 @@ def test_auto_tag_status_can_be_configured(authenticated_client):
     ).json()
     configured = client.patch(
         "/api/v1/auto-tag/status",
-        json={"enabled": True, "create_new": True, "llm_connection_id": connection["id"]},
+        json={
+            "enabled": False,
+            "growth_mode": "closed",
+            "max_tags_per_entry": 3,
+            "promotion_threshold": 10,
+            "support_window_days": 365,
+            "canonical_language": "en",
+            "llm_connection_id": connection["id"],
+        },
         headers=headers,
     )
     assert configured.status_code == 200, configured.text
     body = configured.json()
-    assert body["enabled"] is True
-    assert body["create_new"] is True
+    assert body["enabled"] is False
+    assert body["create_new"] is False
+    assert body["growth_mode"] == "closed"
     assert body["llm_connection_id"] == connection["id"]
     assert body["configured"] is True
-    assert body["max_tags_per_entry"] == 5
-    assert client.get("/api/v1/auto-tag/status").json()["enabled"] is True
+    assert body["max_tags_per_entry"] == 3
+    assert body["promotion_threshold"] == 10
+    assert body["support_window_days"] == 365
+    assert body["canonical_language"] == "en"
+    assert body["min_confidence"] == 0.8
+    assert body["preview_required"] is True
+    blocked = client.patch(
+        "/api/v1/auto-tag/status",
+        json={"enabled": True, "growth_mode": "closed"},
+        headers=headers,
+    )
+    assert blocked.status_code == 400
+    assert "preview" in blocked.json()["detail"].lower()
+    assert client.get("/api/v1/auto-tag/status").json()["enabled"] is False
     disabled = client.patch(
         "/api/v1/auto-tag/status",
-        json={"enabled": False, "create_new": False, "llm_connection_id": connection["id"]},
+        json={"enabled": False, "create_new": True, "llm_connection_id": connection["id"]},
         headers=headers,
     )
     assert disabled.json()["enabled"] is False
+    assert disabled.json()["growth_mode"] == "threshold"
+    assert disabled.json()["create_new"] is True
+    assert disabled.json()["preview_required"] is True
+
+
+def test_auto_tag_preview_cleanup_and_proposal_routes(
+    authenticated_client, monkeypatch
+):
+    client, factory, headers = authenticated_client
+    now = datetime(2026, 8, 21, 8)
+
+    def fake_create_preview(db, *, sample_size):
+        preview = AutoTagPreview(
+            status="pending",
+            sample_size=sample_size,
+            entry_ids=[41],
+            results=[],
+            metrics={},
+            last_error=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(preview)
+        db.flush()
+        return preview
+
+    monkeypatch.setattr(api_module, "create_preview", fake_create_preview)
+    monkeypatch.setattr(
+        api_module,
+        "get_preview",
+        lambda db, preview_id: db.get(AutoTagPreview, preview_id),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "build_auto_tag_cleanup_preview",
+        lambda _db: {
+            "items": [
+                {
+                    "tag_id": 7,
+                    "name": "one-off",
+                    "total_count": 1,
+                    "inferred_auto_count": 1,
+                    "legacy_count": 1,
+                    "manual_count": 0,
+                    "auto_count": 0,
+                    "feed_count": 0,
+                    "schedule_count": 0,
+                    "deletable": True,
+                }
+            ],
+            "inferred_auto_association_count": 1,
+            "review_token": "a" * 64,
+            "reviewed": False,
+        },
+    )
+    monkeypatch.setattr(
+        api_module,
+        "apply_cleanup",
+        lambda _db, *, remove_tag_ids, keep_tag_ids, review_token: {
+            "removed_tag_ids": remove_tag_ids,
+            "kept_tag_ids": keep_tag_ids,
+            "removed_count": len(remove_tag_ids),
+        },
+    )
+    monkeypatch.setattr(
+        api_module,
+        "list_proposals",
+        lambda _db, *, offset, limit: {
+            "items": [
+                {
+                    "id": 9,
+                    "name": "Quantum networks",
+                    "description": "Distributed quantum communication.",
+                    "status": "pending",
+                    "support_count": 4,
+                    "promoted_tag_id": None,
+                    "aliases": ["量子网络"],
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            ][offset : offset + limit],
+            "total": 1,
+        },
+    )
+
+    created = client.post(
+        "/api/v1/auto-tag/previews",
+        json={"sample_size": 50},
+        headers=headers,
+    )
+    assert created.status_code == 202, created.text
+    preview_id = created.json()["id"]
+    assert created.json()["sample_size"] == 50
+    assert client.get("/api/v1/auto-tag/previews").json()["items"][0]["id"] == preview_id
+    assert client.get(f"/api/v1/auto-tag/previews/{preview_id}").status_code == 200
+    with factory() as db:
+        job = db.scalar(select(Job).where(Job.kind == "auto_tag_preview"))
+        assert job is not None
+        assert job.payload["preview_id"] == preview_id
+
+    cleanup = client.get("/api/v1/auto-tag/cleanup-preview")
+    assert cleanup.status_code == 200
+    assert cleanup.json()["items"][0]["deletable"] is True
+    applied = client.post(
+        "/api/v1/auto-tag/cleanup",
+        json={
+            "review_token": cleanup.json()["review_token"],
+            "remove_tag_ids": [7],
+            "keep_tag_ids": [8],
+        },
+        headers=headers,
+    )
+    assert applied.json() == {
+        "removed_tag_ids": [7],
+        "kept_tag_ids": [8],
+        "removed_count": 1,
+    }
+    proposals = client.get("/api/v1/auto-tag/proposals?offset=0&limit=10")
+    assert proposals.status_code == 200
+    assert proposals.json()["items"][0]["support_count"] == 4
+
+
+def test_manual_tag_provenance_suppression_and_merge(authenticated_client):
+    client, factory, headers = authenticated_client
+    entry_id = add_entry(factory, title="Governed tags")
+    with factory() as db:
+        source = Tag(name="QEC")
+        target = Tag(name="Quantum error correction")
+        db.add_all([source, target])
+        db.commit()
+        source_id = source.id
+        target_id = target.id
+
+    assert client.post(
+        f"/api/v1/entries/{entry_id}/tags/{source_id}", headers=headers
+    ).status_code == 204
+    with factory() as db:
+        link = db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == entry_id,
+                EntryTag.tag_id == source_id,
+            )
+        )
+        assert link is not None
+        provenance = db.scalar(
+            select(EntryTagSource).where(EntryTagSource.entry_tag_id == link.id)
+        )
+        assert provenance is not None
+        assert provenance.source == "manual"
+
+    assert client.delete(
+        f"/api/v1/entries/{entry_id}/tags/{source_id}", headers=headers
+    ).status_code == 204
+    with factory() as db:
+        assert db.scalar(
+            select(AutoTagSuppression).where(
+                AutoTagSuppression.entry_id == entry_id,
+                AutoTagSuppression.tag_id == source_id,
+            )
+        ) is not None
+
+    # Re-adding is explicit positive feedback and clears the suppression.
+    assert client.post(
+        f"/api/v1/entries/{entry_id}/tags/{source_id}", headers=headers
+    ).status_code == 204
+    merged = client.post(
+        f"/api/v1/tags/{source_id}/merge/{target_id}", headers=headers
+    )
+    assert merged.status_code == 200, merged.text
+    assert merged.json()["id"] == target_id
+    assert merged.json()["entry_count"] == 1
+    with factory() as db:
+        assert db.get(Tag, source_id) is None
+        assert db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == entry_id,
+                EntryTag.tag_id == target_id,
+            )
+        ) is not None
+
+
+def test_tag_governance_metadata_create_update_and_list(authenticated_client):
+    client, factory, headers = authenticated_client
+    created = client.post(
+        "/api/v1/tags",
+        json={
+            "name": "Quantum Error Correction",
+            "color": "#336699",
+            "description": "Protects quantum information from errors.",
+            "aliases": ["QEC", "量子纠错"],
+            "auto_assignable": False,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    tag_id = created.json()["id"]
+    assert created.json() == {
+        "id": tag_id,
+        "name": "Quantum Error Correction",
+        "color": "#336699",
+        "description": "Protects quantum information from errors.",
+        "aliases": ["QEC", "量子纠错"],
+        "origin": "manual",
+        "auto_assignable": False,
+        "entry_count": 0,
+    }
+
+    listed = client.get("/api/v1/tags")
+    assert listed.status_code == 200, listed.text
+    listed_tag = next(item for item in listed.json()["items"] if item["id"] == tag_id)
+    assert listed_tag["description"] == "Protects quantum information from errors."
+    assert set(listed_tag["aliases"]) == {"QEC", "量子纠错"}
+    assert listed_tag["origin"] == "manual"
+    assert listed_tag["auto_assignable"] is False
+
+    updated = client.patch(
+        f"/api/v1/tags/{tag_id}",
+        json={
+            "name": "Fault-Tolerant Quantum Computing",
+            "color": "#123456",
+            "description": "Fault-tolerant methods and architectures.",
+            "aliases": ["FTQC", "容错量子计算"],
+            "auto_assignable": True,
+        },
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    assert body["name"] == "Fault-Tolerant Quantum Computing"
+    assert body["color"] == "#123456"
+    assert body["description"] == "Fault-tolerant methods and architectures."
+    assert set(body["aliases"]) == {
+        "FTQC",
+        "Quantum Error Correction",
+        "容错量子计算",
+    }
+    assert body["origin"] == "manual"
+    assert body["auto_assignable"] is True
+
+    listed_tag = next(
+        item for item in client.get("/api/v1/tags").json()["items"]
+        if item["id"] == tag_id
+    )
+    assert listed_tag == {**body, "entry_count": 0}
+    with factory() as db:
+        tag = db.get(Tag, tag_id)
+        assert tag is not None
+        assert tag.normalized_name == "fault tolerant quantum computing"
+
+
+def test_tag_names_and_aliases_conflict_with_active_proposals(authenticated_client):
+    client, factory, headers = authenticated_client
+    with factory() as db:
+        proposal = TagProposal(
+            name="Generative AI",
+            normalized_name="generative ai",
+            description="A candidate topic.",
+            status="active",
+            support_count=3,
+        )
+        db.add(proposal)
+        db.flush()
+        db.add(
+            TagProposalAlias(
+                proposal_id=proposal.id,
+                alias="GenAI",
+                normalized_alias="genai",
+            )
+        )
+        db.commit()
+
+    conflicts = [
+        {"name": "Generative AI"},
+        {"name": "GenAI"},
+        {"name": "Safe topic", "aliases": ["GenAI"]},
+    ]
+    for payload in conflicts:
+        response = client.post("/api/v1/tags", json=payload, headers=headers)
+        assert response.status_code == 409, (payload, response.text)
+
+    safe = client.post(
+        "/api/v1/tags",
+        json={"name": "Existing manual tag"},
+        headers=headers,
+    )
+    assert safe.status_code == 201, safe.text
+    updated = client.patch(
+        f"/api/v1/tags/{safe.json()['id']}",
+        json={"name": "Unrelated", "aliases": ["Generative AI"]},
+        headers=headers,
+    )
+    assert updated.status_code == 409, updated.text
+    names = {item["name"] for item in client.get("/api/v1/tags").json()["items"]}
+    assert names == {"Existing manual tag"}
+
+
+def test_tag_partial_updates_preserve_other_metadata_and_reject_invalid_aliases(
+    authenticated_client,
+):
+    client, _factory, headers = authenticated_client
+    created = client.post(
+        "/api/v1/tags",
+        json={
+            "name": "Quantum Networks",
+            "color": "#224466",
+            "description": "Original description.",
+            "aliases": ["QN"],
+            "auto_assignable": True,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    tag_id = created.json()["id"]
+
+    updated = client.patch(
+        f"/api/v1/tags/{tag_id}",
+        json={"description": "Updated only."},
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json() == {
+        "id": tag_id,
+        "name": "Quantum Networks",
+        "color": "#224466",
+        "description": "Updated only.",
+        "aliases": ["QN"],
+        "origin": "manual",
+        "auto_assignable": True,
+    }
+
+    for payload in (
+        {"name": "Invalid alias", "aliases": ["---"]},
+        {"name": "Too long alias", "aliases": ["a" * 121]},
+    ):
+        response = client.post("/api/v1/tags", json=payload, headers=headers)
+        assert response.status_code == 422, (payload, response.text)
+    invalid_name = client.patch(
+        f"/api/v1/tags/{tag_id}", json={"name": "---"}, headers=headers
+    )
+    assert invalid_name.status_code == 422, invalid_name.text
+
+
+def test_tag_partial_update_preserves_legacy_null_normalized_name(authenticated_client):
+    client, factory, headers = authenticated_client
+    legacy_name = "\ufb03" * 120
+    with factory() as db:
+        tag = Tag(
+            name=legacy_name,
+            normalized_name=None,
+            description="Legacy description.",
+            color=None,
+            origin="legacy",
+        )
+        db.add(tag)
+        db.commit()
+        tag_id = tag.id
+
+    updated = client.patch(
+        f"/api/v1/tags/{tag_id}",
+        json={"description": "Updated legacy description.", "color": "#123456"},
+        headers=headers,
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["name"] == legacy_name
+    assert updated.json()["description"] == "Updated legacy description."
+    assert updated.json()["color"] == "#123456"
+    with factory() as db:
+        tag = db.get(Tag, tag_id)
+        assert tag is not None
+        assert tag.name == legacy_name
+        assert tag.normalized_name is None
+
+
+def test_delete_tag_is_blocked_by_entry_feed_and_active_schedule(authenticated_client):
+    client, factory, headers = authenticated_client
+    entry_id = add_entry(factory, title="Delete guards")
+    with factory() as db:
+        entry_tag = Tag(name="Article tag", normalized_name="article tag")
+        feed_tag = Tag(name="Feed tag", normalized_name="feed tag")
+        schedule_tag = Tag(name="Schedule tag", normalized_name="schedule tag")
+        db.add_all([entry_tag, feed_tag, schedule_tag])
+        db.flush()
+        feed = Feed(title="Tagged feed", url="https://delete-guards.test/rss")
+        db.add(feed)
+        db.flush()
+        db.add_all(
+            [
+                EntryTag(entry_id=entry_id, tag_id=entry_tag.id),
+                FeedTag(feed_id=feed.id, tag_id=feed_tag.id),
+                BriefSchedule(
+                    name="Active tagged schedule",
+                    period="daily",
+                    timezone="UTC",
+                    cutoff_time="09:00",
+                    tag_ids=[schedule_tag.id],
+                    enabled=True,
+                ),
+            ]
+        )
+        db.commit()
+        guarded = {
+            entry_tag.id: "article associations",
+            feed_tag.id: "assigned to a feed",
+            schedule_tag.id: "active brief schedule",
+        }
+
+    for tag_id, detail in guarded.items():
+        response = client.delete(f"/api/v1/tags/{tag_id}", headers=headers)
+        assert response.status_code == 409, response.text
+        assert detail in response.json()["detail"]
+    with factory() as db:
+        assert all(db.get(Tag, tag_id) is not None for tag_id in guarded)
+
+
+def test_merge_tag_remaps_all_references_and_preserves_target_metadata(
+    authenticated_client,
+):
+    client, factory, headers = authenticated_client
+    first_entry_id = add_entry(factory, title="Merge source only")
+    second_entry_id = add_entry(factory, title="Merge overlap")
+    with factory() as db:
+        source = Tag(
+            name="QEC",
+            normalized_name="qec",
+            description="Legacy source tag.",
+            origin="legacy",
+            auto_assignable=True,
+        )
+        target = Tag(
+            name="Quantum Error Correction",
+            normalized_name="quantum error correction",
+            description="Canonical target description.",
+            color="#445566",
+            origin="auto_promoted",
+            auto_assignable=False,
+        )
+        unrelated = Tag(name="Unrelated", normalized_name="unrelated")
+        db.add_all([source, target, unrelated])
+        db.flush()
+        source_id = source.id
+        target_id = target.id
+        unrelated_id = unrelated.id
+        db.add(
+            TagAlias(
+                tag_id=source_id,
+                alias="Quantum EC",
+                normalized_alias="quantum ec",
+            )
+        )
+
+        first_source = EntryTag(entry_id=first_entry_id, tag_id=source_id)
+        second_source = EntryTag(entry_id=second_entry_id, tag_id=source_id)
+        second_target = EntryTag(entry_id=second_entry_id, tag_id=target_id)
+        db.add_all([first_source, second_source, second_target])
+        db.flush()
+        db.add_all(
+            [
+                EntryTagSource(entry_tag_id=first_source.id, source="legacy"),
+                EntryTagSource(
+                    entry_tag_id=second_source.id,
+                    source="auto",
+                    confidence=0.86,
+                    policy_version="policy-a",
+                ),
+                EntryTagSource(entry_tag_id=second_source.id, source="manual"),
+                EntryTagSource(
+                    entry_tag_id=second_target.id,
+                    source="auto",
+                    confidence=0.93,
+                    policy_version="policy-b",
+                ),
+            ]
+        )
+
+        first_feed = Feed(title="Source feed", url="https://merge.test/source")
+        second_feed = Feed(title="Overlapping feed", url="https://merge.test/both")
+        db.add_all([first_feed, second_feed])
+        db.flush()
+        db.add_all(
+            [
+                FeedTag(feed_id=first_feed.id, tag_id=source_id),
+                FeedTag(feed_id=second_feed.id, tag_id=source_id),
+                FeedTag(feed_id=second_feed.id, tag_id=target_id),
+                AutoTagRecord(
+                    entry_id=first_entry_id,
+                    source_hash="a" * 64,
+                    status="complete",
+                    attempts=1,
+                    tag_ids=[source_id, unrelated_id],
+                    policy_version="policy-a",
+                ),
+                AutoTagRecord(
+                    entry_id=second_entry_id,
+                    source_hash="a" * 64,
+                    status="complete",
+                    attempts=1,
+                    tag_ids=[source_id, target_id, source_id],
+                    policy_version="policy-b",
+                ),
+                BriefSchedule(
+                    name="Active merge schedule",
+                    period="daily",
+                    timezone="UTC",
+                    cutoff_time="09:00",
+                    tag_ids=[source_id, target_id, source_id],
+                    enabled=True,
+                ),
+                BriefSchedule(
+                    name="Disabled merge schedule",
+                    period="weekly",
+                    timezone="UTC",
+                    cutoff_time="09:00",
+                    weekday=1,
+                    tag_ids=[source_id],
+                    enabled=False,
+                ),
+            ]
+        )
+        db.commit()
+
+    merged = client.post(
+        f"/api/v1/tags/{source_id}/merge/{target_id}", headers=headers
+    )
+    assert merged.status_code == 200, merged.text
+    assert merged.json() == {
+        "id": target_id,
+        "name": "Quantum Error Correction",
+        "color": "#445566",
+        "description": "Canonical target description.",
+        "aliases": ["QEC", "Quantum EC"],
+        "origin": "auto_promoted",
+        "auto_assignable": False,
+        "entry_count": 2,
+    }
+
+    with factory() as db:
+        assert db.get(Tag, source_id) is None
+        assert db.scalar(select(func.count(EntryTag.id)).where(EntryTag.tag_id == source_id)) == 0
+        target_links = list(
+            db.scalars(
+                select(EntryTag)
+                .where(EntryTag.tag_id == target_id)
+                .order_by(EntryTag.entry_id)
+            )
+        )
+        assert len(target_links) == 2
+        assert {link.entry_id for link in target_links} == {
+            first_entry_id,
+            second_entry_id,
+        }
+        overlap_link = next(
+            link for link in target_links if link.entry_id == second_entry_id
+        )
+        overlap_sources = list(
+            db.scalars(
+                select(EntryTagSource).where(
+                    EntryTagSource.entry_tag_id == overlap_link.id
+                )
+            )
+        )
+        assert {source.source for source in overlap_sources} == {"auto", "manual"}
+        auto_source = next(source for source in overlap_sources if source.source == "auto")
+        assert auto_source.confidence == 0.93
+        assert db.scalar(select(func.count(FeedTag.id)).where(FeedTag.tag_id == source_id)) == 0
+        target_feed_ids = list(
+            db.scalars(select(FeedTag.feed_id).where(FeedTag.tag_id == target_id))
+        )
+        assert len(target_feed_ids) == 2
+        records = list(db.scalars(select(AutoTagRecord).order_by(AutoTagRecord.entry_id)))
+        assert records[0].tag_ids == sorted([target_id, unrelated_id])
+        assert records[1].tag_ids == [target_id]
+        schedules = {
+            schedule.name: schedule.tag_ids
+            for schedule in db.scalars(select(BriefSchedule))
+        }
+        assert schedules == {
+            "Active merge schedule": [target_id],
+            "Disabled merge schedule": [target_id],
+        }
+        aliases = set(
+            db.scalars(select(TagAlias.alias).where(TagAlias.tag_id == target_id))
+        )
+        assert aliases == {"QEC", "Quantum EC"}
+
+
+def test_cleanup_only_changes_explicitly_selected_associations(authenticated_client):
+    client, factory, headers = authenticated_client
+    remove_entry_id = add_entry(factory, title="Cleanup remove")
+    keep_entry_id = add_entry(factory, title="Cleanup keep")
+    untouched_entry_id = add_entry(factory, title="Cleanup untouched")
+    with factory() as db:
+        remove_tag = Tag(name="Remove candidate", normalized_name="remove candidate")
+        keep_tag = Tag(name="Keep candidate", normalized_name="keep candidate")
+        untouched_tag = Tag(name="Untouched candidate", normalized_name="untouched candidate")
+        db.add_all([remove_tag, keep_tag, untouched_tag])
+        db.flush()
+        remove_id = remove_tag.id
+        keep_id = keep_tag.id
+        untouched_id = untouched_tag.id
+        links = [
+            EntryTag(entry_id=remove_entry_id, tag_id=remove_id),
+            EntryTag(entry_id=keep_entry_id, tag_id=keep_id),
+            EntryTag(entry_id=untouched_entry_id, tag_id=untouched_id),
+        ]
+        db.add_all(links)
+        db.flush()
+        db.add_all(
+            [EntryTagSource(entry_tag_id=link.id, source="legacy") for link in links]
+            + [
+                AutoTagRecord(
+                    entry_id=entry_id,
+                    source_hash="a" * 64,
+                    status="complete",
+                    attempts=1,
+                    tag_ids=[tag_id],
+                    policy_version="legacy",
+                )
+                for entry_id, tag_id in [
+                    (remove_entry_id, remove_id),
+                    (keep_entry_id, keep_id),
+                    (untouched_entry_id, untouched_id),
+                ]
+            ]
+        )
+        db.commit()
+
+    preview = client.get("/api/v1/auto-tag/cleanup-preview")
+    assert preview.status_code == 200, preview.text
+    with factory() as db:
+        assert db.scalar(select(func.count(EntryTag.id))) == 3
+        assert db.scalar(select(func.count(EntryTagSource.id))) == 3
+
+    cleaned = client.post(
+        "/api/v1/auto-tag/cleanup",
+        json={
+            "review_token": preview.json()["review_token"],
+            "remove_tag_ids": [remove_id],
+            "keep_tag_ids": [keep_id],
+        },
+        headers=headers,
+    )
+    assert cleaned.status_code == 200, cleaned.text
+    assert cleaned.json() == {
+        "removed_tag_ids": [remove_id],
+        "kept_tag_ids": [keep_id],
+        "removed_count": 1,
+    }
+
+    with factory() as db:
+        assert db.get(Tag, remove_id) is None
+        assert db.scalar(
+            select(EntryTag.id).where(
+                EntryTag.entry_id == remove_entry_id,
+                EntryTag.tag_id == remove_id,
+            )
+        ) is None
+        keep_link = db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == keep_entry_id,
+                EntryTag.tag_id == keep_id,
+            )
+        )
+        assert keep_link is not None
+        assert list(
+            db.scalars(
+                select(EntryTagSource.source).where(
+                    EntryTagSource.entry_tag_id == keep_link.id
+                )
+            )
+        ) == ["manual"]
+        untouched_link = db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == untouched_entry_id,
+                EntryTag.tag_id == untouched_id,
+            )
+        )
+        assert untouched_link is not None
+        assert list(
+            db.scalars(
+                select(EntryTagSource.source).where(
+                    EntryTagSource.entry_tag_id == untouched_link.id
+                )
+            )
+        ) == ["legacy"]
+        untouched_record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == untouched_entry_id)
+        )
+        assert untouched_record is not None
+        assert untouched_record.tag_ids == [untouched_id]
 
 
 def test_brief_schedule_accepts_and_validates_start_time(authenticated_client):

@@ -27,11 +27,14 @@ versions, and impact. Maintainers should acknowledge a report within seven days.
   summaries to the selected third-party provider. In automatic fallback mode,
   Google GTX also receives the text if the primary provider fails; manual mode
   stops without sending it to GTX.
-- Auto-tagging and brief generation also send source titles and summaries to
-  the owner-selected LLM provider. Auto-tagging continues in the background
-  while enabled, and brief schedules repeat that transfer at their configured
-  times. Keep these features disabled for content that must not leave the
-  instance.
+- Auto-tagging sends the owner-selected LLM a batch-local article ordinal plus
+  the source title and summary. It also sends the locally selected controlled
+  tags and active proposals (names, descriptions, and aliases). Authors, Feed
+  metadata, domains, RSS categories, full article content, and database entry
+  IDs are not sent for tagging. Brief generation separately sends source titles
+  and summaries. Auto-tagging continues in the background while enabled, and
+  brief schedules repeat that transfer at their configured times. Keep these
+  features disabled for content that must not leave the instance.
 - The optional AI theme generator sends the primary domain, selected domain
   names, and the free-form style preference to the endpoint chosen on that
   screen. Its API key is used for that one request and is not persisted.
@@ -64,6 +67,7 @@ versions, and impact. Maintainers should acknowledge a report within seven days.
   then scans and smoke-tests those exact digests before publishing the combined
   version and `latest` tags. Unreviewed High or Critical Grype findings block
   publication.
-- `.grype.yaml` contains only exact, documented CPython CPE exceptions for code
-  paths that the service does not use. Each exception is also restricted to the
-  current Python version, so a runtime update requires a fresh review.
+- Any exception added to `.grype.yaml` must document an unused code path and
+  apply only to NVD fallback CPE matches. Each exception must name an exact CVE,
+  package name, version, and type; distro/package matches remain visible.
+  Package or base-image updates require a fresh review.

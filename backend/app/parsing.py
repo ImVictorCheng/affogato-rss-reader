@@ -26,8 +26,7 @@ MAX_ENTRY_GUID_CHARS = 4_096
 MAX_ENTRY_TITLE_CHARS = 2_000
 MAX_ENTRY_SUMMARY_CHARS = 500_000
 MAX_ENTRY_CONTENT_CHARS = 1_000_000
-MAX_ENTRY_AUTHORS = 100
-MAX_ENTRY_AUTHOR_CHARS = 500
+MAX_ENTRY_AUTHORS_CHARS = 500_000
 MAX_ENTRY_CATEGORIES = 100
 MAX_ENTRY_CATEGORY_CHARS = 200
 MAX_FEED_TITLE_CHARS = 500
@@ -107,6 +106,34 @@ def _bounded(value: str, *, label: str, max_chars: int) -> str:
     if len(value) > max_chars:
         raise ValueError(f"Feed {label} exceeds the {max_chars}-character limit")
     return value
+
+
+def _entry_author_credits(entry: Any) -> list[str]:
+    """Preserve the author credits exposed by the source feed.
+
+    Feedparser maps structured Atom authors and aggregate RSS creator fields to
+    the same interface. Treat each source value as opaque credit text rather
+    than guessing individual people from punctuation.
+    """
+    raw_authors = entry.get("authors") or []
+    authors = [
+        clean_html(str(author.get("name") or ""))
+        for author in raw_authors
+        if author.get("name")
+    ]
+    authors = [author for author in authors if author]
+    if not authors and entry.get("author"):
+        author = clean_html(str(entry.author))
+        authors = [author] if author else []
+
+    # Include JSON list punctuation in the aggregate accounting so a malicious
+    # feed cannot evade the storage bound with many tiny credit values.
+    author_payload_chars = sum(len(author) + 3 for author in authors)
+    if author_payload_chars > MAX_ENTRY_AUTHORS_CHARS:
+        raise ValueError(
+            f"Feed author data exceeds the {MAX_ENTRY_AUTHORS_CHARS}-character limit"
+        )
+    return authors
 
 
 def canonicalize_url(value: str | None) -> str:
@@ -214,30 +241,7 @@ def parse_feed(
         guid = str(_get(item, "id", "guid") or "") or None
         if guid:
             _bounded(guid, label="entry GUID", max_chars=MAX_ENTRY_GUID_CHARS)
-        raw_authors = item.get("authors") or []
-        if len(raw_authors) > MAX_ENTRY_AUTHORS:
-            raise ValueError(f"Feed entry has more than {MAX_ENTRY_AUTHORS} authors")
-        authors = [
-            _bounded(
-                clean_html(str(author.get("name") or "")),
-                label="author name",
-                max_chars=MAX_ENTRY_AUTHOR_CHARS,
-            )
-            for author in raw_authors
-            if author.get("name")
-        ]
-        if not authors and item.get("author"):
-            authors = [part.strip() for part in re.split(r",|;|\band\b", clean_html(item.author)) if part.strip()]
-            if len(authors) > MAX_ENTRY_AUTHORS:
-                raise ValueError(f"Feed entry has more than {MAX_ENTRY_AUTHORS} authors")
-            authors = [
-                _bounded(
-                    author,
-                    label="author name",
-                    max_chars=MAX_ENTRY_AUTHOR_CHARS,
-                )
-                for author in authors
-            ]
+        authors = _entry_author_credits(item)
         raw_categories = item.get("tags") or []
         if len(raw_categories) > MAX_ENTRY_CATEGORIES:
             raise ValueError(

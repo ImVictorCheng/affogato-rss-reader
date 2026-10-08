@@ -4,7 +4,9 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -279,6 +281,7 @@ class AutoTagRecord(Base):
     last_error: Mapped[str | None] = mapped_column(Text)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
     tag_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    policy_version: Mapped[str | None] = mapped_column(String(120))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
@@ -287,7 +290,86 @@ class Tag(Base):
     __tablename__ = "tags"
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(120), unique=True)
+    normalized_name: Mapped[str | None] = mapped_column(String(240), index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
     color: Mapped[str | None] = mapped_column(String(20))
+    origin: Mapped[str] = mapped_column(String(30), default="manual", index=True)
+    auto_assignable: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class TagAlias(Base):
+    __tablename__ = "tag_aliases"
+    __table_args__ = (
+        UniqueConstraint("normalized_alias", name="uq_tag_alias_normalized"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tag_id: Mapped[int] = mapped_column(
+        ForeignKey("tags.id", ondelete="CASCADE"), index=True
+    )
+    alias: Mapped[str] = mapped_column(String(120))
+    normalized_alias: Mapped[str] = mapped_column(String(240))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class TagProposal(Base):
+    __tablename__ = "tag_proposals"
+    __table_args__ = (
+        UniqueConstraint("normalized_name", name="uq_tag_proposal_normalized"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120))
+    normalized_name: Mapped[str] = mapped_column(String(240))
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="active", index=True)
+    support_count: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    promoted_tag_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tags.id", ondelete="SET NULL"), index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class TagProposalAlias(Base):
+    __tablename__ = "tag_proposal_aliases"
+    __table_args__ = (
+        UniqueConstraint(
+            "normalized_alias", name="uq_tag_proposal_alias_normalized"
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("tag_proposals.id", ondelete="CASCADE"), index=True
+    )
+    alias: Mapped[str] = mapped_column(String(120))
+    normalized_alias: Mapped[str] = mapped_column(String(240))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class TagProposalSupport(Base):
+    __tablename__ = "tag_proposal_supports"
+    __table_args__ = (
+        UniqueConstraint(
+            "proposal_id", "entry_id", name="uq_tag_proposal_support_entry"
+        ),
+        CheckConstraint(
+            "confidence >= 0 AND confidence <= 1",
+            name="ck_tag_proposal_support_confidence",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("tag_proposals.id", ondelete="CASCADE"), index=True
+    )
+    entry_id: Mapped[int] = mapped_column(
+        ForeignKey("entries.id", ondelete="CASCADE"), index=True
+    )
+    work_id: Mapped[int] = mapped_column(
+        ForeignKey("works.id", ondelete="CASCADE"), index=True
+    )
+    source_hash: Mapped[str] = mapped_column(String(64), index=True)
+    confidence: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class EntryTag(Base):
@@ -298,12 +380,64 @@ class EntryTag(Base):
     tag_id: Mapped[int] = mapped_column(ForeignKey("tags.id", ondelete="CASCADE"), index=True)
 
 
+class EntryTagSource(Base):
+    __tablename__ = "entry_tag_sources"
+    __table_args__ = (
+        UniqueConstraint(
+            "entry_tag_id", "source", name="uq_entry_tag_source"
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="ck_entry_tag_source_confidence",
+        ),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entry_tag_id: Mapped[int] = mapped_column(
+        ForeignKey("entry_tags.id", ondelete="CASCADE"), index=True
+    )
+    source: Mapped[str] = mapped_column(String(30), default="manual", index=True)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    policy_version: Mapped[str | None] = mapped_column(String(120), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class FeedTag(Base):
     __tablename__ = "feed_tags"
     __table_args__ = (UniqueConstraint("feed_id", "tag_id", name="uq_feed_tag"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     feed_id: Mapped[int] = mapped_column(ForeignKey("feeds.id", ondelete="CASCADE"), index=True)
     tag_id: Mapped[int] = mapped_column(ForeignKey("tags.id", ondelete="CASCADE"), index=True)
+
+
+class AutoTagSuppression(Base):
+    __tablename__ = "auto_tag_suppressions"
+    __table_args__ = (
+        UniqueConstraint("entry_id", "tag_id", name="uq_auto_tag_suppression"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entry_id: Mapped[int] = mapped_column(
+        ForeignKey("entries.id", ondelete="CASCADE"), index=True
+    )
+    tag_id: Mapped[int] = mapped_column(
+        ForeignKey("tags.id", ondelete="CASCADE"), index=True
+    )
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AutoTagPreview(Base):
+    __tablename__ = "auto_tag_previews"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    entry_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    results: Mapped[list[dict]] = mapped_column(JSON, default=list)
+    metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
 
 class SyncRun(Base):

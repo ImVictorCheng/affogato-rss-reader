@@ -26,9 +26,14 @@ jobs:
       - name: Verify tag and version
         shell: bash
         run: |
-          python scripts/check_version.py
+          python scripts/check_version.py --release
           version="$(cat VERSION)"
           test "$GITHUB_REF_NAME" = "v${version}"
+          tag_type="$(git cat-file -t "$GITHUB_REF")"
+          if [[ "$tag_type" != "tag" ]]; then
+            echo "Release tags must be annotated tags; found object type: $tag_type" >&2
+            exit 1
+          fi
           if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
             echo "Release tags must point to a commit contained in main." >&2
             exit 1

@@ -113,7 +113,7 @@ describe("Affogato RSS Reader", () => {
 
     expect(await screen.findByRole("heading", { name: "Briefs", level: 1 }, { timeout: 10_000 })).toBeInTheDocument();
     expect(document.querySelector(".reader-shell")).toHaveClass("is-brief-workspace");
-  });
+  }, 15_000);
   it("resizes the desktop panes from separators and persists the widths", async () => {
     mockApi(); render(<App />);
     const navigationResizer = await screen.findByRole("separator", { name: "Resize navigation pane" });

@@ -1,23 +1,39 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import httpx
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
 
 from backend.app.models import (
+    AutoTagRecord,
+    AutoTagSuppression,
     Entry,
     EntryFeed,
+    EntryTag,
+    EntryTagSource,
     Feed,
     NetworkProxyConfig,
     SyncRun,
+    Tag,
+    TagProposal,
+    TagProposalSupport,
     Translation,
     Work,
     utcnow,
 )
 from backend.app.parsing import ParsedEntry
-from backend.app.sync import discover_feeds, sync_due_feeds, sync_feed, upsert_entry
+from backend.app.sync import (
+    _merge_entry_into,
+    _merge_work_into,
+    discover_feeds,
+    sync_due_feeds,
+    sync_feed,
+    upsert_entry,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +82,72 @@ def test_cross_source_dedup_and_arxiv_versions(db_factory):
         assert db.scalar(select(func.count()).select_from(Work)) == 1
         assert db.scalar(select(func.count()).select_from(Entry)) == 2
         assert db.scalar(select(func.count()).select_from(EntryFeed)) == 3
+
+
+def test_upsert_locks_cleanup_snapshot_before_entry_insert_and_update(db_factory):
+    """Keep sync's SQL lock order aligned with automatic classification."""
+
+    with db_factory() as db:
+        feed = Feed(title="Ordered", url="https://ordered.test/rss")
+        db.add(feed)
+        db.commit()
+        engine = db.get_bind()
+        statements: list[tuple[str, object]] = []
+
+        def record_statement(
+            _connection,
+            _cursor,
+            statement,
+            _parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            statements.append(
+                (" ".join(statement.upper().split()), _parameters)
+            )
+
+        def assert_cleanup_lock_precedes(entry_prefix: str) -> None:
+            cleanup_lock_index = next(
+                index
+                for index, (statement, parameters) in enumerate(statements)
+                if statement.startswith("UPDATE APP_SETTINGS SET")
+                and "auto_tag_cleanup_snapshot_lock" in repr(parameters)
+            )
+            entry_dml_index = next(
+                index
+                for index, (statement, _parameters) in enumerate(statements)
+                if statement.startswith(entry_prefix)
+            )
+            first_work_or_entry_index = next(
+                index
+                for index, (statement, _parameters) in enumerate(statements)
+                if (
+                    " FROM WORKS " in f" {statement} "
+                    or statement.startswith("INSERT INTO WORKS")
+                    or " FROM ENTRIES " in f" {statement} "
+                    or statement.startswith("INSERT INTO ENTRIES")
+                    or statement.startswith("UPDATE ENTRIES")
+                )
+            )
+            assert cleanup_lock_index < first_work_or_entry_index <= entry_dml_index
+
+        sqlalchemy_event.listen(engine, "before_cursor_execute", record_statement)
+        try:
+            original = parsed("2607.54321v1", 1)
+            entry, action = upsert_entry(db, feed, original)
+            assert action == "created"
+            assert_cleanup_lock_precedes("INSERT INTO ENTRIES")
+            db.commit()
+
+            statements.clear()
+            revised = replace(original, title="Revised paper title")
+            same_entry, action = upsert_entry(db, feed, revised)
+            assert same_entry.id == entry.id
+            assert action == "updated"
+            assert_cleanup_lock_precedes("UPDATE ENTRIES")
+            db.commit()
+        finally:
+            sqlalchemy_event.remove(engine, "before_cursor_execute", record_statement)
 
 
 def test_doi_first_then_arxiv_promotes_same_work(db_factory):
@@ -213,6 +295,245 @@ def test_late_doi_bridge_merges_existing_works_and_preserves_versions(db_factory
         assert journal_again.title == "Paper version 1"
 
 
+def test_duplicate_entry_merge_preserves_auto_tag_governance_state(db_factory):
+    with db_factory() as db:
+        source_work = Work(dedup_key="governance-source")
+        target_work = Work(dedup_key="governance-target")
+        db.add_all([source_work, target_work])
+        db.flush()
+        source = Entry(
+            work_id=source_work.id,
+            version_key="default",
+            title="Duplicate source",
+            summary="Source summary",
+            url="https://source.test/paper",
+            source_hash="source-hash",
+        )
+        target = Entry(
+            work_id=target_work.id,
+            version_key="default",
+            title="Canonical target",
+            summary="Target summary",
+            url="https://target.test/paper",
+            source_hash="target-hash",
+        )
+        provenance_tag = Tag(
+            name="Quantum Computing",
+            normalized_name="quantum computing",
+        )
+        suppressed_tag = Tag(
+            name="Machine Learning",
+            normalized_name="machine learning",
+        )
+        shared_proposal = TagProposal(
+            name="Quantum Networks",
+            normalized_name="quantum networks",
+            status="active",
+        )
+        moved_proposal = TagProposal(
+            name="Fault Tolerance",
+            normalized_name="fault tolerance",
+            status="active",
+        )
+        db.add_all(
+            [
+                source,
+                target,
+                provenance_tag,
+                suppressed_tag,
+                shared_proposal,
+                moved_proposal,
+            ]
+        )
+        db.flush()
+
+        source_link = EntryTag(entry_id=source.id, tag_id=provenance_tag.id)
+        target_link = EntryTag(entry_id=target.id, tag_id=provenance_tag.id)
+        suppressed_link = EntryTag(entry_id=target.id, tag_id=suppressed_tag.id)
+        db.add_all([source_link, target_link, suppressed_link])
+        db.flush()
+        db.add_all(
+            [
+                EntryTagSource(entry_tag_id=source_link.id, source="manual"),
+                EntryTagSource(
+                    entry_tag_id=source_link.id,
+                    source="auto",
+                    confidence=0.93,
+                    policy_version="source-policy",
+                ),
+                EntryTagSource(entry_tag_id=source_link.id, source="legacy"),
+                EntryTagSource(entry_tag_id=target_link.id, source="manual"),
+                EntryTagSource(
+                    entry_tag_id=target_link.id,
+                    source="auto",
+                    confidence=0.81,
+                    policy_version="target-policy",
+                ),
+                EntryTagSource(entry_tag_id=suppressed_link.id, source="manual"),
+                EntryTagSource(
+                    entry_tag_id=suppressed_link.id,
+                    source="auto",
+                    confidence=0.88,
+                    policy_version="target-policy",
+                ),
+                AutoTagSuppression(
+                    entry_id=source.id,
+                    tag_id=suppressed_tag.id,
+                    reason="removed by user",
+                ),
+                AutoTagRecord(
+                    entry_id=source.id,
+                    source_hash=source.source_hash,
+                    status="complete",
+                    attempts=2,
+                    tag_ids=[provenance_tag.id],
+                ),
+                AutoTagRecord(
+                    entry_id=target.id,
+                    source_hash="stale-target-hash",
+                    status="failed",
+                    attempts=5,
+                    last_error="stale failure",
+                    next_retry_at=utcnow() + timedelta(hours=1),
+                    tag_ids=[suppressed_tag.id],
+                ),
+                TagProposalSupport(
+                    proposal_id=shared_proposal.id,
+                    entry_id=source.id,
+                    work_id=source_work.id,
+                    source_hash=source.source_hash,
+                    confidence=0.96,
+                ),
+                TagProposalSupport(
+                    proposal_id=shared_proposal.id,
+                    entry_id=target.id,
+                    work_id=target_work.id,
+                    source_hash="stale-target-hash",
+                    confidence=0.82,
+                ),
+                TagProposalSupport(
+                    proposal_id=moved_proposal.id,
+                    entry_id=source.id,
+                    work_id=source_work.id,
+                    source_hash=source.source_hash,
+                    confidence=0.91,
+                ),
+            ]
+        )
+        db.flush()
+
+        _merge_entry_into(db, source, target)
+        db.commit()
+
+        assert db.get(Entry, source.id) is None
+        merged_link = db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == target.id,
+                EntryTag.tag_id == provenance_tag.id,
+            )
+        )
+        assert merged_link is not None
+        merged_sources = list(
+            db.scalars(
+                select(EntryTagSource)
+                .where(EntryTagSource.entry_tag_id == merged_link.id)
+                .order_by(EntryTagSource.source)
+            )
+        )
+        assert [row.source for row in merged_sources] == ["auto", "legacy", "manual"]
+        merged_auto = next(row for row in merged_sources if row.source == "auto")
+        assert merged_auto.confidence == pytest.approx(0.93)
+        assert merged_auto.policy_version == "source-policy"
+
+        suppression = db.scalar(
+            select(AutoTagSuppression).where(
+                AutoTagSuppression.entry_id == target.id,
+                AutoTagSuppression.tag_id == suppressed_tag.id,
+            )
+        )
+        assert suppression is not None
+        suppressed_sources = list(
+            db.scalars(
+                select(EntryTagSource)
+                .join(EntryTag, EntryTagSource.entry_tag_id == EntryTag.id)
+                .where(
+                    EntryTag.entry_id == target.id,
+                    EntryTag.tag_id == suppressed_tag.id,
+                )
+            )
+        )
+        assert [row.source for row in suppressed_sources] == ["manual"]
+
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == target.id)
+        )
+        assert record is not None
+        assert record.source_hash == target.source_hash
+        assert record.status == "pending"
+        assert record.attempts == 0
+        assert record.last_error is None
+        assert record.next_retry_at is None
+        assert record.tag_ids == [provenance_tag.id]
+        assert db.scalar(select(func.count()).select_from(AutoTagRecord)) == 1
+
+        supports = list(
+            db.scalars(
+                select(TagProposalSupport)
+                .where(TagProposalSupport.entry_id == target.id)
+                .order_by(TagProposalSupport.proposal_id)
+            )
+        )
+        # Neither the source nor the pre-existing target evidence was produced
+        # for the surviving content hash, so both are discarded. The pending
+        # AutoTagRecord above will rebuild evidence from the target content.
+        assert supports == []
+
+
+def test_work_merge_remaps_proposal_support_before_source_work_is_deleted(db_factory):
+    with db_factory() as db:
+        source_work = Work(dedup_key="proposal-support-source")
+        target_work = Work(dedup_key="proposal-support-target")
+        proposal = TagProposal(
+            name="Quantum Sensing",
+            normalized_name="quantum sensing",
+            status="active",
+        )
+        db.add_all([source_work, target_work, proposal])
+        db.flush()
+        entry = Entry(
+            work_id=source_work.id,
+            version_key="v2",
+            title="Second version",
+            summary="Summary",
+            url="https://example.test/v2",
+            source_hash="version-two-hash",
+        )
+        db.add(entry)
+        db.flush()
+        support = TagProposalSupport(
+            proposal_id=proposal.id,
+            entry_id=entry.id,
+            work_id=source_work.id,
+            source_hash=entry.source_hash,
+            confidence=0.9,
+        )
+        db.add(support)
+        db.flush()
+        support_id = support.id
+
+        _merge_work_into(db, source_work, target_work)
+        db.commit()
+
+        assert db.get(Work, source_work.id) is None
+        db.refresh(entry)
+        assert entry.work_id == target_work.id
+        remapped_support = db.get(TagProposalSupport, support_id)
+        assert remapped_support is not None
+        assert remapped_support.entry_id == entry.id
+        assert remapped_support.work_id == target_work.id
+        assert remapped_support.source_hash == entry.source_hash
+
+
 def test_sync_uses_conditional_headers_and_304_is_idempotent(db_factory, settings):
     calls = []
     rss = b"""<rss version="2.0"><channel><title>Feed</title>
@@ -242,6 +563,68 @@ def test_sync_uses_conditional_headers_and_304_is_idempotent(db_factory, setting
         assert second.status == "not_modified"
         assert db.scalar(select(func.count()).select_from(Entry)) == 1
         assert db.scalar(select(func.count()).select_from(Translation)) == 1
+
+
+def test_sync_batch_acquires_one_cleanup_lock_before_entry_writes(
+    db_factory,
+    settings,
+):
+    rss = b"""<rss version="2.0"><channel><title>Feed</title>
+      <item><guid>one</guid><title>One</title><link>https://example.test/one</link>
+      <description>First</description></item>
+      <item><guid>two</guid><title>Two</title><link>https://example.test/two</link>
+      <description>Second</description></item></channel></rss>"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=rss,
+            headers={"content-type": "application/rss+xml"},
+        )
+
+    with db_factory() as db, httpx.Client(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        feed = Feed(title="Batch", url="https://example.test/rss")
+        db.add(feed)
+        db.commit()
+        engine = db.get_bind()
+        statements: list[tuple[str, object]] = []
+
+        def record_statement(
+            _connection,
+            _cursor,
+            statement,
+            parameters,
+            _context,
+            _executemany,
+        ) -> None:
+            statements.append(
+                (" ".join(statement.upper().split()), parameters)
+            )
+
+        sqlalchemy_event.listen(engine, "before_cursor_execute", record_statement)
+        try:
+            run = sync_feed(db, feed, settings, client=client)
+        finally:
+            sqlalchemy_event.remove(engine, "before_cursor_execute", record_statement)
+
+        cleanup_lock_indexes = [
+            index
+            for index, (statement, parameters) in enumerate(statements)
+            if statement.startswith("UPDATE APP_SETTINGS SET")
+            and "auto_tag_cleanup_snapshot_lock" in repr(parameters)
+        ]
+        entry_insert_indexes = [
+            index
+            for index, (statement, _parameters) in enumerate(statements)
+            if statement.startswith("INSERT INTO ENTRIES")
+        ]
+        assert run.status == "success"
+        assert run.created_count == 2
+        assert len(cleanup_lock_indexes) == 1
+        assert len(entry_insert_indexes) == 2
+        assert cleanup_lock_indexes[0] < min(entry_insert_indexes)
 
 
 def test_feed_failure_is_recorded_without_corrupting_successful_feed(db_factory, settings):

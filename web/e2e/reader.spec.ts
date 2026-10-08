@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Dialog } from "@playwright/test";
 
 test.beforeEach(async ({ request, page }) => {
   await request.post("http://127.0.0.1:18081/__test__/reset");
@@ -63,7 +63,7 @@ test("translation failure falls back to the original", async ({ page }) => {
   await expect(page.locator(".detail-pane")).toContainText("Translation failed");
 });
 
-test("renders article summaries and briefs with local MathJax", async ({ page, request }) => {
+test("renders article titles, summaries, and briefs with local MathJax", async ({ page, request }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const externalRequests: string[] = [];
   const localMathJaxRequests: string[] = [];
@@ -81,7 +81,12 @@ test("renders article summaries and briefs with local MathJax", async ({ page, r
   expect(licenseResponse.status()).toBe(200);
 
   await page.goto("/");
+  const firstCard = page.locator(".entry-card").first();
+  await expect(firstCard.locator("h3 mjx-container")).toHaveCount(1);
+  await expect(firstCard.locator(".entry-card__original mjx-container")).toHaveCount(1);
   await page.locator(".entry-card").first().click();
+  await expect(page.locator(".article-title--translated mjx-container")).toHaveCount(1);
+  await expect(page.locator(".article-title--original mjx-container")).toHaveCount(1);
   const abstract = page.locator(".abstract-section");
   await expect(abstract.locator(".abstract-block--translated mjx-container")).toHaveCount(1);
   await expect(abstract.locator(".abstract-block:not(.abstract-block--translated) mjx-container")).toHaveCount(2);
@@ -181,6 +186,23 @@ test("uses the shared field contract without widening compact controls", async (
   await tagCards.nth(1).getByRole("button", { name: "Rename tag QEC" }).click();
   await expect(page.getByRole("textbox", { name: "Rename tag QEC" })).toBeVisible();
   await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.locator(".auto-tag-policy-note strong").getByText("Threshold growth", { exact: true })).toBeVisible();
+  await expect(page.getByText("10 Work / 365 days", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Article data sent.*batch-local identifier, title, and summary/i)).toBeVisible();
+  const previewButton = page.getByRole("button", { name: "Run 50-article preview" });
+  await expect(previewButton).toBeDisabled();
+  await page.getByRole("button", { name: "Preview cleanup" }).click();
+  await expect(page.getByRole("checkbox", { name: /QEC/ })).toBeEnabled();
+  await expect(page.locator(".auto-tag-cleanup-row").nth(1).getByRole("checkbox")).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Keep as manual" })).toHaveCount(2);
+  await expect(previewButton).toBeDisabled();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Confirm cleanup review" }).click();
+  await expect(previewButton).toBeEnabled();
+  await previewButton.click();
+  await expect(page.getByText("Preview result", { exact: true })).toBeVisible();
+  await expect(page.getByText("Classified", { exact: true })).toBeVisible();
+  await expect(page.getByText(/reproducibility · 91%/)).toBeVisible();
   await expect(page.locator(".category-manager__create > button").first()).not.toHaveCSS("width", "100%");
   await expect(page.locator(".icon-button").first()).toHaveCSS("width", "36px");
 
@@ -200,4 +222,178 @@ test("uses the shared field contract without widening compact controls", async (
   expect(opmlBoxes[0].height).toBeLessThan(120);
   expect(opmlBoxes[0].headingTop).toBe(opmlBoxes[1].headingTop);
   expect(opmlBoxes[0].buttonTop).toBe(opmlBoxes[1].buttonTop);
+});
+
+test("governed auto tagging keeps cleanup explicit and reuses all 50 preview results", async ({ page, request }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/");
+  await page.locator(".sidebar__footer").getByRole("button", { name: /Settings/ }).click();
+  await page.locator(".settings-nav-card").filter({ hasText: "Content" }).click();
+
+  await expect(page.getByText(/4 Work · Collecting/)).toBeVisible();
+  await expect(page.getByText(/10 Work · Promoted → Quantum Computing/)).toBeVisible();
+  const previewButton = page.getByRole("button", { name: "Run 50-article preview" });
+  await expect(previewButton).toBeDisabled();
+  await page.getByRole("button", { name: "Preview cleanup" }).click();
+  await expect(page.locator(".auto-tag-cleanup-row")).toHaveCount(2);
+  await expect(previewButton).toBeDisabled();
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Confirm cleanup review" }).click();
+  await expect(previewButton).toBeEnabled();
+
+  await request.post("http://127.0.0.1:18081/__test__/auto-tag-scenario", {
+    data: { invalidate_cleanup_review: true },
+  });
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Keep as manual" }).first().click();
+  await expect(previewButton).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Confirm cleanup review" })).toBeVisible();
+  await expect(page.locator(".auto-tag-cleanup-row")).toHaveCount(2);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Confirm cleanup review" }).click();
+  await expect(previewButton).toBeEnabled();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Keep as manual" }).first().click();
+  await expect(page.locator(".auto-tag-cleanup-row")).toHaveCount(1);
+  await expect(page.getByText(/Cleanup review confirmed/)).toBeVisible();
+  await expect(previewButton).toBeEnabled();
+
+  await previewButton.click();
+  await expect(page.locator(".auto-tag-preview-list > div")).toHaveCount(50);
+  await expect(page.getByText("Estimated full calls", { exact: true })).toBeVisible();
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Approve full run" }).click();
+  await expect(page.getByRole("button", { name: "Approve full run" })).toHaveCount(0);
+  await expect(page.locator(".translation-status-card").filter({ hasText: "Queued for tagging" }).locator("strong")).toHaveText("50");
+
+  const acceptMerge = async (dialog: Dialog) => {
+    await dialog.accept(dialog.type() === "prompt" ? "3" : undefined);
+  };
+  page.on("dialog", acceptMerge);
+  const mergeSource = page.locator(".tag-manager-card").filter({ hasText: "Condensed Matter" });
+  await mergeSource.hover();
+  await mergeSource.getByRole("button", { name: "Merge tag Condensed Matter", exact: true }).click();
+  await expect(page.locator(".tag-manager-card")).toHaveCount(2);
+  await expect(page.getByText("Condensed Matter", { exact: true })).toHaveCount(0);
+  page.off("dialog", acceptMerge);
+});
+
+test("auto-tag workflow invalidates stale trials after races and taxonomy changes", async ({ page, request }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/");
+  await page.locator(".sidebar__footer").getByRole("button", { name: /Settings/ }).click();
+  await page.locator(".settings-nav-card").filter({ hasText: "Content" }).click();
+
+  const previewButton = page.getByRole("button", { name: "Run 50-article preview" });
+  await page.getByRole("button", { name: "Preview cleanup" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Confirm cleanup review" }).click();
+
+  await request.post("http://127.0.0.1:18081/__test__/auto-tag-scenario", {
+    data: { invalidate_cleanup_after_review_read: true },
+  });
+  await previewButton.click();
+  await expect(previewButton).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Confirm cleanup review" })).toBeVisible();
+  await expect(page.getByText("Preview result", { exact: true })).toHaveCount(0);
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Confirm cleanup review" }).click();
+  await previewButton.click();
+  await expect(page.locator(".auto-tag-preview-list > div")).toHaveCount(50);
+
+  await page.getByRole("combobox", { name: "Tag-library growth" }).click();
+  await page.getByRole("option", { name: "Closed library" }).click();
+  await page.getByRole("heading", { name: "Auto tagging" }).locator("xpath=ancestor::section").getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByText("Preview result", { exact: true })).toHaveCount(0);
+  await expect(previewButton).toBeEnabled();
+
+  await previewButton.click();
+  await expect(page.locator(".auto-tag-preview-list > div")).toHaveCount(50);
+  const createTagForm = page.locator(".category-manager__create");
+  await createTagForm.getByPlaceholder("New tag").fill("New Taxonomy Topic");
+  await createTagForm.getByRole("button").click();
+  await expect(page.getByText("New Taxonomy Topic", { exact: true })).toBeVisible();
+  await expect(page.getByText("Preview result", { exact: true })).toHaveCount(0);
+
+  await previewButton.click();
+  await expect(page.locator(".auto-tag-preview-list > div")).toHaveCount(50);
+  await request.post("http://127.0.0.1:18081/__test__/auto-tag-scenario", {
+    data: { invalidate_cleanup_after_review_read: true },
+  });
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Approve full run" }).click();
+  await expect(page.getByText("Preview result", { exact: true })).toHaveCount(0);
+  await expect(previewButton).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Confirm cleanup review" })).toBeVisible();
+
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Confirm cleanup review" }).click();
+  await expect(previewButton).toBeEnabled();
+});
+
+test("a successful tag merge stays successful when cleanup refresh fails", async ({ page, request }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/");
+  await page.locator(".sidebar__footer").getByRole("button", { name: /Settings/ }).click();
+  await page.locator(".settings-nav-card").filter({ hasText: "Content" }).click();
+
+  const previewButton = page.getByRole("button", { name: "Run 50-article preview" });
+  await page.getByRole("button", { name: "Preview cleanup" }).click();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Confirm cleanup review" }).click();
+  await previewButton.click();
+  await expect(page.locator(".auto-tag-preview-list > div")).toHaveCount(50);
+
+  await request.post("http://127.0.0.1:18081/__test__/auto-tag-scenario", {
+    data: { fail_cleanup_preview_once: true },
+  });
+  const acceptMerge = async (dialog: Dialog) => {
+    await dialog.accept(dialog.type() === "prompt" ? "3" : undefined);
+  };
+  page.on("dialog", acceptMerge);
+  const mergeSource = page.locator(".tag-manager-card").filter({ hasText: "Condensed Matter" });
+  await mergeSource.hover();
+  await mergeSource.getByRole("button", { name: "Merge tag Condensed Matter", exact: true }).click();
+  await expect(page.getByText("Merged into “Quantum Computing”.", { exact: true })).toBeVisible();
+  await expect(page.locator(".tag-manager-card__body > strong").getByText("Condensed Matter", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Preview result", { exact: true })).toHaveCount(0);
+  await expect(previewButton).toBeDisabled();
+  page.off("dialog", acceptMerge);
+
+  await page.getByRole("button", { name: "Refresh cleanup preview" }).click();
+  await expect(page.locator(".auto-tag-cleanup-row")).toHaveCount(1);
+});
+
+test("auto-tag rebuild and preview error recovery are clear in Chinese", async ({ page, request }) => {
+  await request.post("http://127.0.0.1:18081/__test__/auto-tag-scenario", {
+    data: { rebuild: true, outdated_count: 23, preview_mode: "failed", cleanup_empty: true },
+  });
+  await page.addInitScript(() => localStorage.setItem("affogato-rss-reader:locale", "zh-CN"));
+  await page.goto("/");
+  await page.locator(".sidebar__footer").getByRole("button", { name: /设置/ }).click();
+  await page.locator(".settings-nav-card").filter({ hasText: "内容" }).click();
+
+  await expect(page.getByText("策略或标签库已变化", { exact: true })).toBeVisible();
+  await expect(page.getByText(/23 篇文章的旧结果需要重建/)).toBeVisible();
+  const previewButton = page.getByRole("button", { name: "运行 50 篇试跑" });
+  await expect(previewButton).toBeDisabled();
+  await page.getByRole("button", { name: "预览可清理标签" }).click();
+  await expect(page.getByText("没有需要清理的标签。", { exact: true })).toBeVisible();
+  await expect(previewButton).toBeDisabled();
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "确认已审阅清理预览" }).click();
+  await expect(previewButton).toBeEnabled();
+  await previewButton.click();
+  await expect(page.getByText("provider timeout", { exact: true })).toBeVisible();
+
+  await request.post("http://127.0.0.1:18081/__test__/auto-tag-scenario", {
+    data: { preview_mode: "success" },
+  });
+  await previewButton.click();
+  await expect(page.getByText("试跑结果", { exact: true })).toBeVisible();
+  await expect(page.locator(".auto-tag-preview-list > div")).toHaveCount(50);
 });

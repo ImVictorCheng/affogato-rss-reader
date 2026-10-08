@@ -2,6 +2,11 @@ import type {
   ApiErrorBody,
   AppSettings,
   AuthStatus,
+  AutoTagCleanupPreview,
+  AutoTagCleanupResult,
+  AutoTagPreview,
+  AutoTagProposalList,
+  AutoTagSettingsInput,
   AutoTagStatus,
   Brief,
   BriefGenerationProgress,
@@ -275,10 +280,11 @@ class ApiClient {
   async tags() {
     return (await this.request<{ items: Tag[] }>("/tags")).items;
   }
-  createTag(name: string) {
-    return this.request<Tag>("/tags", { method: "POST", body: JSON.stringify({ name }) });
+  createTag(input: string | Pick<Tag, "name"> & Partial<Pick<Tag, "color" | "description" | "aliases" | "auto_assignable">>) {
+    const body = typeof input === "string" ? { name: input } : input;
+    return this.request<Tag>("/tags", { method: "POST", body: JSON.stringify(body) });
   }
-  updateTag(id: number, patch: Partial<Pick<Tag, "name" | "color">>) {
+  updateTag(id: number, patch: Partial<Pick<Tag, "name" | "color" | "description" | "aliases" | "auto_assignable">>) {
     return this.request<Tag>(`/tags/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
   }
   deleteTag(id: number) {
@@ -311,8 +317,32 @@ class ApiClient {
   autoTagStatus() {
     return this.request<AutoTagStatus>("/auto-tag/status");
   }
-  setAutoTagStatus(settings: { enabled: boolean; create_new: boolean; llm_connection_id?: number | null }) {
+  setAutoTagStatus(settings: AutoTagSettingsInput) {
     return this.request<AutoTagStatus>("/auto-tag/status", { method: "PATCH", body: JSON.stringify(settings) });
+  }
+  async autoTagPreviews() {
+    return (await this.request<{ items: AutoTagPreview[] }>("/auto-tag/previews")).items;
+  }
+  createAutoTagPreview(input: { sample_size: number } = { sample_size: 50 }) {
+    return this.request<AutoTagPreview>("/auto-tag/previews", { method: "POST", body: JSON.stringify(input) });
+  }
+  autoTagPreview(id: number) {
+    return this.request<AutoTagPreview>(`/auto-tag/previews/${id}`);
+  }
+  approveAutoTagPreview(id: number, input: { scope: "all" } = { scope: "all" }) {
+    return this.request<AutoTagStatus>(`/auto-tag/previews/${id}/approve`, { method: "POST", body: JSON.stringify(input) });
+  }
+  autoTagCleanupPreview() {
+    return this.request<AutoTagCleanupPreview>("/auto-tag/cleanup-preview");
+  }
+  cleanupAutoTags(input: { remove_tag_ids: number[]; keep_tag_ids: number[]; review_token: string }) {
+    return this.request<AutoTagCleanupResult>("/auto-tag/cleanup", { method: "POST", body: JSON.stringify(input) });
+  }
+  autoTagProposals(offset = 0, limit = 50) {
+    return this.request<AutoTagProposalList>(`/auto-tag/proposals?offset=${offset}&limit=${limit}`);
+  }
+  mergeTags(sourceId: number, targetId: number) {
+    return this.request<Tag>(`/tags/${sourceId}/merge/${targetId}`, { method: "POST" });
   }
   setTranslation(settings: TranslationSettingsInput) {
     return this.request<TranslationStatus>("/translations/status", { method: "PATCH", body: JSON.stringify(settings) });

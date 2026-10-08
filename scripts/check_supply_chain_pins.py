@@ -13,6 +13,7 @@ FROM_LINE = re.compile(r"^FROM\s+(\S+)(?:\s+AS\s+(\S+))?$", re.IGNORECASE)
 SYNTAX_IMAGE = re.compile(r"^# syntax=\S+@sha256:[0-9a-f]{64}$")
 TOOL_IMAGE = re.compile(r"(?P<image>(?:anchore/(?:grype|syft)|python):[^\s\"']+)")
 PINNED_IMAGE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+CVE_ID = re.compile(r"^CVE-\d{4}-\d+$")
 RELEASE_IMAGE_TEMPLATE = re.compile(
     r"^x-reader-image:\s+"
     r"ghcr\.io/OWNER/affogato-rss-reader:\d+\.\d+\.\d+@READER_DIGEST$",
@@ -156,6 +157,98 @@ def check_scanner_isolation() -> list[str]:
     return errors
 
 
+def validate_grype_ignores(text: str, config: Path) -> list[str]:
+    lines = text.splitlines()
+    errors: list[str] = []
+    active_lines = [line for line in lines if line.strip() and not line.lstrip().startswith("#")]
+    if active_lines == ["ignore: []"]:
+        return []
+    try:
+        ignore_line = lines.index("ignore:")
+    except ValueError:
+        return [f"{config}: missing ignore list"]
+
+    starts = [
+        index
+        for index, line in enumerate(lines[ignore_line + 1 :], ignore_line + 1)
+        if line.startswith("  - ")
+    ]
+    if not starts:
+        return [f"{config}: ignore list must contain at least one scoped rule"]
+
+    scopes: set[tuple[str, str, str, str, str, str]] = set()
+    for rule_number, start in enumerate(starts, 1):
+        end = starts[rule_number] if rule_number < len(starts) else len(lines)
+        rule: dict[str, str] = {}
+        package: dict[str, str] = {}
+        in_package = False
+        for line_number, line in enumerate(lines[start:end], start + 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if line_number == start + 1:
+                match = re.fullmatch(r"  - vulnerability:\s*(\S+)", line)
+                if match is None:
+                    errors.append(f"{config}:{line_number}: ignore rule must start with a CVE")
+                else:
+                    rule["vulnerability"] = match.group(1)
+                continue
+            if line == "    package:":
+                in_package = True
+                continue
+            target = package if line.startswith("      ") and in_package else rule
+            indent = "      " if target is package else "    "
+            match = re.fullmatch(rf"{indent}([a-z-]+):\s*(.+)", line)
+            if match is None:
+                errors.append(f"{config}:{line_number}: malformed or unscoped ignore field")
+                continue
+            key, value = match.groups()
+            if key in target:
+                errors.append(f"{config}:{line_number}: duplicate ignore field: {key}")
+            target[key] = value
+
+        vulnerability = rule.get("vulnerability", "")
+        if not CVE_ID.fullmatch(vulnerability):
+            errors.append(f"{config}: ignore rule {rule_number} must name one exact CVE")
+        expected_rule_keys = {"vulnerability", "namespace", "match-type", "reason"}
+        if set(rule) != expected_rule_keys:
+            errors.append(
+                f"{config}: ignore rule {rule_number} must contain exactly "
+                "vulnerability, namespace, match-type, reason, and package"
+            )
+        if rule.get("namespace") != "nvd:cpe":
+            errors.append(f"{config}: ignore rule {rule_number} must target only nvd:cpe")
+        if rule.get("match-type") != "cpe-match":
+            errors.append(f"{config}: ignore rule {rule_number} must target only cpe-match")
+        if not rule.get("reason", "").strip():
+            errors.append(f"{config}: ignore rule {rule_number} must explain its reachability")
+
+        if set(package) != {"name", "version", "type"}:
+            errors.append(
+                f"{config}: ignore rule {rule_number} package must contain exact name, version, and type"
+            )
+        version = package.get("version", "")
+        if not version or any(character in version for character in "*?<>|,"):
+            errors.append(f"{config}: ignore rule {rule_number} package version must be exact")
+        scope = (
+            vulnerability,
+            rule.get("namespace", ""),
+            rule.get("match-type", ""),
+            package.get("name", ""),
+            version,
+            package.get("type", ""),
+        )
+        if scope in scopes:
+            errors.append(f"{config}: duplicate Grype ignore scope: {scope}")
+        scopes.add(scope)
+    return errors
+
+
+def check_grype_ignores() -> list[str]:
+    config = ROOT / ".grype.yaml"
+    return validate_grype_ignores(config.read_text(encoding="utf-8"), config)
+
+
 def check_audit_gates() -> list[str]:
     ci = ROOT / ".github" / "workflows" / "ci.yml"
     preflight = ROOT / "scripts" / "release_preflight.ps1"
@@ -258,6 +351,7 @@ def main() -> int:
         + check_release_compose()
         + check_python_build_system()
         + check_scanner_isolation()
+        + check_grype_ignores()
         + check_audit_gates()
         + check_release_bundle_modes()
         + check_release_promotion()

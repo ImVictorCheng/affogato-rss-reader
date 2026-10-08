@@ -4,22 +4,27 @@ from datetime import timedelta
 from urllib.parse import urljoin, urlsplit
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .auto_tag import acquire_cleanup_snapshot
 from .config import Settings, get_settings
 from .models import (
     AppSetting,
+    AutoTagRecord,
+    AutoTagSuppression,
     BriefItem,
     Entry,
     EntryDomain,
     EntryFeed,
     EntryTag,
+    EntryTagSource,
     Feed,
     ReadingState,
     SyncRun,
     Translation,
+    TagProposalSupport,
     Work,
     utcnow,
 )
@@ -119,6 +124,7 @@ def _equivalent_entry(db: Session, work_id: int, version_key: str) -> Entry | No
 
 def _merge_entry_into(db: Session, source: Entry, target: Entry) -> None:
     """Move user, source, and brief relationships while collapsing a duplicate."""
+    acquire_cleanup_snapshot(db)
     for link in list(db.scalars(select(EntryFeed).where(EntryFeed.entry_id == source.id))):
         existing = db.scalar(
             select(EntryFeed).where(
@@ -199,9 +205,183 @@ def _merge_entry_into(db: Session, source: Entry, target: Entry) -> None:
             )
         )
         if existing:
+            for source_row in list(
+                db.scalars(
+                    select(EntryTagSource).where(
+                        EntryTagSource.entry_tag_id == entry_tag.id
+                    )
+                )
+            ):
+                target_row = db.scalar(
+                    select(EntryTagSource).where(
+                        EntryTagSource.entry_tag_id == existing.id,
+                        EntryTagSource.source == source_row.source,
+                    )
+                )
+                if target_row is None:
+                    source_row.entry_tag_id = existing.id
+                else:
+                    if source_row.confidence is not None:
+                        target_row.confidence = max(
+                            target_row.confidence or 0,
+                            source_row.confidence,
+                        )
+                        if source_row.policy_version:
+                            target_row.policy_version = source_row.policy_version
+                    db.delete(source_row)
+            db.flush()
             db.delete(entry_tag)
         else:
             entry_tag.entry_id = target.id
+
+    for suppression in list(
+        db.scalars(
+            select(AutoTagSuppression).where(
+                AutoTagSuppression.entry_id == source.id
+            )
+        )
+    ):
+        existing = db.scalar(
+            select(AutoTagSuppression).where(
+                AutoTagSuppression.entry_id == target.id,
+                AutoTagSuppression.tag_id == suppression.tag_id,
+            )
+        )
+        if existing is None:
+            suppression.entry_id = target.id
+        else:
+            db.delete(suppression)
+        target_link = db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == target.id,
+                EntryTag.tag_id == suppression.tag_id,
+            )
+        )
+        if target_link is not None:
+            auto_source = db.scalar(
+                select(EntryTagSource).where(
+                    EntryTagSource.entry_tag_id == target_link.id,
+                    EntryTagSource.source == "auto",
+                )
+            )
+            if auto_source is not None:
+                db.delete(auto_source)
+                db.flush()
+                if db.scalar(
+                    select(EntryTagSource.id)
+                    .where(EntryTagSource.entry_tag_id == target_link.id)
+                    .limit(1)
+                ) is None:
+                    db.delete(target_link)
+
+    # A suppression that already belonged to the surviving entry also wins
+    # over any automatic source moved from the duplicate.
+    for suppression in list(
+        db.scalars(
+            select(AutoTagSuppression).where(
+                AutoTagSuppression.entry_id == target.id
+            )
+        )
+    ):
+        target_link = db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == target.id,
+                EntryTag.tag_id == suppression.tag_id,
+            )
+        )
+        if target_link is None:
+            continue
+        auto_source = db.scalar(
+            select(EntryTagSource).where(
+                EntryTagSource.entry_tag_id == target_link.id,
+                EntryTagSource.source == "auto",
+            )
+        )
+        if auto_source is None:
+            continue
+        db.delete(auto_source)
+        db.flush()
+        if db.scalar(
+            select(EntryTagSource.id)
+            .where(EntryTagSource.entry_tag_id == target_link.id)
+            .limit(1)
+        ) is None:
+            db.delete(target_link)
+
+    for support in list(
+        db.scalars(
+            select(TagProposalSupport).where(
+                TagProposalSupport.entry_id == source.id
+            )
+        )
+    ):
+        # Proposal evidence is tied to the exact title/summary hash that the
+        # model classified. A duplicate merge may choose a different version
+        # as the survivor; never relabel old evidence as if it matched that
+        # content. The surviving entry is queued below for fresh classification.
+        if support.source_hash != target.source_hash:
+            db.delete(support)
+            continue
+        existing = db.scalar(
+            select(TagProposalSupport).where(
+                TagProposalSupport.proposal_id == support.proposal_id,
+                TagProposalSupport.entry_id == target.id,
+            )
+        )
+        if existing is None:
+            support.entry_id = target.id
+            support.work_id = target.work_id
+        else:
+            existing.work_id = target.work_id
+            if existing.source_hash == target.source_hash:
+                existing.confidence = max(existing.confidence, support.confidence)
+            else:
+                # The source support is valid for the surviving content while
+                # the prior target support is stale, so replace its evidence.
+                existing.source_hash = support.source_hash
+                existing.confidence = support.confidence
+            db.delete(support)
+
+    db.execute(
+        delete(TagProposalSupport).where(
+            TagProposalSupport.entry_id == target.id,
+            TagProposalSupport.source_hash != target.source_hash,
+        )
+    )
+
+    source_record = db.scalar(
+        select(AutoTagRecord).where(AutoTagRecord.entry_id == source.id)
+    )
+    target_record = db.scalar(
+        select(AutoTagRecord).where(AutoTagRecord.entry_id == target.id)
+    )
+    if source_record is not None:
+        if target_record is None:
+            source_record.entry_id = target.id
+            target_record = source_record
+        else:
+            db.delete(source_record)
+    if target_record is not None:
+        target_record.source_hash = target.source_hash
+        target_record.status = "pending"
+        target_record.attempts = 0
+        target_record.last_error = None
+        target_record.next_retry_at = None
+        db.flush()
+        target_record.tag_ids = list(
+            db.scalars(
+                select(EntryTag.tag_id)
+                .join(
+                    EntryTagSource,
+                    EntryTagSource.entry_tag_id == EntryTag.id,
+                )
+                .where(
+                    EntryTag.entry_id == target.id,
+                    EntryTagSource.source == "auto",
+                )
+                .order_by(EntryTag.tag_id)
+            )
+        )
 
     for item in list(db.scalars(select(BriefItem).where(BriefItem.entry_id == source.id))):
         existing = db.scalar(
@@ -227,6 +407,12 @@ def _merge_work_into(db: Session, source: Work, target: Work) -> None:
         if equivalent:
             _merge_entry_into(db, entry, equivalent)
         else:
+            for support in db.scalars(
+                select(TagProposalSupport).where(
+                    TagProposalSupport.entry_id == entry.id
+                )
+            ):
+                support.work_id = target.id
             entry.work_id = target.id
             db.flush()
     db.delete(source)
@@ -336,7 +522,21 @@ def _source_may_update_entry(
     return first_link_id == existing_link.id
 
 
-def upsert_entry(db: Session, feed: Feed, parsed: ParsedEntry, translation_enabled: bool = True) -> tuple[Entry, str]:
+def upsert_entry(
+    db: Session,
+    feed: Feed,
+    parsed: ParsedEntry,
+    translation_enabled: bool = True,
+    *,
+    _cleanup_lock_held: bool = False,
+) -> tuple[Entry, str]:
+    # Match the cleanup -> entry lock order used by automatic tagging. This
+    # must happen before even looking up a Work/Entry: a lookup can lead to a
+    # duplicate merge and every create/update path flushes Entry state below.
+    # sync_feed acquires once for its whole transaction and opts out here so a
+    # large batch does not issue the same no-op lock UPDATE for every item.
+    if not _cleanup_lock_held:
+        acquire_cleanup_snapshot(db)
     work = _get_or_create_work(db, parsed)
     entry, cross_source_fallback = _find_entry_for_work(db, work, parsed)
     existing_link = None
@@ -481,8 +681,16 @@ def sync_feed(
             run.fetched_count = len(entries)
             translation_enabled = db.get(AppSetting, "translation_enabled")
             enabled = translation_enabled is None or translation_enabled.value.lower() == "true"
+            if entries:
+                acquire_cleanup_snapshot(db)
             for parsed in entries:
-                _entry, action = upsert_entry(db, feed, parsed, enabled)
+                _entry, action = upsert_entry(
+                    db,
+                    feed,
+                    parsed,
+                    enabled,
+                    _cleanup_lock_held=True,
+                )
                 if action == "created":
                     run.created_count += 1
                 elif action == "updated":

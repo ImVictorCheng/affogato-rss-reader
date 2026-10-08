@@ -69,7 +69,7 @@ describe("reader edge cases", () => {
     expect(screen.getByRole("button", { name: "Mark as unread" })).not.toHaveClass("is-active");
     expect(screen.getByRole("button", { name: "Remove from read later" })).toHaveClass("is-active");
   });
-  it("typesets original and translated summaries in bilingual mode", async () => {
+  it("typesets original and translated titles and summaries in bilingual mode", async () => {
     const typesetPromise = vi.fn().mockResolvedValue(undefined);
     window.MathJax = {
       startup: { promise: Promise.resolve() },
@@ -77,7 +77,7 @@ describe("reader edge cases", () => {
       typesetPromise,
     };
     const entry: Entry = {
-      id: 5, title: "Formula article", translated_title: "公式文章",
+      id: 5, title: "Formula $E=mc^2$ article", translated_title: "公式 \\(E=mc^2\\) 文章",
       summary: "Energy is $E=mc^2$.", translated_summary: "能量满足 \\(E=mc^2\\)。",
       url: "https://example.test/formula", authors: ["Researcher"],
       published_at: "2026-07-27T00:00:00Z", feed_titles: ["Example"], state: { read: false, starred: false, later: false, archived: false },
@@ -88,7 +88,9 @@ describe("reader edge cases", () => {
 
     expect(screen.getByText("Energy is $E=mc^2$.")).toBeInTheDocument();
     expect(screen.getByText("能量满足 \\(E=mc^2\\)。")).toBeInTheDocument();
-    await waitFor(() => expect(typesetPromise).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(entry.title).closest(".mathjax-scope")?.tagName).toBe("SPAN");
+    expect(screen.getByText(entry.translated_title!).closest(".mathjax-scope")?.tagName).toBe("SPAN");
+    await waitFor(() => expect(typesetPromise).toHaveBeenCalledTimes(4));
   });
   it("opens tag suggestions only from the chevron and uses a custom option grid", async () => {
     const user = userEvent.setup();

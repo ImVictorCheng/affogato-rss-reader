@@ -10,7 +10,7 @@ ARG VITE_API_BASE_URL=/api/v1
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN npm run build
 
-FROM python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS wheel-builder
+FROM python:3.14.8-alpine3.24@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72 AS wheel-builder
 WORKDIR /src
 RUN python -m pip install --no-cache-dir build==1.3.0
 COPY README.md LICENSE ./
@@ -19,22 +19,14 @@ RUN rm -rf ./backend/static && mkdir -p ./backend/static
 COPY --from=web-builder /src/web/dist/ ./backend/static/
 RUN python -m build --wheel --outdir /wheels ./backend
 
-FROM python:3.14.6-alpine3.24@sha256:26730869004e2b9c4b9ad09cab8625e81d256d1ce97e72df5520e806b1709f92 AS runtime
-ARG VERSION=0.4.4
-ARG VCS_REF=unknown
-ARG SOURCE_URL=https://github.com/OWNER/affogato-rss-reader
-LABEL org.opencontainers.image.title="Affogato RSS Reader" \
-      org.opencontainers.image.description="Private self-hosted RSS and Atom reader" \
-      org.opencontainers.image.version="${VERSION}" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.licenses="MIT AND Apache-2.0" \
-      org.opencontainers.image.source="${SOURCE_URL}"
+FROM python:3.14.8-alpine3.24@sha256:f6a589d43c42b9e7f7dc67a12d37132491f362859a5d750607710cc56da3bc72 AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     AFFOGATO_RSS_READER_DATA_DIR=/app/data \
     AFFOGATO_RSS_READER_STATIC_DIR=/usr/local/lib/python3.14/site-packages/backend/static
-RUN addgroup -S -g 10001 reader \
+RUN apk add --upgrade --no-cache zlib=1.3.2-r1 \
+    && addgroup -S -g 10001 reader \
     && adduser -S -D -H -u 10001 -G reader -s /sbin/nologin reader \
     && mkdir -p /app/data /app/secrets /app/logs \
     && chown reader:reader /app/data /app/secrets /app/logs
@@ -44,6 +36,15 @@ COPY --from=wheel-builder /wheels/*.whl /tmp/
 RUN python -m pip install --no-cache-dir --no-deps /tmp/*.whl \
     && rm -rf /tmp/*.whl /tmp/requirements.lock
 COPY LICENSE THIRD_PARTY_NOTICES.md licenses/MathJax-APACHE-2.0.txt /usr/share/licenses/affogato-rss-reader/
+ARG VERSION=0.5.0
+ARG VCS_REF=unknown
+ARG SOURCE_URL=https://github.com/OWNER/affogato-rss-reader
+LABEL org.opencontainers.image.title="Affogato RSS Reader" \
+      org.opencontainers.image.description="Private self-hosted RSS and Atom reader" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="MIT AND Apache-2.0" \
+      org.opencontainers.image.source="${SOURCE_URL}"
 USER reader
 WORKDIR /app
 EXPOSE 8787

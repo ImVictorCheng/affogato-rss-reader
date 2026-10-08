@@ -39,6 +39,12 @@ full CI as a quality gate before building and publishing images.
    validation, and the source SBOM. It requires Docker Desktop with Linux
    container mode and network access.
 
+   On slow networks, `-GrypeDatabaseArchive <path>` can seed the scanner cache
+   from a separately downloaded official Grype database archive. The preflight
+   verifies its SHA256 against Anchore's current database metadata before import.
+   This option still refreshes the database online and retains hash, age, and
+   vulnerability checks; it is not a skip flag.
+
 3. **Squash onto `main` with a non-personal identity.** Never use a personal
    name or email for `main` commits. Use the current LLM model name as
    `user.name` and `ImVictorCheng@users.noreply.github.com` as `user.email`
@@ -113,6 +119,137 @@ instance **always** on port `8788` with its own data:
   ```
 
 - First login uses `docker compose -p affogato-rss-reader-dev exec reader affogato-rss-reader initial-password`.
+
+## Docker Desktop network-timeout fallback (Windows)
+
+Use this fallback only when a Docker operation that must reach the internet
+(`pull`, `build`, a scanner database/image download, or the release preflight)
+repeatedly fails with connection or handshake timeouts while the host proxy is
+working. Docker Desktop does not expose this setting through its CLI, so the
+user-level settings store must be changed while Docker Desktop is stopped.
+
+The normal project state is **Containers proxy: No proxy**, represented by an
+empty `ContainersProxyHTTPMode`. Never overwrite a custom non-empty value. If
+the backup below already exists, treat it as an interrupted earlier task and
+restore it before doing any more Docker work.
+
+Temporarily switch to **Same as host proxy** with PowerShell:
+
+```powershell
+$dockerSettingsDir = Join-Path $env:APPDATA "Docker"
+$dockerSettingsPath = Join-Path $dockerSettingsDir "settings-store.json"
+$dockerProxyBackupPath = Join-Path $dockerSettingsDir "settings-store.json.affogato-temporary-proxy.bak"
+
+if (-not (Test-Path -LiteralPath $dockerSettingsPath -PathType Leaf)) {
+    throw "Docker Desktop settings-store.json was not found."
+}
+if (Test-Path -LiteralPath $dockerProxyBackupPath) {
+    throw "A temporary proxy backup already exists; restore it before continuing."
+}
+
+docker desktop stop
+$dockerProcesses = @(
+    Get-Process -Name "Docker Desktop", "com.docker.backend" -ErrorAction SilentlyContinue
+)
+if ($dockerProcesses.Count -ne 0) {
+    throw "Docker Desktop is still running; do not edit its settings store."
+}
+
+$dockerSettings = Get-Content -LiteralPath $dockerSettingsPath -Raw | ConvertFrom-Json
+if ($dockerSettings.ContainersProxyHTTPMode -ne "") {
+    throw "Refusing to overwrite a Containers proxy setting other than No proxy."
+}
+
+Copy-Item -LiteralPath $dockerSettingsPath -Destination $dockerProxyBackupPath
+$dockerSettingsText = [IO.File]::ReadAllText($dockerSettingsPath)
+$dockerNoProxyEntry = '"ContainersProxyHTTPMode": ""'
+$dockerHostProxyEntry = '"ContainersProxyHTTPMode": "same-as-host-proxy"'
+if ([regex]::Matches($dockerSettingsText, [regex]::Escape($dockerNoProxyEntry)).Count -ne 1) {
+    throw "Expected exactly one No proxy setting; the backup was kept and no edit was made."
+}
+[IO.File]::WriteAllText(
+    $dockerSettingsPath,
+    $dockerSettingsText.Replace($dockerNoProxyEntry, $dockerHostProxyEntry),
+    [Text.UTF8Encoding]::new($false)
+)
+
+$dockerSettings = Get-Content -LiteralPath $dockerSettingsPath -Raw | ConvertFrom-Json
+if ($dockerSettings.ContainersProxyHTTPMode -ne "same-as-host-proxy") {
+    throw "The temporary Containers proxy setting was not applied."
+}
+docker desktop start
+if ($LASTEXITCODE -ne 0) { throw "Docker Desktop did not start cleanly." }
+docker desktop status
+if ($LASTEXITCODE -ne 0) { throw "Docker Desktop did not reach running state." }
+$dockerSettings = Get-Content -LiteralPath $dockerSettingsPath -Raw | ConvertFrom-Json
+if ($dockerSettings.ContainersProxyHTTPMode -ne "same-as-host-proxy") {
+    throw "Docker Desktop did not retain the temporary Same as host proxy setting."
+}
+```
+
+Retry only the failed Docker operation. **Before the task ends, regardless of
+success, failure, or cancellation, restore No proxy** with the following
+cleanup. Do not send the final response while the temporary value or backup
+still exists.
+
+```powershell
+$dockerSettingsDir = Join-Path $env:APPDATA "Docker"
+$dockerSettingsPath = Join-Path $dockerSettingsDir "settings-store.json"
+$dockerProxyBackupPath = Join-Path $dockerSettingsDir "settings-store.json.affogato-temporary-proxy.bak"
+
+if (-not (Test-Path -LiteralPath $dockerProxyBackupPath -PathType Leaf)) {
+    throw "The temporary proxy backup is missing; do not guess the original setting."
+}
+
+docker desktop stop
+$dockerProcesses = @(
+    Get-Process -Name "Docker Desktop", "com.docker.backend" -ErrorAction SilentlyContinue
+)
+if ($dockerProcesses.Count -ne 0) {
+    throw "Docker Desktop is still running; do not restore its settings store yet."
+}
+
+$dockerProxyBackup = Get-Content -LiteralPath $dockerProxyBackupPath -Raw | ConvertFrom-Json
+if ($dockerProxyBackup.ContainersProxyHTTPMode -ne "") {
+    throw "The backup does not contain the expected original No proxy setting."
+}
+$dockerSettings = Get-Content -LiteralPath $dockerSettingsPath -Raw | ConvertFrom-Json
+if ($dockerSettings.ContainersProxyHTTPMode -notin @("", "same-as-host-proxy")) {
+    throw "Refusing to overwrite a Containers proxy value changed by the user."
+}
+Copy-Item -LiteralPath $dockerProxyBackupPath -Destination $dockerSettingsPath -Force
+
+$dockerSettings = Get-Content -LiteralPath $dockerSettingsPath -Raw | ConvertFrom-Json
+if ($dockerSettings.ContainersProxyHTTPMode -ne "") {
+    throw "The original No proxy setting was not restored."
+}
+$dockerSettingsHash = (Get-FileHash -LiteralPath $dockerSettingsPath -Algorithm SHA256).Hash
+$dockerProxyBackupHash = (Get-FileHash -LiteralPath $dockerProxyBackupPath -Algorithm SHA256).Hash
+if ($dockerSettingsHash -ne $dockerProxyBackupHash) {
+    throw "The restored settings do not exactly match the backup."
+}
+
+docker desktop start
+if ($LASTEXITCODE -ne 0) { throw "Docker Desktop did not start cleanly." }
+docker desktop status
+if ($LASTEXITCODE -ne 0) {
+    throw "Docker Desktop did not reach running state; keep the backup for recovery."
+}
+$dockerSettings = Get-Content -LiteralPath $dockerSettingsPath -Raw | ConvertFrom-Json
+if ($dockerSettings.ContainersProxyHTTPMode -ne "") {
+    throw "Docker Desktop did not retain the restored No proxy setting."
+}
+
+$resolvedDockerSettingsDir = (Resolve-Path -LiteralPath $dockerSettingsDir).Path
+$resolvedDockerProxyBackupPath = (Resolve-Path -LiteralPath $dockerProxyBackupPath).Path
+if (
+    [IO.Path]::GetDirectoryName($resolvedDockerProxyBackupPath) -ne $resolvedDockerSettingsDir -or
+    [IO.Path]::GetFileName($resolvedDockerProxyBackupPath) -ne "settings-store.json.affogato-temporary-proxy.bak"
+) {
+    throw "Refusing to remove an unexpected backup path."
+}
+Remove-Item -LiteralPath $resolvedDockerProxyBackupPath -Force
+```
 
 ## Notes
 

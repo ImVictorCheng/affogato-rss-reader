@@ -6,7 +6,9 @@ import re
 from datetime import datetime
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+
+from .topic_names import validate_normalized_topic_name
 
 
 class APIModel(BaseModel):
@@ -257,6 +259,56 @@ class BulkState(BaseModel):
 class TagCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    description: str | None = Field(default=None, max_length=1000)
+    aliases: list[str] | None = Field(default=None, max_length=50)
+    auto_assignable: bool | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_normalized_name(cls, name: str) -> str:
+        validate_normalized_topic_name(name, field_name="Tag name")
+        return name
+
+    @field_validator("aliases")
+    @classmethod
+    def validate_alias_lengths(cls, aliases: list[str] | None) -> list[str] | None:
+        if aliases is not None and any(len(alias) > 120 for alias in aliases):
+            raise ValueError("Tag aliases must be at most 120 characters")
+        for alias in aliases or []:
+            validate_normalized_topic_name(
+                alias,
+                field_name="Tag alias",
+                allow_empty=True,
+            )
+        return aliases
+
+
+class TagUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    color: str | None = Field(default=None, pattern=r"^#[0-9a-fA-F]{6}$")
+    description: str | None = Field(default=None, max_length=1000)
+    aliases: list[str] | None = Field(default=None, max_length=50)
+    auto_assignable: bool | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_normalized_name(cls, name: str | None) -> str | None:
+        if name is not None:
+            validate_normalized_topic_name(name, field_name="Tag name")
+        return name
+
+    @field_validator("aliases")
+    @classmethod
+    def validate_alias_lengths(cls, aliases: list[str] | None) -> list[str] | None:
+        if aliases is not None and any(len(alias) > 120 for alias in aliases):
+            raise ValueError("Tag aliases must be at most 120 characters")
+        for alias in aliases or []:
+            validate_normalized_topic_name(
+                alias,
+                field_name="Tag alias",
+                allow_empty=True,
+            )
+        return aliases
 
 
 class TranslationToggle(BaseModel):
@@ -464,6 +516,10 @@ class TagOut(APIModel):
     id: int
     name: str
     color: str | None
+    description: str = ""
+    aliases: list[str] = Field(default_factory=list)
+    origin: str = "manual"
+    auto_assignable: bool = True
 
 
 class TagWithCountOut(TagOut):
@@ -792,22 +848,133 @@ class BriefScheduleListOut(APIModel):
 
 class AutoTagToggle(BaseModel):
     enabled: bool
-    create_new: bool = False
+    # ``create_new`` remains accepted for clients from before growth modes.
+    # When ``growth_mode`` is present it is authoritative.
+    create_new: bool | None = None
+    growth_mode: Literal["closed", "threshold"] | None = None
+    max_tags_per_entry: int | None = Field(default=None, ge=1, le=3)
+    promotion_threshold: int | None = Field(default=None, ge=2, le=100)
+    support_window_days: int | None = Field(default=None, ge=30, le=3650)
+    canonical_language: Literal["en"] | None = None
     llm_connection_id: int | None = None
 
 
 class AutoTagStatusOut(APIModel):
     enabled: bool
     create_new: bool
+    growth_mode: Literal["closed", "threshold"] = "closed"
     llm_connection_id: int | None
     llm_connection_name: str | None
     model: str | None
     configured: bool
-    max_tags_per_entry: int
+    max_tags_per_entry: int = Field(default=3, ge=1, le=3)
+    promotion_threshold: int = Field(default=10, ge=2, le=100)
+    support_window_days: int = Field(default=365, ge=30, le=3650)
+    canonical_language: Literal["en"] = "en"
+    min_confidence: float = Field(default=0.8, ge=0, le=1)
+    preview_required: bool = True
+    proposal_count: int = Field(default=0, ge=0)
+    promoted_count: int = Field(default=0, ge=0)
+    estimated_calls: int = Field(default=0, ge=0)
+    outdated_count: int = Field(default=0, ge=0)
+    needs_rebuild: bool = False
     pending_count: int
     running_count: int
     complete_count: int
     failed_count: int
+
+
+class AutoTagPreviewCreate(BaseModel):
+    sample_size: Literal[50] = 50
+
+
+class AutoTagPreviewTopicOut(APIModel):
+    kind: Literal["tag", "proposal", "new"]
+    id: int | None = None
+    name: str
+    confidence: float = Field(ge=0, le=1)
+
+
+class AutoTagPreviewResultOut(APIModel):
+    entry_id: int
+    title: str
+    topics: list[AutoTagPreviewTopicOut]
+
+
+class AutoTagPreviewOut(APIModel):
+    id: int
+    status: str
+    sample_size: int
+    entry_ids: list[int]
+    results: list[AutoTagPreviewResultOut]
+    metrics: dict[str, Any]
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AutoTagPreviewListOut(APIModel):
+    items: list[AutoTagPreviewOut]
+
+
+class AutoTagPreviewApproval(BaseModel):
+    scope: Literal["all"] = "all"
+
+
+class AutoTagCleanupItemOut(APIModel):
+    tag_id: int
+    name: str
+    total_count: int = Field(ge=0)
+    inferred_auto_count: int = Field(ge=0)
+    legacy_count: int = Field(ge=0)
+    manual_count: int = Field(ge=0)
+    auto_count: int = Field(ge=0)
+    feed_count: int = Field(ge=0)
+    schedule_count: int = Field(ge=0)
+    deletable: bool
+
+
+class AutoTagCleanupPreviewOut(APIModel):
+    items: list[AutoTagCleanupItemOut]
+    inferred_auto_association_count: int = Field(ge=0)
+    review_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    reviewed: bool = False
+
+
+class AutoTagCleanupApply(BaseModel):
+    review_token: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    remove_tag_ids: list[int] = Field(default_factory=list, max_length=10_000)
+    keep_tag_ids: list[int] = Field(default_factory=list, max_length=10_000)
+
+    @model_validator(mode="after")
+    def validate_disjoint_tag_ids(self) -> Self:
+        overlap = set(self.remove_tag_ids) & set(self.keep_tag_ids)
+        if overlap:
+            raise ValueError("remove_tag_ids and keep_tag_ids must be disjoint")
+        return self
+
+
+class AutoTagCleanupResultOut(APIModel):
+    removed_tag_ids: list[int]
+    kept_tag_ids: list[int]
+    removed_count: int = Field(ge=0)
+
+
+class AutoTagProposalOut(APIModel):
+    id: int
+    name: str
+    description: str = ""
+    status: str
+    support_count: int = Field(ge=0)
+    promoted_tag_id: int | None
+    aliases: list[str]
+    created_at: datetime
+    updated_at: datetime
+
+
+class AutoTagProposalListOut(APIModel):
+    items: list[AutoTagProposalOut]
+    total: int = Field(ge=0)
 
 
 class AppSettingsOut(APIModel):

@@ -15,7 +15,24 @@ from sqlalchemy.orm import Session
 
 from .config import Settings, get_settings
 from .bootstrap import remove_initial_owner_password
-from .auto_tag import auto_tag_status, configure_auto_tag
+from .auto_tag import (
+    acquire_cleanup_snapshot,
+    acquire_topic_namespace,
+    add_manual_tag,
+    apply_cleanup,
+    approve_preview,
+    auto_tag_status,
+    cleanup_preview as build_auto_tag_cleanup_preview,
+    configure_auto_tag,
+    create_preview,
+    get_preview,
+    list_previews,
+    list_proposals,
+    merge_tags,
+    normalize_topic_name,
+    remove_manual_tag,
+    retire_tag_proposals,
+)
 from .call_logging import read_call_logs
 from .db import get_db
 from .briefs import (
@@ -39,6 +56,7 @@ from .briefs import (
 )
 from .models import (
     AppSetting,
+    AutoTagRecord,
     Brief,
     BriefGenerationCheckpoint,
     BriefSchedule,
@@ -49,6 +67,7 @@ from .models import (
     EntryTag,
     Feed,
     FeedDomain,
+    FeedTag,
     Folder,
     Job,
     Owner,
@@ -56,10 +75,14 @@ from .models import (
     Session as LoginSession,
     SyncRun,
     Tag,
+    TagAlias,
+    TagProposal,
+    TagProposalAlias,
     Translation,
     utcnow,
 )
 from .opml import export_opml_document, import_opml_document
+from .jobs import AUTO_TAG_PREVIEW_KIND, enqueue_job
 from .schemas import (
     AIThemeRequest,
     AIThemeResponse,
@@ -121,7 +144,16 @@ from .schemas import (
     TagCreate,
     TagListOut,
     TagOut,
+    TagUpdate,
     TagWithCountOut,
+    AutoTagCleanupApply,
+    AutoTagCleanupPreviewOut,
+    AutoTagCleanupResultOut,
+    AutoTagPreviewApproval,
+    AutoTagPreviewCreate,
+    AutoTagPreviewListOut,
+    AutoTagPreviewOut,
+    AutoTagProposalListOut,
     AutoTagStatusOut,
     AutoTagToggle,
     TranslationRetry,
@@ -823,9 +855,8 @@ def add_entry_tag(
         raise not_found("Entry")
     if db.get(Tag, tag_id) is None:
         raise not_found("Tag")
-    if db.scalar(select(EntryTag).where(EntryTag.entry_id == entry_id, EntryTag.tag_id == tag_id)) is None:
-        db.add(EntryTag(entry_id=entry_id, tag_id=tag_id))
-        db.commit()
+    add_manual_tag(db, entry_id, tag_id)
+    db.commit()
 
 
 @router.delete("/entries/{entry_id}/tags/{tag_id}", status_code=204)
@@ -835,7 +866,11 @@ def remove_entry_tag(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> None:
-    db.execute(delete(EntryTag).where(EntryTag.entry_id == entry_id, EntryTag.tag_id == tag_id))
+    if db.get(Entry, entry_id) is None:
+        raise not_found("Entry")
+    if db.get(Tag, tag_id) is None:
+        raise not_found("Tag")
+    remove_manual_tag(db, entry_id, tag_id)
     db.commit()
 
 
@@ -1218,6 +1253,10 @@ def delete_feed(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> None:
+    # FeedTag rows are removed by the database's ON DELETE CASCADE and are part
+    # of the cleanup-review fingerprint, so the parent delete shares the same
+    # transaction lock as direct provenance writes.
+    acquire_cleanup_snapshot(db)
     feed = db.get(Feed, feed_id)
     if feed is None:
         raise not_found("Feed")
@@ -1371,10 +1410,68 @@ def list_tags(
     ).all()
     return {
         "items": [
-            {"id": tag.id, "name": tag.name, "color": tag.color, "entry_count": int(count)}
+            {
+                "id": tag.id,
+                "name": tag.name,
+                "color": tag.color,
+                "description": tag.description or "",
+                "aliases": list(
+                    db.scalars(
+                        select(TagAlias.alias)
+                        .where(TagAlias.tag_id == tag.id)
+                        .order_by(TagAlias.alias)
+                    )
+                ),
+                "origin": tag.origin,
+                "auto_assignable": tag.auto_assignable,
+                "entry_count": int(count),
+            }
             for tag, count in rows
         ]
     }
+
+
+def _topic_name_is_owned(
+    db: Session,
+    normalized_name: str,
+    *,
+    exclude_tag_id: int | None = None,
+) -> bool:
+    tag_query = select(Tag.id).where(Tag.normalized_name == normalized_name)
+    alias_query = select(TagAlias.id).where(
+        TagAlias.normalized_alias == normalized_name
+    )
+    if exclude_tag_id is not None:
+        tag_query = tag_query.where(Tag.id != exclude_tag_id)
+        alias_query = alias_query.where(TagAlias.tag_id != exclude_tag_id)
+    return any(
+        (
+            db.scalar(tag_query.limit(1)) is not None,
+            db.scalar(alias_query.limit(1)) is not None,
+            db.scalar(
+                select(TagProposal.id)
+                .where(
+                    TagProposal.normalized_name == normalized_name,
+                    TagProposal.status == "active",
+                )
+                .limit(1)
+            )
+            is not None,
+            db.scalar(
+                select(TagProposalAlias.id)
+                .join(
+                    TagProposal,
+                    TagProposal.id == TagProposalAlias.proposal_id,
+                )
+                .where(
+                    TagProposalAlias.normalized_alias == normalized_name,
+                    TagProposal.status == "active",
+                )
+                .limit(1)
+            )
+            is not None,
+        )
+    )
 
 
 @router.post("/tags", status_code=201, response_model=TagWithCountOut)
@@ -1383,39 +1480,159 @@ def create_tag(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
+    acquire_topic_namespace(db)
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=422, detail="Tag name cannot be blank")
-    if db.scalar(select(Tag.id).where(func.lower(Tag.name) == name.lower())) is not None:
+    normalized_name = normalize_topic_name(name)
+    if not normalized_name:
+        raise HTTPException(status_code=422, detail="Tag name cannot be blank")
+    if _topic_name_is_owned(db, normalized_name):
         raise HTTPException(status_code=409, detail="Tag already exists")
-    tag = Tag(name=name, color=body.color)
+    tag = Tag(
+        name=name,
+        normalized_name=normalized_name,
+        description=(body.description or "").strip(),
+        color=body.color,
+        origin="manual",
+        auto_assignable=True if body.auto_assignable is None else body.auto_assignable,
+    )
     db.add(tag)
-    db.commit()
+    db.flush()
+    seen_aliases: set[str] = {normalized_name}
+    for alias_name in body.aliases or []:
+        alias_name = alias_name.strip()
+        normalized_alias = normalize_topic_name(alias_name)
+        if not alias_name or normalized_alias in seen_aliases:
+            continue
+        if not normalized_alias:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=f"Invalid tag alias: {alias_name}")
+        if _topic_name_is_owned(db, normalized_alias):
+            db.rollback()
+            raise HTTPException(status_code=409, detail=f"Tag alias already exists: {alias_name}")
+        db.add(TagAlias(tag_id=tag.id, alias=alias_name, normalized_alias=normalized_alias))
+        seen_aliases.add(normalized_alias)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Tag or alias already exists") from exc
     db.refresh(tag)
-    return {"id": tag.id, "name": tag.name, "color": tag.color, "entry_count": 0}
+    return {
+        "id": tag.id,
+        "name": tag.name,
+        "color": tag.color,
+        "description": tag.description,
+        "aliases": list(
+            db.scalars(
+                select(TagAlias.alias)
+                .where(TagAlias.tag_id == tag.id)
+                .order_by(TagAlias.alias)
+            )
+        ),
+        "origin": tag.origin,
+        "auto_assignable": tag.auto_assignable,
+        "entry_count": 0,
+    }
 
 
 @router.patch("/tags/{tag_id}", response_model=TagOut)
 def update_tag(
     tag_id: int,
-    body: TagCreate,
+    body: TagUpdate,
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
+    acquire_topic_namespace(db)
     tag = db.get(Tag, tag_id)
     if tag is None:
         raise not_found("Tag")
-    name = body.name.strip()
-    if not name:
-        raise HTTPException(status_code=422, detail="Tag name cannot be blank")
-    tag.name = name
-    tag.color = body.color
+    old_name = tag.name
+    old_normalized = tag.normalized_name
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=422, detail="Tag name cannot be blank")
+        normalized_name = normalize_topic_name(name)
+        if not normalized_name:
+            raise HTTPException(status_code=422, detail="Tag name cannot be blank")
+        if _topic_name_is_owned(db, normalized_name, exclude_tag_id=tag.id):
+            raise HTTPException(status_code=409, detail="Tag already exists")
+        tag.name = name
+        tag.normalized_name = normalized_name
+    else:
+        name = tag.name
+        normalized_name = tag.normalized_name
+    if "color" in body.model_fields_set:
+        tag.color = body.color
+    if "description" in body.model_fields_set:
+        tag.description = (body.description or "").strip()
+    if body.auto_assignable is not None:
+        tag.auto_assignable = body.auto_assignable
+    desired_aliases: list[str] | None = None
+    if "aliases" in body.model_fields_set:
+        db.execute(delete(TagAlias).where(TagAlias.tag_id == tag.id))
+        db.flush()
+        desired_aliases = list(body.aliases or [])
+    elif old_normalized != normalized_name:
+        db.execute(
+            delete(TagAlias).where(
+                TagAlias.tag_id == tag.id,
+                TagAlias.normalized_alias == normalized_name,
+            )
+        )
+        db.flush()
+        desired_aliases = list(
+            db.scalars(select(TagAlias.alias).where(TagAlias.tag_id == tag.id))
+        )
+    if desired_aliases is not None and old_normalized and old_normalized != normalized_name:
+        desired_aliases.append(old_name)
+    seen_aliases = {normalized_name} if normalized_name else set()
+    for alias_name in desired_aliases or []:
+        alias_name = alias_name.strip()
+        normalized_alias = normalize_topic_name(alias_name)
+        if not alias_name or normalized_alias in seen_aliases:
+            continue
+        if not normalized_alias:
+            db.rollback()
+            raise HTTPException(status_code=422, detail=f"Invalid tag alias: {alias_name}")
+        if _topic_name_is_owned(
+            db,
+            normalized_alias,
+            exclude_tag_id=tag.id,
+        ):
+            db.rollback()
+            raise HTTPException(status_code=409, detail=f"Tag alias already exists: {alias_name}")
+        owner = db.scalar(
+            select(TagAlias).where(TagAlias.normalized_alias == normalized_alias)
+        )
+        if owner is not None and owner.tag_id != tag.id:
+            db.rollback()
+            raise HTTPException(status_code=409, detail=f"Tag alias already exists: {alias_name}")
+        if owner is None:
+            db.add(TagAlias(tag_id=tag.id, alias=alias_name, normalized_alias=normalized_alias))
+        seen_aliases.add(normalized_alias)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail="Tag already exists") from exc
-    return {"id": tag.id, "name": tag.name, "color": tag.color}
+    return {
+        "id": tag.id,
+        "name": tag.name,
+        "color": tag.color,
+        "description": tag.description,
+        "aliases": list(
+            db.scalars(
+                select(TagAlias.alias)
+                .where(TagAlias.tag_id == tag.id)
+                .order_by(TagAlias.alias)
+            )
+        ),
+        "origin": tag.origin,
+        "auto_assignable": tag.auto_assignable,
+    }
 
 
 @router.delete("/tags/{tag_id}", status_code=204)
@@ -1424,11 +1641,82 @@ def delete_tag(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> None:
+    acquire_topic_namespace(db)
     tag = db.get(Tag, tag_id)
     if tag is None:
         raise not_found("Tag")
+    if any(
+        tag_id in (schedule.tag_ids or [])
+        for schedule in db.scalars(
+            select(BriefSchedule).where(BriefSchedule.enabled.is_(True))
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Tag is used by an active brief schedule; remove or merge it first",
+        )
+    if db.scalar(select(EntryTag.id).where(EntryTag.tag_id == tag_id).limit(1)) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Tag still has article associations; remove or merge them first",
+        )
+    if db.scalar(select(FeedTag.id).where(FeedTag.tag_id == tag_id).limit(1)) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Tag is still assigned to a feed; remove or merge it first",
+        )
+    for record in db.scalars(select(AutoTagRecord)):
+        if tag_id in (record.tag_ids or []):
+            record.tag_ids = [value for value in record.tag_ids if value != tag_id]
+    retire_tag_proposals(db, tag_id)
     db.delete(tag)
     db.commit()
+
+
+@router.post(
+    "/tags/{source_tag_id}/merge/{target_tag_id}",
+    response_model=TagWithCountOut,
+)
+def merge_tag_into_target(
+    source_tag_id: int,
+    target_tag_id: int,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    if source_tag_id == target_tag_id:
+        raise HTTPException(status_code=409, detail="A tag cannot be merged into itself")
+    if db.get(Tag, source_tag_id) is None:
+        raise not_found("Source tag")
+    if db.get(Tag, target_tag_id) is None:
+        raise not_found("Target tag")
+    try:
+        merge_tags(db, source_tag_id, target_tag_id)
+        db.commit()
+    except (IntegrityError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    target = db.get(Tag, target_tag_id)
+    if target is None:
+        raise not_found("Target tag")
+    entry_count = db.scalar(
+        select(func.count(EntryTag.id)).where(EntryTag.tag_id == target_tag_id)
+    )
+    return {
+        "id": target.id,
+        "name": target.name,
+        "color": target.color,
+        "description": target.description or "",
+        "aliases": list(
+            db.scalars(
+                select(TagAlias.alias)
+                .where(TagAlias.tag_id == target.id)
+                .order_by(TagAlias.alias)
+            )
+        ),
+        "origin": target.origin,
+        "auto_assignable": target.auto_assignable,
+        "entry_count": int(entry_count or 0),
+    }
 
 
 @router.get("/translations/status", response_model=TranslationStatusOut)
@@ -1476,20 +1764,32 @@ def toggle_translation(
     return get_translation_status(_owner=db.get(Owner, 1), db=db)  # type: ignore[arg-type]
 
 
+def _auto_tag_status_response(db: Session) -> dict:
+    data = dict(auto_tag_status(db))
+    counts = dict(data.pop("counts", {}) or {})
+    growth_mode = data.get("growth_mode")
+    if growth_mode not in {"closed", "threshold"}:
+        growth_mode = "threshold" if data.get("create_new") else "closed"
+    data["growth_mode"] = growth_mode
+    data["create_new"] = growth_mode == "threshold"
+    data["max_tags_per_entry"] = max(
+        1, min(int(data.get("max_tags_per_entry", 3)), 3)
+    )
+    return {
+        **data,
+        "pending_count": int(data.get("pending_count", counts.get("pending", 0))),
+        "running_count": int(data.get("running_count", counts.get("running", 0))),
+        "complete_count": int(data.get("complete_count", counts.get("complete", 0))),
+        "failed_count": int(data.get("failed_count", counts.get("failed", 0))),
+    }
+
+
 @router.get("/auto-tag/status", response_model=AutoTagStatusOut)
 def get_auto_tag_status(
     _owner: Owner = Depends(current_owner),
     db: Session = Depends(get_db),
 ) -> dict:
-    data = auto_tag_status(db)
-    counts = data.pop("counts")
-    return {
-        **data,
-        "pending_count": counts["pending"],
-        "running_count": counts["running"],
-        "complete_count": counts["complete"],
-        "failed_count": counts["failed"],
-    }
+    return _auto_tag_status_response(db)
 
 
 @router.patch("/auto-tag/status", response_model=AutoTagStatusOut)
@@ -1498,25 +1798,148 @@ def set_auto_tag_status(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
+    growth_mode = body.growth_mode
+    if growth_mode is None and body.create_new is not None:
+        growth_mode = "threshold" if body.create_new else "closed"
+    create_new = growth_mode == "threshold" if growth_mode is not None else None
     try:
         configure_auto_tag(
             db,
             enabled=body.enabled,
-            create_new=body.create_new,
+            create_new=create_new,
+            growth_mode=growth_mode,
+            max_tags_per_entry=body.max_tags_per_entry,
+            promotion_threshold=body.promotion_threshold,
+            support_window_days=body.support_window_days,
+            canonical_language=body.canonical_language,
             llm_connection_id=body.llm_connection_id,
         )
     except ValueError as exc:
         db.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    data = auto_tag_status(db)
-    counts = data.pop("counts")
+    return _auto_tag_status_response(db)
+
+
+@router.post(
+    "/auto-tag/previews",
+    status_code=202,
+    response_model=AutoTagPreviewOut,
+)
+def start_auto_tag_preview(
+    body: AutoTagPreviewCreate | None = None,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> object:
+    try:
+        preview = create_preview(db, sample_size=body.sample_size if body else 50)
+        preview_id = (
+            int(preview["id"])
+            if isinstance(preview, dict)
+            else int(getattr(preview, "id"))
+        )
+        enqueue_job(
+            db,
+            AUTO_TAG_PREVIEW_KIND,
+            {"preview_id": preview_id},
+            reason="api",
+        )
+        return preview
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/auto-tag/previews", response_model=AutoTagPreviewListOut)
+def list_auto_tag_previews(
+    _owner: Owner = Depends(current_owner),
+    db: Session = Depends(get_db),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> dict:
+    return list_previews(db, limit=limit)
+
+
+@router.get(
+    "/auto-tag/previews/{preview_id}",
+    response_model=AutoTagPreviewOut,
+)
+def read_auto_tag_preview(
+    preview_id: int,
+    _owner: Owner = Depends(current_owner),
+    db: Session = Depends(get_db),
+) -> object:
+    preview = get_preview(db, preview_id)
+    if preview is None:
+        raise not_found("Auto-tag preview")
+    return preview
+
+
+@router.post(
+    "/auto-tag/previews/{preview_id}/approve",
+    response_model=AutoTagStatusOut,
+)
+def approve_auto_tag_preview(
+    preview_id: int,
+    body: AutoTagPreviewApproval,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    if get_preview(db, preview_id) is None:
+        raise not_found("Auto-tag preview")
+    try:
+        approve_preview(db, preview_id, scope=body.scope)
+        db.commit()
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _auto_tag_status_response(db)
+
+
+@router.get(
+    "/auto-tag/cleanup-preview",
+    response_model=AutoTagCleanupPreviewOut,
+)
+def get_auto_tag_cleanup_preview(
+    _owner: Owner = Depends(current_owner),
+    db: Session = Depends(get_db),
+) -> dict:
+    return build_auto_tag_cleanup_preview(db)
+
+
+@router.post("/auto-tag/cleanup", response_model=AutoTagCleanupResultOut)
+def clean_up_auto_tags(
+    body: AutoTagCleanupApply,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        result = apply_cleanup(
+            db,
+            remove_tag_ids=body.remove_tag_ids,
+            keep_tag_ids=body.keep_tag_ids,
+            review_token=body.review_token,
+        )
+        db.commit()
+    except (IntegrityError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    result = dict(result or {})
+    removed_tag_ids = list(result.get("removed_tag_ids", body.remove_tag_ids))
+    kept_tag_ids = list(result.get("kept_tag_ids", body.keep_tag_ids))
     return {
-        **data,
-        "pending_count": counts["pending"],
-        "running_count": counts["running"],
-        "complete_count": counts["complete"],
-        "failed_count": counts["failed"],
+        "removed_tag_ids": removed_tag_ids,
+        "kept_tag_ids": kept_tag_ids,
+        "removed_count": int(result.get("removed_count", len(removed_tag_ids))),
     }
+
+
+@router.get("/auto-tag/proposals", response_model=AutoTagProposalListOut)
+def get_auto_tag_proposals(
+    _owner: Owner = Depends(current_owner),
+    db: Session = Depends(get_db),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    return list_proposals(db, offset=offset, limit=limit)
 
 
 @router.post("/translations/test", response_model=TranslationTestOut)
@@ -2587,6 +3010,7 @@ def create_brief_schedule(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
+    acquire_cleanup_snapshot(db)
     try:
         ZoneInfo(body.timezone)
     except Exception as exc:
@@ -2606,6 +3030,7 @@ def update_brief_schedule(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
+    acquire_cleanup_snapshot(db)
     schedule = db.get(BriefSchedule, schedule_id)
     if schedule is None:
         raise not_found("Brief schedule")
@@ -2631,6 +3056,7 @@ def delete_brief_schedule(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> None:
+    acquire_cleanup_snapshot(db)
     schedule = db.get(BriefSchedule, schedule_id)
     if schedule is None:
         raise not_found("Brief schedule")

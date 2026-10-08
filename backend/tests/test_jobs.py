@@ -14,6 +14,7 @@ from backend.app import jobs as jobs_module
 from backend.app import scheduler as scheduler_module
 from backend.app.cli import app as cli_app
 from backend.app.jobs import (
+    AUTO_TAG_PREVIEW_KIND,
     BACKUP_KIND,
     BRIEF_KIND,
     FEED_SYNC_KIND,
@@ -31,6 +32,7 @@ from backend.app.jobs import (
 )
 from backend.app.briefs import brief_schedule_window_key, schedule_window
 from backend.app.models import (
+    AutoTagRecord,
     BriefSchedule,
     Entry,
     Feed,
@@ -155,14 +157,23 @@ def test_interrupted_sync_and_translation_are_retryable(db_factory):
             status="running",
             attempts=1,
         )
-        db.add_all([run, translation])
+        auto_tag = AutoTagRecord(
+            entry_id=entry.id,
+            source_hash=entry.source_hash,
+            status="running",
+            attempts=1,
+            tag_ids=[],
+        )
+        db.add_all([run, translation, auto_tag])
         db.commit()
         assert recover_interrupted_operations(db) == {
             "sync_runs": 1,
             "translations": 1,
+            "auto_tags": 1,
         }
         assert run.status == "failed"
         assert translation.status == "pending"
+        assert auto_tag.status == "pending"
         assert feed.next_fetch_at <= utcnow()
 
 
@@ -215,6 +226,46 @@ def test_enqueue_deduplicates_active_jobs_per_kind(db_factory):
         assert second.id == first.id
         assert other.id != first.id
         assert len(list(db.scalars(select(Job)))) == 2
+
+
+def test_auto_tag_preview_jobs_are_deduplicated_per_preview(
+    db_factory, settings, monkeypatch
+):
+    monkeypatch.setattr(
+        jobs_module,
+        "run_auto_tag_preview",
+        lambda _db, preview_id: SimpleNamespace(
+            id=preview_id,
+            status="complete",
+        ),
+    )
+    with db_factory() as db:
+        first = enqueue_job(
+            db,
+            AUTO_TAG_PREVIEW_KIND,
+            {"preview_id": 11},
+            reason="api",
+        )
+        duplicate = enqueue_job(
+            db,
+            AUTO_TAG_PREVIEW_KIND,
+            {"preview_id": 11},
+            reason="api",
+        )
+        second = enqueue_job(
+            db,
+            AUTO_TAG_PREVIEW_KIND,
+            {"preview_id": 12},
+            reason="api",
+        )
+        assert duplicate.id == first.id
+        assert second.id != first.id
+        completed = claim_next_job(db, AUTO_TAG_PREVIEW_KIND, settings)
+        assert completed is not None
+        assert completed.result["auto_tag_preview"] == {
+            "preview_id": 11,
+            "status": "complete",
+        }
 
 
 def test_due_checks_split_by_kind(db_factory, settings):

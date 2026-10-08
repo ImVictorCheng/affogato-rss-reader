@@ -4,6 +4,10 @@ This list tracks the unresolved findings from the 2026-08-01 pre-release audit. 
 container recreation, GitHub 304 retry, and scheduler starvation findings were fixed
 in the working tree and are therefore not listed below.
 
+The 0.5.0 release preparation review retains unchecked items as historical
+backlog. Automatic installation remains fail-closed; releases require manual
+installation while update and rollback lifecycle work remains pending.
+
 ## P1 — release blockers
 
 - [x] Eliminate the update Compose TOCTOU window. Validate and install from the same
@@ -48,10 +52,12 @@ in the working tree and are therefore not listed below.
   between different feeds that share the same title.
 - [x] Provide a persistent, documented way to disable the Docker-Socket updater across
   future `docker compose up` runs.
-- [ ] Add hashes to Python dependency locks, pin isolated build requirements, and make
-  the container build fully reproducible.
-- [ ] Add CI coverage for the real Docker update lifecycle, rollback, `pip-audit`,
-  `npm audit`, Bandit, and a scan of the exact release image.
+- [x] Pin isolated Python build requirements to exact versions.
+- [ ] Add hashes to Python dependency locks and make the container build fully
+  reproducible.
+- [x] Add CI gates for `pip-audit`, `npm audit`, Bandit, and scanning the exact
+  release image.
+- [ ] Add CI coverage for the real Docker update lifecycle and rollback.
 - [x] Avoid unnecessary anonymous data/secrets volumes in the updater and log-init
   containers by masking the image-declared paths with ephemeral tmpfs mounts.
 - [x] Validate update result schema versions and require request/version correlation

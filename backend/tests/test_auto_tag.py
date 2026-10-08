@@ -1,46 +1,83 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 
+import pytest
 from sqlalchemy import select
 
 from backend.app.auto_tag import (
+    AUTO_TAG_BATCH_SIZE,
+    AUTO_TAG_INPUT_CHAR_BUDGET,
+    AUTO_TAG_MAX_ATTEMPTS,
     MAX_AUTO_TAGS_PER_ENTRY,
+    _build_batch_prompt,
     _parse_tag_names,
+    add_manual_tag,
+    apply_cleanup,
     auto_tag_due,
     auto_tag_pending,
     auto_tag_status,
+    cleanup_preview,
     configure_auto_tag,
     ensure_auto_tag_queue,
+    normalize_topic_name,
+    remove_manual_tag,
     tag_entry,
+    tag_entries_batch,
 )
 from backend.app.models import (
+    AppSetting,
     AutoTagRecord,
+    AutoTagSuppression,
+    Domain,
     Entry,
+    EntryDomain,
+    EntryFeed,
     EntryTag,
+    EntryTagSource,
+    Feed,
     LLMConnection,
     Tag,
+    TagAlias,
+    TagProposal,
+    TagProposalAlias,
+    TagProposalSupport,
     Work,
+    utcnow,
 )
-from backend.app.llm import LLMConnectionError
 
 
-def add_entry(factory, *, title: str = "Tagged article") -> int:
+def add_entry(
+    factory,
+    *,
+    title: str = "Tagged article",
+    work: Work | None = None,
+    published_at=None,
+) -> int:
     with factory() as db:
-        work = Work(
-            dedup_key=f"url:https://tag.test/{title}",
-            canonical_url=f"https://tag.test/{title}",
+        if work is None:
+            work = Work(
+                dedup_key=f"url:https://tag.test/{title}",
+                canonical_url=f"https://tag.test/{title}",
+            )
+            db.add(work)
+            db.flush()
+        else:
+            work = db.merge(work)
+        existing_versions = list(
+            db.scalars(select(Entry).where(Entry.work_id == work.id))
         )
-        db.add(work)
-        db.flush()
+        version = len(existing_versions) + 1
         entry = Entry(
             work_id=work.id,
-            version_key="default",
+            version_key=f"v{version}",
             title=title,
             summary="A summary about quantum error correction.",
-            url=f"https://tag.test/{title}",
+            url=f"https://tag.test/{title}/{version}",
             authors=["Alice"],
-            source_hash="t" * 64,
+            source_hash=(title[0].lower() if title else "t") * 64,
+            published_at=published_at,
         )
         db.add(entry)
         db.commit()
@@ -61,197 +98,962 @@ def add_llm_connection(factory) -> int:
         return connection.id
 
 
-def test_parse_tag_names_limits_to_five_and_deduplicates():
-    payload = '["a", "b", "b", "c", "d", "e", "f"]'
-    assert _parse_tag_names(payload) == ["a", "b", "c", "d", "e"]
-    assert len(_parse_tag_names(payload)) <= MAX_AUTO_TAGS_PER_ENTRY
-    assert _parse_tag_names("not json") == []
-    assert _parse_tag_names("text [\"x\", 3, \"y\"] trailing") == ["x", "y"]
-    longest_valid = "x" * 120
-    assert _parse_tag_names(
-        json.dumps(
-            [
-                "   ",
-                " Physics ",
-                "physics",
-                longest_valid,
-                "y" * 121,
-            ]
+def response_for_articles(*topics: dict) -> callable:
+    def complete(*args, **kwargs):
+        request = json.loads(kwargs["user_prompt"])
+        return json.dumps(
+            {
+                "entries": [
+                    {"entry_id": article["entry_id"], "topics": list(topics)}
+                    for article in request["articles"]
+                ]
+            }
         )
-    ) == ["Physics", longest_valid]
+
+    return complete
 
 
-def test_auto_tag_reuses_case_insensitive_manual_tag_name(db_factory, monkeypatch):
-    monkeypatch.setattr(
-        "backend.app.auto_tag.complete_feature_chat",
-        lambda *args, **kwargs: '[" physics ", "PHYSICS"]',
+def enable_closed(db, factory) -> None:
+    connection_id = add_llm_connection(factory)
+    configure_auto_tag(
+        db,
+        enabled=False,
+        growth_mode="closed",
+        llm_connection_id=connection_id,
     )
+    row = db.get(AppSetting, "auto_tag_preview_required")
+    if row is None:
+        db.add(AppSetting(key="auto_tag_preview_required", value="false"))
+    else:
+        row.value = "false"
+    db.commit()
+    configure_auto_tag(db, enabled=True, growth_mode="closed")
+
+
+def enable_threshold(db, factory, *, threshold: int = 10) -> None:
+    connection_id = add_llm_connection(factory)
+    configure_auto_tag(
+        db,
+        enabled=False,
+        growth_mode="threshold",
+        promotion_threshold=threshold,
+        support_window_days=365,
+        canonical_language="en",
+        llm_connection_id=connection_id,
+    )
+    row = db.get(AppSetting, "auto_tag_preview_required")
+    if row is None:
+        db.add(AppSetting(key="auto_tag_preview_required", value="false"))
+    else:
+        row.value = "false"
+    db.commit()
+    configure_auto_tag(db, enabled=True, growth_mode="threshold")
+
+
+def add_approved_tag(db, name: str) -> Tag:
+    tag = Tag(
+        name=name,
+        normalized_name=normalize_topic_name(name),
+        description=f"Articles about {name}.",
+        origin="manual",
+        auto_assignable=True,
+    )
+    db.add(tag)
+    db.commit()
+    return tag
+
+
+def test_legacy_parser_uses_new_three_tag_limit_and_normalizes():
+    payload = '["A", "a", "b", "c", "d"]'
+    assert _parse_tag_names(payload) == ["A", "b", "c"]
+    assert len(_parse_tag_names(payload)) == MAX_AUTO_TAGS_PER_ENTRY == 3
+    assert normalize_topic_name(" Quantum-error  Correction ") == "quantum error correction"
+
+
+def test_closed_mode_allows_zero_and_ignores_low_confidence(db_factory, monkeypatch):
     with db_factory() as db:
-        existing = Tag(name="Physics")
-        db.add(existing)
-        db.commit()
+        tag = add_approved_tag(db, "Physics")
         entry_id = add_entry(db_factory)
-        configure_auto_tag(
-            db,
-            enabled=True,
-            create_new=True,
-            llm_connection_id=add_llm_connection(db_factory),
+        monkeypatch.setattr(
+            "backend.app.auto_tag.complete_feature_chat",
+            response_for_articles(
+                {"kind": "tag", "id": tag.id, "confidence": 0.79},
+            ),
         )
+        enable_closed(db, db_factory)
         record = db.scalar(
             select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
         )
-        assert record is not None
         tag_entry(db, record)
-
-        assert list(db.scalars(select(Tag.name))) == ["Physics"]
-        link = db.scalar(
-            select(EntryTag).where(EntryTag.entry_id == entry_id)
-        )
-        assert link is not None
-        assert link.tag_id == existing.id
-
-
-def test_tag_entry_existing_only_mode_never_creates_tags(db_factory, monkeypatch):
-    monkeypatch.setattr(
-        "backend.app.auto_tag.complete_feature_chat",
-        lambda *args, **kwargs: '["physics", "brand-new-tag"]',
-    )
-    with db_factory() as db:
-        existing = Tag(name="physics")
-        db.add(existing)
-        db.commit()
-        entry_id = add_entry(db_factory)
-        configure_auto_tag(db, enabled=True, create_new=False, llm_connection_id=add_llm_connection(db_factory))
-        db.commit()
-        record = db.scalar(
-            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
-        )
-        assert record is not None
-        tag_entry(db, record)
-        db.refresh(record)
         assert record.status == "complete"
-        attached = list(db.scalars(select(Tag).order_by(Tag.id)))
-        assert [tag.name for tag in attached] == ["physics"]
-        links = db.scalars(
-            select(EntryTag).where(EntryTag.entry_id == entry_id)
-        ).all()
-        assert len(links) == 1
-        assert links[0].tag_id == existing.id
+        assert record.tag_ids == []
+        assert db.scalar(select(EntryTag).where(EntryTag.entry_id == entry_id)) is None
+        assert db.scalar(select(TagProposal.id)) is None
 
 
-def test_tag_entry_create_new_mode_adds_new_tags_to_library(db_factory, monkeypatch):
-    monkeypatch.setattr(
-        "backend.app.auto_tag.complete_feature_chat",
-        lambda *args, **kwargs: '["physics", "quantum-error-correction"]',
-    )
+def test_unknown_tag_id_fails_without_removing_previous_auto_tag(db_factory, monkeypatch):
+    calls = {"count": 0}
+
+    def complete(*args, **kwargs):
+        request = json.loads(kwargs["user_prompt"])
+        calls["count"] += 1
+        tag_id = 1 if calls["count"] == 1 else 999_999
+        return json.dumps(
+            {
+                "entries": [
+                    {
+                        "entry_id": article["entry_id"],
+                        "topics": [{"kind": "tag", "id": tag_id, "confidence": 0.95}],
+                    }
+                    for article in request["articles"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr("backend.app.auto_tag.complete_feature_chat", complete)
     with db_factory() as db:
-        db.add(Tag(name="physics"))
-        db.commit()
+        tag = add_approved_tag(db, "Physics")
+        assert tag.id == 1
         entry_id = add_entry(db_factory)
-        configure_auto_tag(db, enabled=True, create_new=True, llm_connection_id=add_llm_connection(db_factory))
-        db.commit()
+        enable_closed(db, db_factory)
         record = db.scalar(
             select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
         )
         tag_entry(db, record)
-        names = list(db.scalars(select(Tag.name).order_by(Tag.id)))
-        assert "quantum-error-correction" in names
-        db.refresh(record)
-        assert len(record.tag_ids) == 2
+        assert record.tag_ids == [tag.id]
+        tag_entry(db, record)
+        assert record.status == "failed"
+        assert record.tag_ids == [tag.id]
+        assert db.scalar(
+            select(EntryTag).where(EntryTag.entry_id == entry_id, EntryTag.tag_id == tag.id)
+        ) is not None
 
 
-def test_retagging_replaces_only_previous_auto_tags(db_factory, monkeypatch):
-    calls = {"n": 0}
-
-    def summarize(*args, **kwargs):
-        calls["n"] += 1
-        return '["old"]' if calls["n"] == 1 else '["new"]'
-
+def test_alias_and_punctuation_variant_resolve_to_existing_tag(db_factory, monkeypatch):
     monkeypatch.setattr(
         "backend.app.auto_tag.complete_feature_chat",
-        summarize,
-    )
-    with db_factory() as db:
-        entry_id = add_entry(db_factory)
-        configure_auto_tag(db, enabled=True, create_new=True, llm_connection_id=add_llm_connection(db_factory))
-        db.commit()
-        record = db.scalar(
-            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
-        )
-        tag_entry(db, record)
-        old = db.scalar(select(Tag).where(Tag.name == "old"))
-        assert old is not None
-        # The owner adds a tag by hand; it must survive the next auto run.
-        manual = Tag(name="manual-tag")
-        db.add(manual)
-        db.flush()
-        db.add(EntryTag(entry_id=entry_id, tag_id=manual.id))
-        # Simulate a re-run after content change.
-        entry = db.get(Entry, entry_id)
-        entry.summary = "A summary about new directions."
-        entry.source_hash = "u" * 64
-        record.source_hash = "v" * 64
-        db.commit()
-        tag_entry(db, record)
-        names = list(
-            db.scalars(select(Tag.name).order_by(Tag.id))
-        )
-        assert "old" in names  # library keeps it
-        links = list(
-            db.scalars(select(EntryTag).where(EntryTag.entry_id == entry_id))
-        )
-        assert sorted(db.get(Tag, link.tag_id).name for link in links) == ["manual-tag", "new"]
-
-
-def test_llm_failure_marks_record_failed_with_retry_backoff(db_factory, monkeypatch):
-    monkeypatch.setattr(
-        "backend.app.auto_tag.complete_feature_chat",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            LLMConnectionError("503", retryable=True)
+        response_for_articles(
+            {
+                "kind": "new",
+                "name": "quantum-computing",
+                "description": "Quantum information processing.",
+                "aliases": ["量子计算"],
+                "confidence": 0.94,
+            }
         ),
     )
     with db_factory() as db:
-        entry_id = add_entry(db_factory)
-        configure_auto_tag(db, enabled=True, create_new=False, llm_connection_id=add_llm_connection(db_factory))
+        tag = add_approved_tag(db, "Quantum Computing")
+        db.add(
+            TagAlias(
+                tag_id=tag.id,
+                alias="量子计算",
+                normalized_alias=normalize_topic_name("量子计算"),
+            )
+        )
         db.commit()
+        entry_id = add_entry(db_factory)
+        enable_threshold(db, db_factory)
         record = db.scalar(
             select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
         )
         tag_entry(db, record)
-        db.refresh(record)
-        assert record.status == "failed"
-        assert record.next_retry_at is not None
+        assert record.tag_ids == [tag.id]
+        assert db.scalar(select(TagProposal.id)) is None
 
 
-def test_auto_tag_pending_processes_queue_and_due_check(db_factory, monkeypatch):
+def test_threshold_requires_approved_preview(db_factory):
+    with db_factory() as db:
+        connection_id = add_llm_connection(db_factory)
+        configure_auto_tag(
+            db,
+            enabled=True,
+            growth_mode="threshold",
+            llm_connection_id=connection_id,
+        )
+        status = auto_tag_status(db)
+        assert status["enabled"] is False
+        assert status["preview_required"] is True
+        with pytest.raises(ValueError, match="preview"):
+            configure_auto_tag(
+                db,
+                enabled=True,
+                growth_mode="threshold",
+            )
+
+
+def test_nine_works_remain_a_proposal(db_factory, monkeypatch):
     monkeypatch.setattr(
         "backend.app.auto_tag.complete_feature_chat",
-        lambda *args, **kwargs: '["physics"]',
+        response_for_articles(
+            {
+                "kind": "new",
+                "name": "Quantum error correction",
+                "description": "Methods that protect quantum information from errors.",
+                "aliases": ["QEC", "量子纠错"],
+                "confidence": 0.93,
+            }
+        ),
     )
     with db_factory() as db:
-        db.add(Tag(name="physics"))
+        for index in range(9):
+            add_entry(db_factory, title=f"Paper {index}", published_at=utcnow())
+        enable_threshold(db, db_factory)
+        records = auto_tag_pending(db, limit=AUTO_TAG_BATCH_SIZE)
+        assert len(records) == 9
+        proposal = db.scalar(select(TagProposal))
+        assert proposal is not None
+        assert proposal.support_count == 9
+        assert proposal.status == "active"
+        assert db.scalar(select(Tag).where(Tag.origin == "auto_promoted")) is None
+        assert db.scalar(select(EntryTag.id)) is None
+
+
+def test_tenth_distinct_work_promotes_and_backfills(db_factory, monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles(
+            {
+                "kind": "new",
+                "name": "Quantum error correction",
+                "description": "Methods that protect quantum information from errors.",
+                "aliases": ["QEC", "量子纠错"],
+                "confidence": 0.93,
+            }
+        ),
+    )
+    with db_factory() as db:
+        for index in range(10):
+            add_entry(db_factory, title=f"Paper {index}", published_at=utcnow())
+        enable_threshold(db, db_factory)
+        records = auto_tag_pending(db, limit=AUTO_TAG_BATCH_SIZE)
+        assert len(records) == 10
+        proposal = db.scalar(select(TagProposal))
+        tag = db.scalar(select(Tag).where(Tag.origin == "auto_promoted"))
+        assert proposal is not None and proposal.status == "promoted"
+        assert proposal.support_count == 10
+        assert tag is not None and tag.name == "Quantum error correction"
+        assert db.scalars(select(EntryTag).where(EntryTag.tag_id == tag.id)).all()
+        assert len(db.scalars(select(EntryTag).where(EntryTag.tag_id == tag.id)).all()) == 10
+        assert len(db.scalars(select(TagAlias).where(TagAlias.tag_id == tag.id)).all()) == 2
+
+
+def test_duplicate_versions_and_old_articles_do_not_inflate_support(db_factory, monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles(
+            {
+                "kind": "new",
+                "name": "Quantum sensing",
+                "description": "Quantum-enhanced measurement.",
+                "aliases": [],
+                "confidence": 0.9,
+            }
+        ),
+    )
+    with db_factory() as db:
+        shared = Work(dedup_key="shared-work", canonical_url="https://tag.test/shared")
+        db.add(shared)
         db.commit()
-        first = add_entry(db_factory, title="One")
-        second = add_entry(db_factory, title="Two")
-        configure_auto_tag(db, enabled=True, create_new=False, llm_connection_id=add_llm_connection(db_factory))
+        add_entry(db_factory, title="Shared v1", work=shared, published_at=utcnow())
+        add_entry(db_factory, title="Shared v2", work=shared, published_at=utcnow())
+        for index in range(8):
+            add_entry(db_factory, title=f"Recent {index}", published_at=utcnow())
+        add_entry(
+            db_factory,
+            title="Old work",
+            published_at=utcnow() - timedelta(days=366),
+        )
+        enable_threshold(db, db_factory)
+        auto_tag_pending(db, limit=AUTO_TAG_BATCH_SIZE)
+        auto_tag_pending(db, limit=AUTO_TAG_BATCH_SIZE)
+        proposal = db.scalar(select(TagProposal))
+        assert proposal is not None
+        assert proposal.support_count == 9
+        assert proposal.status == "active"
+        assert len(db.scalars(select(TagProposalSupport)).all()) == 11
+
+
+def test_retagging_removes_only_auto_source_and_preserves_manual(db_factory, monkeypatch):
+    calls = {"count": 0}
+
+    def complete(*args, **kwargs):
+        request = json.loads(kwargs["user_prompt"])
+        calls["count"] += 1
+        topics = (
+            [{"kind": "tag", "id": 1, "confidence": 0.95}]
+            if calls["count"] == 1
+            else []
+        )
+        return json.dumps(
+            {
+                "entries": [
+                    {"entry_id": article["entry_id"], "topics": topics}
+                    for article in request["articles"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr("backend.app.auto_tag.complete_feature_chat", complete)
+    with db_factory() as db:
+        tag = add_approved_tag(db, "Physics")
+        assert tag.id == 1
+        entry_id = add_entry(db_factory)
+        add_manual_tag(db, entry_id, tag.id)
+        enable_closed(db, db_factory)
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
+        )
+        tag_entry(db, record)
+        link = db.scalar(select(EntryTag).where(EntryTag.entry_id == entry_id))
+        assert {row.source for row in db.scalars(select(EntryTagSource).where(EntryTagSource.entry_tag_id == link.id))} == {"manual", "auto"}
+        tag_entry(db, record)
+        assert db.get(EntryTag, link.id) is not None
+        assert [row.source for row in db.scalars(select(EntryTagSource).where(EntryTagSource.entry_tag_id == link.id))] == ["manual"]
+
+
+def test_owner_removal_suppresses_future_automatic_assignment(db_factory, monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles({"kind": "tag", "id": 1, "confidence": 0.95}),
+    )
+    with db_factory() as db:
+        tag = add_approved_tag(db, "Physics")
+        entry_id = add_entry(db_factory)
+        enable_closed(db, db_factory)
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
+        )
+        tag_entry(db, record)
+        remove_manual_tag(db, entry_id, tag.id)
+        assert db.scalar(
+            select(AutoTagSuppression).where(
+                AutoTagSuppression.entry_id == entry_id,
+                AutoTagSuppression.tag_id == tag.id,
+            )
+        ) is not None
+        tag_entry(db, record)
+        assert db.scalar(select(EntryTag).where(EntryTag.entry_id == entry_id)) is None
+
+
+def test_source_hash_change_requeues_completed_record(db_factory, monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles(),
+    )
+    with db_factory() as db:
+        entry_id = add_entry(db_factory)
+        enable_closed(db, db_factory)
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
+        )
+        tag_entry(db, record)
+        assert record.status == "complete"
+        entry = db.get(Entry, entry_id)
+        entry.source_hash = "z" * 64
         db.commit()
         assert auto_tag_due(db) is True
-        processed = auto_tag_pending(db, limit=10)
-        assert len(processed) == 2
-        assert all(row.status == "complete" for row in processed)
-        assert auto_tag_due(db) is False
-        with db_factory() as db2:
-            status = auto_tag_status(db2)
-            assert status["enabled"] is True
-            assert status["counts"]["complete"] == 2
-        assert db.scalar(select(EntryTag).where(EntryTag.entry_id == first))
-        assert db.scalar(select(EntryTag).where(EntryTag.entry_id == second))
+        assert ensure_auto_tag_queue(db) == 1
+        assert record.status == "pending"
 
 
-def test_disabled_auto_tag_does_not_process_or_count_due(db_factory, monkeypatch):
+def test_cleanup_preview_is_read_only_then_removes_selected_legacy_auto_links(db_factory):
     with db_factory() as db:
-        add_entry(db_factory)
-        configure_auto_tag(db, enabled=False, create_new=False)
+        tag = add_approved_tag(db, "One-off")
+        entry_id = add_entry(db_factory)
+        link = EntryTag(entry_id=entry_id, tag_id=tag.id)
+        db.add(link)
+        db.flush()
+        db.add(EntryTagSource(entry_tag_id=link.id, source="legacy"))
+        db.add(
+            AutoTagRecord(
+                entry_id=entry_id,
+                source_hash=db.get(Entry, entry_id).source_hash,
+                status="complete",
+                tag_ids=[tag.id],
+            )
+        )
         db.commit()
+        before = cleanup_preview(db)
+        assert before["inferred_auto_association_count"] == 1
+        assert db.get(Tag, tag.id) is not None
+        result = apply_cleanup(
+            db,
+            remove_tag_ids=[tag.id],
+            keep_tag_ids=[],
+            review_token=before["review_token"],
+        )
+        assert result["removed_count"] == 1
+        assert result["removed_tag_ids"] == [tag.id]
+        assert db.get(Tag, tag.id) is None
+
+
+def test_status_estimates_one_call_per_ten_articles(db_factory):
+    with db_factory() as db:
+        for index in range(21):
+            add_entry(db_factory, title=f"Queued {index}")
+        configure_auto_tag(
+            db,
+            enabled=False,
+            growth_mode="closed",
+            llm_connection_id=add_llm_connection(db_factory),
+        )
+        ensure_auto_tag_queue(db)
+        db.commit()
+        status = auto_tag_status(db)
+        assert status["estimated_calls"] == 3
+        assert status["max_tags_per_entry"] == 3
+        assert status["promotion_threshold"] == 10
+        assert status["support_window_days"] == 365
+
+
+def test_complete_batch_prompt_is_bounded_uses_ordinals_and_excludes_local_metadata(
+    db_factory,
+):
+    with db_factory() as db:
+        entry_ids = [
+            add_entry(db_factory, title=f"Visible article {index}")
+            for index in range(12)
+        ]
+        selected_ids = entry_ids[-2:]
+        for index, entry_id in enumerate(selected_ids):
+            entry = db.get(Entry, entry_id)
+            entry.summary = f"Visible summary {index} " + ("x" * 50_000)
+            entry.authors = [f"PRIVATE_AUTHOR_{index}"]
+            entry.categories = [f"PRIVATE_CATEGORY_{index}"]
+
+        feed = Feed(
+            title="PRIVATE_FEED_TITLE",
+            url="https://private-feed.test/rss",
+        )
+        domain = Domain(name="PRIVATE_DOMAIN_NAME")
+        db.add_all([feed, domain])
+        db.flush()
+        for entry_id in selected_ids:
+            db.add(EntryFeed(entry_id=entry_id, feed_id=feed.id))
+            db.add(EntryDomain(entry_id=entry_id, domain_id=domain.id))
+
+        for index in range(110):
+            db.add(
+                Tag(
+                    name=f"Controlled topic {index}",
+                    normalized_name=f"controlled topic {index}",
+                    description="d" * 1_000,
+                    auto_assignable=True,
+                )
+            )
+        for index in range(60):
+            db.add(
+                TagProposal(
+                    name=f"Candidate topic {index}",
+                    normalized_name=f"candidate topic {index}",
+                    description="p" * 1_000,
+                    status="active",
+                    support_count=index,
+                )
+            )
+        db.commit()
+        configure_auto_tag(db, enabled=False, growth_mode="threshold")
+
+        entries = [db.get(Entry, entry_id) for entry_id in selected_ids]
+        system_prompt, user_prompt, _tag_ids, _proposal_ids = _build_batch_prompt(
+            db, entries
+        )
+        payload = json.loads(user_prompt)
+        serialized_prompt = system_prompt + user_prompt
+
+        assert len(serialized_prompt) <= AUTO_TAG_INPUT_CHAR_BUDGET == 24_000
+        assert selected_ids != [1, 2]
+        assert [article["entry_id"] for article in payload["articles"]] == [1, 2]
+        assert all(
+            set(article) == {"entry_id", "title", "summary"}
+            for article in payload["articles"]
+        )
+        for private_value in (
+            "PRIVATE_AUTHOR_0",
+            "PRIVATE_AUTHOR_1",
+            "PRIVATE_CATEGORY_0",
+            "PRIVATE_CATEGORY_1",
+            "PRIVATE_FEED_TITLE",
+            "PRIVATE_DOMAIN_NAME",
+        ):
+            assert private_value not in serialized_prompt
+
+
+def test_closed_mode_also_requires_an_approved_preview(db_factory):
+    with db_factory() as db:
+        connection_id = add_llm_connection(db_factory)
+        configure_auto_tag(
+            db,
+            enabled=True,
+            growth_mode="closed",
+            llm_connection_id=connection_id,
+        )
+        status = auto_tag_status(db)
+        assert status["enabled"] is False
+        assert status["preview_required"] is True
+        with pytest.raises(ValueError, match="preview"):
+            configure_auto_tag(
+                db,
+                enabled=True,
+                growth_mode="closed",
+            )
+
+
+def test_chinese_and_abbreviation_aliases_reuse_one_formal_tag(
+    db_factory, monkeypatch
+):
+    def complete(*args, **kwargs):
+        request = json.loads(kwargs["user_prompt"])
+        topics = {
+            1: {
+                "kind": "new",
+                "name": "qec",
+                "description": "Quantum error protection.",
+                "aliases": [],
+                "confidence": 0.95,
+            },
+            2: {
+                "kind": "new",
+                "name": "Fault-tolerant quantum computing",
+                "description": "Reliable quantum computation.",
+                "aliases": ["量子纠错"],
+                "confidence": 0.94,
+            },
+        }
+        return json.dumps(
+            {
+                "entries": [
+                    {
+                        "entry_id": article["entry_id"],
+                        "topics": [topics[article["entry_id"]]],
+                    }
+                    for article in request["articles"]
+                ]
+            }
+        )
+
+    monkeypatch.setattr("backend.app.auto_tag.complete_feature_chat", complete)
+    with db_factory() as db:
+        tag = add_approved_tag(db, "Quantum error correction")
+        db.add_all(
+            [
+                TagAlias(
+                    tag_id=tag.id,
+                    alias="QEC",
+                    normalized_alias=normalize_topic_name("QEC"),
+                ),
+                TagAlias(
+                    tag_id=tag.id,
+                    alias="量子纠错",
+                    normalized_alias=normalize_topic_name("量子纠错"),
+                ),
+            ]
+        )
+        db.commit()
+        entry_ids = [
+            add_entry(db_factory, title=f"Alias article {index}") for index in range(2)
+        ]
+        enable_threshold(db, db_factory)
+        records = list(
+            db.scalars(
+                select(AutoTagRecord)
+                .where(AutoTagRecord.entry_id.in_(entry_ids))
+                .order_by(AutoTagRecord.entry_id)
+            )
+        )
+
+        tag_entries_batch(db, records)
+
+        assert db.scalar(select(TagProposal.id)) is None
+        assert len(db.scalars(select(Tag)).all()) == 1
+        for entry_id in entry_ids:
+            assert db.scalar(
+                select(EntryTag).where(
+                    EntryTag.entry_id == entry_id,
+                    EntryTag.tag_id == tag.id,
+                )
+            ) is not None
+
+
+@pytest.mark.parametrize(
+    "bad_payload",
+    [
+        "not JSON at all",
+        "{}",
+        '{"entries":[]}',
+    ],
+)
+def test_malformed_missing_or_omitted_json_preserves_old_automatic_tag(
+    db_factory, monkeypatch, bad_payload
+):
+    calls = {"count": 0}
+
+    def complete(*args, **kwargs):
+        request = json.loads(kwargs["user_prompt"])
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return json.dumps(
+                {
+                    "entries": [
+                        {
+                            "entry_id": article["entry_id"],
+                            "topics": [
+                                {"kind": "tag", "id": 1, "confidence": 0.95}
+                            ],
+                        }
+                        for article in request["articles"]
+                    ]
+                }
+            )
+        return bad_payload
+
+    monkeypatch.setattr("backend.app.auto_tag.complete_feature_chat", complete)
+    with db_factory() as db:
+        tag = add_approved_tag(db, "Physics")
+        assert tag.id == 1
+        entry_id = add_entry(db_factory)
+        enable_closed(db, db_factory)
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
+        )
+        record = tag_entry(db, record)
+        assert record.tag_ids == [tag.id]
+
+        record = tag_entry(db, record)
+
+        assert record.status == "failed"
+        assert record.tag_ids == [tag.id]
+        link = db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == entry_id,
+                EntryTag.tag_id == tag.id,
+            )
+        )
+        assert link is not None
+        assert db.scalar(
+            select(EntryTagSource).where(
+                EntryTagSource.entry_tag_id == link.id,
+                EntryTagSource.source == "auto",
+            )
+        ) is not None
+
+
+def test_format_failure_splits_batch_and_never_exceeds_retry_limit(
+    db_factory, monkeypatch
+):
+    calls = {"count": 0}
+
+    def invalid_response(*args, **kwargs):
+        calls["count"] += 1
+        return "invalid"
+
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        invalid_response,
+    )
+    with db_factory() as db:
+        entry_ids = [
+            add_entry(db_factory, title=f"Split failure {index}") for index in range(4)
+        ]
+        enable_closed(db, db_factory)
+        records = list(
+            db.scalars(
+                select(AutoTagRecord)
+                .where(AutoTagRecord.entry_id.in_(entry_ids))
+                .order_by(AutoTagRecord.entry_id)
+            )
+        )
+
+        tag_entries_batch(db, records)
+
+        records = list(
+            db.scalars(
+                select(AutoTagRecord)
+                .where(AutoTagRecord.entry_id.in_(entry_ids))
+                .order_by(AutoTagRecord.entry_id)
+            )
+        )
+        assert calls["count"] == 7
+        assert {record.status for record in records} == {"failed"}
+        assert {record.attempts for record in records} == {3}
+        assert all(record.attempts <= AUTO_TAG_MAX_ATTEMPTS for record in records)
+
+
+def test_single_record_stops_calling_llm_after_five_attempts(db_factory, monkeypatch):
+    calls = {"count": 0}
+
+    def invalid_response(*args, **kwargs):
+        calls["count"] += 1
+        return "invalid"
+
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        invalid_response,
+    )
+    with db_factory() as db:
+        entry_id = add_entry(db_factory, title="Retry ceiling")
+        enable_closed(db, db_factory)
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
+        )
+
+        for _index in range(AUTO_TAG_MAX_ATTEMPTS + 2):
+            record = tag_entry(db, record)
+
+        assert calls["count"] == AUTO_TAG_MAX_ATTEMPTS == 5
+        assert record.attempts == AUTO_TAG_MAX_ATTEMPTS
+        assert record.status == "failed"
+        assert record.next_retry_at is None
+
+
+def test_status_estimates_unrecorded_entries_without_populating_queue(db_factory):
+    with db_factory() as db:
+        for index in range(21):
+            add_entry(db_factory, title=f"Never queued {index}")
+        configure_auto_tag(
+            db,
+            enabled=False,
+            growth_mode="closed",
+            llm_connection_id=add_llm_connection(db_factory),
+        )
+
+        assert db.scalar(select(AutoTagRecord.id)) is None
+        status = auto_tag_status(db)
+
+        assert status["estimated_calls"] == 3
+        assert db.scalar(select(AutoTagRecord.id)) is None
+
+
+def test_taxonomy_change_marks_rebuild_without_silently_requeueing(
+    db_factory, monkeypatch
+):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles(),
+    )
+    with db_factory() as db:
+        entry_id = add_entry(db_factory, title="Stable classified article")
+        enable_closed(db, db_factory)
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
+        )
+        tag_entry(db, record)
+        assert auto_tag_status(db)["needs_rebuild"] is False
+
+        add_approved_tag(db, "New taxonomy topic")
+        status = auto_tag_status(db)
+
+        assert status["needs_rebuild"] is True
+        assert status["outdated_count"] == 1
+        # The UI may estimate the cost of an explicitly approved rebuild, but
+        # merely changing the taxonomy must not turn the completed row pending.
+        assert status["estimated_calls"] == 1
+        assert ensure_auto_tag_queue(db) == 0
+        assert record.status == "complete"
         assert auto_tag_due(db) is False
-        assert auto_tag_pending(db, limit=10) == []
+
+
+def test_existing_proposal_alias_is_reused_then_promoted_once(db_factory, monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles(
+            {
+                "kind": "new",
+                "name": "Fault-tolerant quantum computing",
+                "description": "Reliable quantum computation.",
+                "aliases": ["QEC"],
+                "confidence": 0.94,
+            }
+        ),
+    )
+    with db_factory() as db:
+        proposal = TagProposal(
+            name="Quantum error correction",
+            normalized_name=normalize_topic_name("Quantum error correction"),
+            description="Quantum codes that protect information.",
+            status="active",
+            support_count=0,
+        )
+        db.add(proposal)
+        db.flush()
+        db.add(
+            TagProposalAlias(
+                proposal_id=proposal.id,
+                alias="QEC",
+                normalized_alias=normalize_topic_name("QEC"),
+            )
+        )
+        db.commit()
+        entry_ids = [
+            add_entry(db_factory, title=f"Proposal alias {index}", published_at=utcnow())
+            for index in range(2)
+        ]
+        enable_threshold(db, db_factory, threshold=2)
+        records = list(
+            db.scalars(
+                select(AutoTagRecord)
+                .where(AutoTagRecord.entry_id.in_(entry_ids))
+                .order_by(AutoTagRecord.entry_id)
+            )
+        )
+
+        tag_entries_batch(db, records)
+
+        assert len(db.scalars(select(TagProposal)).all()) == 1
+        assert proposal.status == "promoted"
+        assert proposal.support_count == 2
+        tag = db.get(Tag, proposal.promoted_tag_id)
+        assert tag is not None
+        assert tag.name == "Quantum error correction"
+        assert db.scalar(
+            select(TagAlias).where(
+                TagAlias.tag_id == tag.id,
+                TagAlias.normalized_alias == normalize_topic_name("QEC"),
+            )
+        ) is not None
+        assert len(
+            db.scalars(select(EntryTag).where(EntryTag.tag_id == tag.id)).all()
+        ) == 2
+
+
+def test_promotion_backfill_does_not_exceed_three_existing_auto_tags(
+    db_factory, monkeypatch
+):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles(
+            {
+                "kind": "new",
+                "name": "Quantum networking",
+                "description": "Distribution of quantum information.",
+                "aliases": ["QNet"],
+                "confidence": 0.93,
+            }
+        ),
+    )
+    with db_factory() as db:
+        first_id = add_entry(db_factory, title="First support", published_at=utcnow())
+        second_id = add_entry(db_factory, title="Second support", published_at=utcnow())
+        enable_threshold(db, db_factory, threshold=2)
+        first_record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == first_id)
+        )
+        tag_entry(db, first_record)
+        proposal = db.scalar(select(TagProposal))
+        assert proposal is not None and proposal.status == "active"
+
+        for index in range(MAX_AUTO_TAGS_PER_ENTRY):
+            tag = add_approved_tag(db, f"Existing automatic topic {index}")
+            link = EntryTag(entry_id=first_id, tag_id=tag.id)
+            db.add(link)
+            db.flush()
+            db.add(
+                EntryTagSource(
+                    entry_tag_id=link.id,
+                    source="auto",
+                    confidence=0.9,
+                    policy_version="older-policy",
+                )
+            )
+        db.commit()
+        second_record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == second_id)
+        )
+
+        tag_entry(db, second_record)
+
+        promoted = db.get(Tag, proposal.promoted_tag_id)
+        assert promoted is not None
+        first_auto_sources = list(
+            db.scalars(
+                select(EntryTagSource)
+                .join(EntryTag, EntryTag.id == EntryTagSource.entry_tag_id)
+                .where(
+                    EntryTag.entry_id == first_id,
+                    EntryTagSource.source == "auto",
+                )
+            )
+        )
+        assert len(first_auto_sources) == MAX_AUTO_TAGS_PER_ENTRY == 3
+        assert db.scalar(
+            select(EntryTagSource)
+            .join(EntryTag, EntryTag.id == EntryTagSource.entry_tag_id)
+            .where(
+                EntryTag.entry_id == first_id,
+                EntryTag.tag_id == promoted.id,
+                EntryTagSource.source == "auto",
+            )
+        ) is None
+
+
+def test_old_article_can_receive_formal_tag_without_promotion_window(
+    db_factory, monkeypatch
+):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles({"kind": "tag", "id": 1, "confidence": 0.95}),
+    )
+    with db_factory() as db:
+        tag = add_approved_tag(db, "Established topic")
+        assert tag.id == 1
+        entry_id = add_entry(
+            db_factory,
+            title="Old but classifiable",
+            published_at=utcnow() - timedelta(days=500),
+        )
+        enable_closed(db, db_factory)
+        record = db.scalar(
+            select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id)
+        )
+
+        tag_entry(db, record)
+
+        assert db.scalar(
+            select(EntryTag).where(
+                EntryTag.entry_id == entry_id,
+                EntryTag.tag_id == tag.id,
+            )
+        ) is not None
+
+
+def test_missing_published_at_uses_recent_ingestion_time_for_promotion(
+    db_factory, monkeypatch
+):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles(
+            {
+                "kind": "new",
+                "name": "Quantum memories",
+                "description": "Storage of quantum states.",
+                "aliases": [],
+                "confidence": 0.92,
+            }
+        ),
+    )
+    with db_factory() as db:
+        entry_ids = [
+            add_entry(
+                db_factory,
+                title=f"No publication date {index}",
+                published_at=None,
+            )
+            for index in range(2)
+        ]
+        enable_threshold(db, db_factory, threshold=2)
+        records = list(
+            db.scalars(
+                select(AutoTagRecord)
+                .where(AutoTagRecord.entry_id.in_(entry_ids))
+                .order_by(AutoTagRecord.entry_id)
+            )
+        )
+
+        tag_entries_batch(db, records)
+
+        proposal = db.scalar(select(TagProposal))
+        assert proposal is not None
+        assert proposal.support_count == 2
+        assert proposal.status == "promoted"
+        assert proposal.promoted_tag_id is not None

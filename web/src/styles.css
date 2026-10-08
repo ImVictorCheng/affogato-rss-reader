@@ -4470,9 +4470,242 @@ kbd {
   line-height: 1.55;
 }
 
-.auto-tag-create-new {
+.auto-tag-policy-note {
   display: grid;
   gap: 6px;
+}
+
+.auto-tag-policy-note p,
+.auto-tag-workflow p {
+  margin: 0;
+}
+
+.auto-tag-policy-grid,
+.auto-tag-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.auto-tag-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.auto-tag-policy-grid > div,
+.auto-tag-summary-grid > div {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-alt);
+}
+
+.auto-tag-policy-grid span,
+.auto-tag-summary-grid span {
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.auto-tag-policy-grid strong {
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.auto-tag-summary-grid strong {
+  color: var(--ink);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.auto-tag-rebuild-notice {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 11px 12px;
+  border: 1px solid color-mix(in srgb, var(--amber) 55%, var(--line));
+  border-radius: var(--radius-sm);
+  color: var(--ink-soft);
+  background: color-mix(in srgb, var(--amber-soft) 48%, var(--surface));
+  font-size: 12px;
+}
+
+.auto-tag-rebuild-notice strong {
+  color: var(--ink);
+}
+
+.auto-tag-proposals,
+.auto-tag-workflow {
+  display: grid;
+  gap: 13px;
+  margin-top: 18px;
+  padding: 15px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--surface-alt);
+}
+
+.auto-tag-workflow {
+  border-color: color-mix(in srgb, var(--cyan) 42%, var(--line));
+  background: color-mix(in srgb, var(--cyan-soft) 28%, var(--surface));
+}
+
+.auto-tag-workflow__heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auto-tag-workflow__heading > div,
+.auto-tag-workflow__heading > span {
+  display: grid;
+  gap: 4px;
+}
+
+.auto-tag-workflow__heading > span {
+  color: var(--ink-soft);
+  font-size: 11px;
+  text-align: right;
+}
+
+.auto-tag-proposal-list,
+.auto-tag-preview-list,
+.auto-tag-cleanup-list {
+  display: grid;
+  gap: 8px;
+  max-height: 460px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.auto-tag-proposal-list > div,
+.auto-tag-preview-list > div,
+.auto-tag-cleanup-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.auto-tag-proposal-list > div > span:first-child,
+.auto-tag-cleanup-list label > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.auto-tag-proposal-list small,
+.auto-tag-cleanup-list small,
+.auto-tag-preview-list span {
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.auto-tag-proposal-list > div > span:last-child {
+  flex: 0 0 auto;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.auto-tag-cleanup-preview,
+.auto-tag-preview-result {
+  display: grid;
+  gap: 11px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
+.auto-tag-cleanup-list label {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 280px;
+  align-items: center;
+  gap: 10px;
+  justify-content: flex-start;
+  cursor: pointer;
+}
+
+.auto-tag-cleanup-list input {
+  flex: 0 0 auto;
+}
+
+.auto-tag-cleanup-list em {
+  color: var(--ink-faint);
+  font-size: 10px;
+  font-style: normal;
+}
+
+.auto-tag-cleanup-row__actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.auto-tag-review-status {
+  display: grid;
+  gap: 3px;
+  padding: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--cyan) 38%, var(--line));
+  border-radius: var(--radius-sm);
+  color: var(--cyan-dark);
+  background: var(--cyan-soft);
+}
+
+.auto-tag-review-status strong {
+  font-size: 12px;
+}
+
+.auto-tag-review-status span {
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.auto-tag-cleanup-preview > .button,
+.auto-tag-preview-result > .button {
+  justify-self: start;
+}
+
+.auto-tag-preview-list > div {
+  display: grid;
+  justify-content: stretch;
+  gap: 5px;
+}
+
+.auto-tag-preview-metrics {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 7px;
+}
+
+.auto-tag-preview-metrics > div {
+  display: grid;
+  gap: 3px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.auto-tag-preview-metrics span {
+  color: var(--ink-soft);
+  font-size: 10px;
+}
+
+.auto-tag-preview-metrics strong {
+  color: var(--ink);
+  font-size: 17px;
 }
 
 .feed-manager-embedded {
@@ -4523,7 +4756,14 @@ kbd {
   border-radius: 50%;
 }
 
-.tag-manager-card > strong {
+.tag-manager-card__body {
+  display: grid;
+  min-width: 0;
+  max-width: min(420px, calc(100vw - 180px));
+  gap: 2px;
+}
+
+.tag-manager-card__body > strong {
   max-width: min(280px, calc(100vw - 180px));
   overflow: hidden;
   color: var(--ink-soft);
@@ -4533,10 +4773,14 @@ kbd {
   white-space: nowrap;
 }
 
-.tag-manager-card > small {
-  flex: 0 0 auto;
+.tag-manager-card__body > small,
+.tag-manager-card__body > span {
+  max-width: 100%;
+  overflow: hidden;
   color: var(--ink-faint);
   font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tag-manager-card__actions {
@@ -6355,10 +6599,33 @@ kbd {
   .translation-settings__grid,
   .translation-credentials,
   .translation-status-grid,
+  .auto-tag-policy-grid,
+  .auto-tag-summary-grid,
+  .auto-tag-preview-metrics,
   .llm-settings__editor,
   .proxy-settings__connection,
   .proxy-targets {
     grid-template-columns: 1fr;
+  }
+
+  .auto-tag-workflow__heading,
+  .auto-tag-proposal-list > div,
+  .auto-tag-cleanup-row {
+    align-items: flex-start;
+  }
+
+  .auto-tag-cleanup-row {
+    flex-direction: column;
+  }
+
+  .auto-tag-cleanup-row__actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+  }
+
+  .auto-tag-workflow__heading > span,
+  .auto-tag-proposal-list > div > span:last-child {
+    text-align: left;
   }
 
   .proxy-target-row {

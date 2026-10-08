@@ -1,8 +1,8 @@
-import { type ChangeEvent, type FormEvent, useEffect, useMemo, useState } from "react";
+import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import { composeSiteIdentity, customizeSiteIdentity, supportsGeneratedIdentity } from "../domainThemes";
 import { t } from "../i18n";
-import type { AppSettings, AuthStatus, AutoTagStatus, CallLog, Domain, Feed, Folder, Job, LLMConnection, Locale, NetworkProxy, NetworkProxyTestResult, OnboardingProfile, ProxyMode, SiteIdentity, Tag, ThemeConfig, TranslationFallbackMode, TranslationProvider, TranslationProxyService, TranslationStatus, UpdateStatus } from "../types";
+import type { AppSettings, AuthStatus, AutoTagCleanupPreview, AutoTagGrowthMode, AutoTagPreview, AutoTagProposal, AutoTagStatus, CallLog, Domain, Feed, Folder, Job, LLMConnection, Locale, NetworkProxy, NetworkProxyTestResult, OnboardingProfile, ProxyMode, SiteIdentity, Tag, ThemeConfig, TranslationFallbackMode, TranslationProvider, TranslationProxyService, TranslationStatus, UpdateStatus } from "../types";
 import { errorText, formatDateTime, safeHttpUrl } from "../utils";
 import { Brand, ErrorNotice, Modal, SelectMenu, Spinner, Toggle } from "./Common";
 import { FeedManager } from "./FeedManager";
@@ -15,6 +15,46 @@ const TRANSLATION_PROXY_TARGETS: { id: TranslationProxyService; name: string; me
   { id: "google-cloud", name: "Google Cloud Translation", meta: "translation.googleapis.com" },
 ];
 const UPDATE_FAILURES = new Set<UpdateStatus["status"]>(["check_failed", "download_failed", "install_failed"]);
+const AUTO_TAG_SETTINGS = {
+  max_tags_per_entry: 3,
+  promotion_threshold: 10,
+  support_window_days: 365,
+  canonical_language: "en" as const,
+};
+const MIN_AUTO_TAG_CONFIDENCE = 0.8;
+const ACTIVE_AUTO_TAG_PREVIEW_STATUSES = new Set(["pending", "queued", "running"]);
+const READY_AUTO_TAG_PREVIEW_STATUSES = new Set(["complete", "completed", "ready", "success"]);
+
+function autoTagPolicyChanged(previous: AutoTagStatus | null, next: AutoTagStatus): boolean {
+  if (!previous) return false;
+  return previous.growth_mode !== next.growth_mode
+    || (previous.llm_connection_id ?? null) !== (next.llm_connection_id ?? null)
+    || (previous.model ?? null) !== (next.model ?? null)
+    || previous.max_tags_per_entry !== next.max_tags_per_entry
+    || previous.promotion_threshold !== next.promotion_threshold
+    || previous.support_window_days !== next.support_window_days
+    || previous.canonical_language !== next.canonical_language;
+}
+
+function autoTagStateLabel(status: string, locale: Locale): string {
+  const zh = locale === "zh-CN";
+  const labels: Record<string, [string, string]> = {
+    pending: ["等待中", "Pending"],
+    queued: ["已排队", "Queued"],
+    running: ["运行中", "Running"],
+    complete: ["已完成", "Complete"],
+    completed: ["已完成", "Complete"],
+    ready: ["可批准", "Ready"],
+    success: ["已完成", "Complete"],
+    failed: ["失败", "Failed"],
+    active: ["收集中", "Collecting"],
+    promoted: ["已晋升", "Promoted"],
+    merged: ["已合并", "Merged"],
+    applying: ["正在应用", "Applying"],
+    applied: ["已批准并应用", "Approved and applied"],
+  };
+  return labels[status]?.[zh ? 0 : 1] || status;
+}
 
 function updateStatusLabel(update: UpdateStatus, locale: Locale): string {
   const zh = locale === "zh-CN";
@@ -105,9 +145,18 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   const [translationRetrying, setTranslationRetrying] = useState(false);
   const [translationTest, setTranslationTest] = useState<{ tone: "success" | "error"; message: string } | null>(null);
   const [autoTag, setAutoTag] = useState<AutoTagStatus | null>(null);
-  const [autoTagCreateNew, setAutoTagCreateNew] = useState(false);
+  const [autoTagGrowthMode, setAutoTagGrowthMode] = useState<AutoTagGrowthMode>("closed");
   const [autoTagLlmConnectionId, setAutoTagLlmConnectionId] = useState("");
   const [autoTagSaving, setAutoTagSaving] = useState(false);
+  const [autoTagProposals, setAutoTagProposals] = useState<AutoTagProposal[]>([]);
+  const [autoTagPreview, setAutoTagPreview] = useState<AutoTagPreview | null>(null);
+  const [autoTagPreviewBusy, setAutoTagPreviewBusy] = useState(false);
+  const [autoTagApproving, setAutoTagApproving] = useState(false);
+  const [autoTagCleanup, setAutoTagCleanup] = useState<AutoTagCleanupPreview | null>(null);
+  const [autoTagCleanupRemoveIds, setAutoTagCleanupRemoveIds] = useState<number[]>([]);
+  const [autoTagCleanupBusy, setAutoTagCleanupBusy] = useState(false);
+  const autoTagCleanupRefreshId = useRef(0);
+  const autoTagPreviewGeneration = useRef(0);
   const [brandName, setBrandName] = useState("");
   const [brandLogo, setBrandLogo] = useState("");
   const [brandLogoName, setBrandLogoName] = useState("");
@@ -182,7 +231,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
           api.domains(),
         ]);
         setAutoTag(status);
-        setAutoTagCreateNew(status.create_new);
+        setAutoTagGrowthMode(status.growth_mode || (status.create_new ? "threshold" : "closed"));
         setAutoTagLlmConnectionId(status.llm_connection_id ? String(status.llm_connection_id) : "");
         setLlmConnections(connections);
         setFeeds(nextFeeds);
@@ -194,11 +243,39 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       }
     };
     void refresh();
+    void api.autoTagProposals(0, 200).then((value) => setAutoTagProposals(value.items)).catch(() => undefined);
+    const previewGeneration = autoTagPreviewGeneration.current;
+    void api.autoTagPreviews()
+      .then((items) => setAutoTagPreviewForGeneration(items.at(0) || null, previewGeneration))
+      .catch(() => undefined);
     const timer = window.setInterval(() => {
       void api.autoTagStatus().then(setAutoTag).catch(() => undefined);
+      void api.autoTagProposals(0, 200).then((value) => setAutoTagProposals(value.items)).catch(() => undefined);
     }, 5000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      autoTagPreviewGeneration.current += 1;
+    };
   }, [settingsPage]);
+  useEffect(() => {
+    if (settingsPage !== "content" || !autoTagPreview || !ACTIVE_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status)) return;
+    const previewGeneration = autoTagPreviewGeneration.current;
+    let latestPollRequestId = 0;
+    const timer = window.setInterval(() => {
+      const requestId = ++latestPollRequestId;
+      void api.autoTagPreview(autoTagPreview.id)
+        .then((preview) => {
+          if (requestId === latestPollRequestId) {
+            setAutoTagPreviewForGeneration(preview, previewGeneration);
+          }
+        })
+        .catch(() => undefined);
+    }, 2000);
+    return () => {
+      latestPollRequestId += 1;
+      window.clearInterval(timer);
+    };
+  }, [autoTagPreview?.id, autoTagPreview?.status, settingsPage]);
   useEffect(() => {
     if (settingsPage !== "activity") return;
     void api.jobs(20).then(setJobs).catch((caught) => setError(errorText(caught)));
@@ -250,6 +327,20 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     setProxyFeedModes(proxy.feed_modes);
     setProxyLlmConnectionModes(proxy.llm_connection_modes);
     setProxyTranslationServiceModes(proxy.translation_service_modes);
+  }
+  function nextAutoTagPreviewGeneration(): number {
+    autoTagPreviewGeneration.current += 1;
+    return autoTagPreviewGeneration.current;
+  }
+  function setAutoTagPreviewForGeneration(preview: AutoTagPreview | null, generation: number): boolean {
+    if (generation !== autoTagPreviewGeneration.current) return false;
+    setAutoTagPreview(preview);
+    return true;
+  }
+  function clearAutoTagPreview(): number {
+    const generation = nextAutoTagPreviewGeneration();
+    setAutoTagPreview(null);
+    return generation;
   }
   async function loadCallLogs(showLoading = false) {
     if (showLoading) setCallLogsLoading(true);
@@ -478,17 +569,195 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     try {
       const updated = await api.setAutoTagStatus({
         enabled,
-        create_new: autoTagCreateNew,
+        create_new: false,
+        growth_mode: autoTagGrowthMode,
         llm_connection_id: autoTagLlmConnectionId ? Number(autoTagLlmConnectionId) : null,
+        ...AUTO_TAG_SETTINGS,
       });
+      const policyChanged = autoTagPolicyChanged(autoTag, updated);
       setAutoTag(updated);
-      setAutoTagCreateNew(updated.create_new);
+      setAutoTagGrowthMode(updated.growth_mode || autoTagGrowthMode);
       setAutoTagLlmConnectionId(updated.llm_connection_id ? String(updated.llm_connection_id) : "");
+      if (policyChanged) await invalidateAutoTagWorkflow();
       notify(locale === "zh-CN" ? "自动打标签设置已保存。" : "Auto-tagging settings saved.");
     } catch (caught) {
       notify(errorText(caught), "error");
     } finally {
       setAutoTagSaving(false);
+    }
+  }
+  async function loadAutoTagCleanupPreview() {
+    setAutoTagCleanupBusy(true);
+    const refreshId = ++autoTagCleanupRefreshId.current;
+    try {
+      const preview = await api.autoTagCleanupPreview();
+      if (refreshId === autoTagCleanupRefreshId.current) {
+        setAutoTagCleanup(preview);
+        setAutoTagCleanupRemoveIds([]);
+      }
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setAutoTagCleanupBusy(false);
+    }
+  }
+  async function invalidateAutoTagWorkflow(): Promise<boolean> {
+    const refreshId = ++autoTagCleanupRefreshId.current;
+    clearAutoTagPreview();
+    setAutoTagCleanupRemoveIds([]);
+    setAutoTagCleanup((current) => current ? { ...current, reviewed: false } : null);
+    try {
+      const cleanup = await api.autoTagCleanupPreview();
+      if (refreshId === autoTagCleanupRefreshId.current) setAutoTagCleanup(cleanup);
+      return refreshId === autoTagCleanupRefreshId.current;
+    } catch {
+      if (refreshId === autoTagCleanupRefreshId.current) {
+        setAutoTagCleanup((current) => current ? { ...current, reviewed: false } : null);
+      }
+      return false;
+    }
+  }
+  async function confirmAutoTagCleanupReview() {
+    if (!autoTagCleanup) return;
+    const confirmed = window.confirm(locale === "zh-CN"
+      ? "确认已审阅当前清理预览？即使没有疑似关联，也必须完成这一步后才能运行 50 篇试跑。"
+      : "Confirm that you reviewed the current cleanup preview? This step is required before the 50-article preview, even when no inferred links were found.");
+    if (!confirmed) return;
+    setAutoTagCleanupBusy(true);
+    try {
+      await api.cleanupAutoTags({
+        remove_tag_ids: [],
+        keep_tag_ids: [],
+        review_token: autoTagCleanup.review_token,
+      });
+      const reviewed = await api.autoTagCleanupPreview();
+      setAutoTagCleanup(reviewed);
+      setAutoTagCleanupRemoveIds([]);
+      clearAutoTagPreview();
+      notify(locale === "zh-CN" ? "清理预览已确认，可以运行 50 篇试跑。" : "Cleanup review confirmed. The 50-article preview is now available.");
+    } catch (caught) {
+      await invalidateAutoTagWorkflow();
+      notify(errorText(caught), "error");
+    } finally {
+      setAutoTagCleanupBusy(false);
+    }
+  }
+  function toggleAutoTagCleanupItem(tagId: number) {
+    setAutoTagCleanupRemoveIds((current) => current.includes(tagId) ? current.filter((id) => id !== tagId) : [...current, tagId]);
+  }
+  async function runAutoTagCleanup() {
+    if (!autoTagCleanup || autoTagCleanupRemoveIds.length === 0) return;
+    const names = autoTagCleanup.items.filter((item) => autoTagCleanupRemoveIds.includes(item.tag_id)).map((item) => item.name);
+    const confirmed = window.confirm(locale === "zh-CN"
+      ? `移除 ${names.length} 个所选标签的疑似自动关联？仍有手动关联、Feed 或活动简报引用的标签会保留；无剩余引用的标签才会删除。此操作无法撤销。\n\n${names.join("、")}`
+      : `Remove inferred automatic associations for ${names.length} selected tags? Tags with manual links, Feed assignments, or active brief references are retained; only unreferenced tags are deleted. This cannot be undone.\n\n${names.join(", ")}`);
+    if (!confirmed) return;
+    setAutoTagCleanupBusy(true);
+    try {
+      const removeIds = [...autoTagCleanupRemoveIds];
+      const result = await api.cleanupAutoTags({
+        remove_tag_ids: removeIds,
+        keep_tag_ids: [],
+        review_token: autoTagCleanup.review_token,
+      });
+      setAutoTagCleanup(await api.autoTagCleanupPreview());
+      setAutoTagCleanupRemoveIds([]);
+      clearAutoTagPreview();
+      await refreshTags();
+      notify(locale === "zh-CN"
+        ? `已移除 ${result.removed_count ?? 0} 条疑似自动关联。`
+        : `Removed ${result.removed_count ?? 0} inferred automatic associations.`);
+    } catch (caught) {
+      await invalidateAutoTagWorkflow();
+      notify(errorText(caught), "error");
+    } finally {
+      setAutoTagCleanupBusy(false);
+    }
+  }
+  async function keepAutoTagCleanupItem(tagId: number, name: string) {
+    if (!autoTagCleanup) return;
+    const confirmed = window.confirm(locale === "zh-CN"
+      ? `把“${name}”的疑似自动关联保留为手动标签？之后自动重打不会撤销这些关联。`
+      : `Keep the inferred automatic associations for “${name}” as manual tags? Future automatic retagging will not revoke them.`);
+    if (!confirmed) return;
+    setAutoTagCleanupBusy(true);
+    try {
+      await api.cleanupAutoTags({
+        remove_tag_ids: [],
+        keep_tag_ids: [tagId],
+        review_token: autoTagCleanup.review_token,
+      });
+      setAutoTagCleanup(await api.autoTagCleanupPreview());
+      setAutoTagCleanupRemoveIds((current) => current.filter((id) => id !== tagId));
+      clearAutoTagPreview();
+      await refreshTags();
+      notify(locale === "zh-CN" ? "所选关联已保留为手动标签。" : "The selected associations are now manual tags.");
+    } catch (caught) {
+      await invalidateAutoTagWorkflow();
+      notify(errorText(caught), "error");
+    } finally {
+      setAutoTagCleanupBusy(false);
+    }
+  }
+  async function startAutoTagPreview() {
+    if (!autoTagCleanup?.reviewed) {
+      notify(locale === "zh-CN" ? "请先预览并确认清理结果。" : "Preview and confirm cleanup before running the 50-article preview.", "error");
+      return;
+    }
+    setAutoTagPreviewBusy(true);
+    const previewGeneration = nextAutoTagPreviewGeneration();
+    try {
+      const review = await api.autoTagCleanupPreview();
+      if (previewGeneration !== autoTagPreviewGeneration.current) return;
+      setAutoTagCleanup(review);
+      if (!review.reviewed) {
+        clearAutoTagPreview();
+        notify(locale === "zh-CN" ? "清理内容已变化，请重新审阅并确认。" : "Cleanup candidates changed. Review and confirm them again.", "error");
+        return;
+      }
+      const preview = await api.createAutoTagPreview({ sample_size: 50 });
+      if (!setAutoTagPreviewForGeneration(preview, previewGeneration)) return;
+      notify(locale === "zh-CN" ? "50 篇文章试跑已开始。" : "The 50-article preview has started.");
+    } catch (caught) {
+      if (previewGeneration === autoTagPreviewGeneration.current) {
+        await invalidateAutoTagWorkflow();
+        notify(errorText(caught), "error");
+      }
+    } finally {
+      setAutoTagPreviewBusy(false);
+    }
+  }
+  async function approveAutoTagPreview() {
+    if (!autoTagPreview || !READY_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status) || !autoTagCleanup?.reviewed) return;
+    const calls = autoTag?.estimated_calls ?? 0;
+    const confirmed = window.confirm(locale === "zh-CN"
+      ? `批准试跑结果并处理全部待处理文章？预计需要 ${calls} 次 LLM 调用。`
+      : `Approve this preview and process every pending article? About ${calls} LLM calls are estimated.`);
+    if (!confirmed) return;
+    setAutoTagApproving(true);
+    const preview = autoTagPreview;
+    const previewGeneration = nextAutoTagPreviewGeneration();
+    try {
+      const review = await api.autoTagCleanupPreview();
+      if (previewGeneration !== autoTagPreviewGeneration.current) return;
+      setAutoTagCleanup(review);
+      if (!review.reviewed) {
+        clearAutoTagPreview();
+        notify(locale === "zh-CN" ? "清理内容已变化，请重新审阅并重新试跑。" : "Cleanup candidates changed. Review them and run a new preview.", "error");
+        return;
+      }
+      const updated = await api.approveAutoTagPreview(preview.id, { scope: "all" });
+      if (previewGeneration !== autoTagPreviewGeneration.current) return;
+      setAutoTag(updated);
+      setAutoTagPreviewForGeneration({ ...preview, status: "applied" }, previewGeneration);
+      notify(locale === "zh-CN" ? "已批准全量自动打标签。" : "Full auto-tagging approved.");
+    } catch (caught) {
+      if (previewGeneration === autoTagPreviewGeneration.current) {
+        await invalidateAutoTagWorkflow();
+        notify(errorText(caught), "error");
+      }
+    } finally {
+      setAutoTagApproving(false);
     }
   }
   async function refreshTags() {
@@ -499,9 +768,11 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     if (!tagDraft.trim()) return;
     setTagBusy(true);
     try {
-      await api.createTag(tagDraft.trim());
+      const created = await api.createTag(tagDraft.trim());
+      const cleanupRefresh = invalidateAutoTagWorkflow();
+      setTags((current) => current.some((tag) => tag.id === created.id) ? current : [...current, created]);
       setTagDraft("");
-      await refreshTags();
+      await Promise.allSettled([refreshTags(), cleanupRefresh]);
       notify(locale === "zh-CN" ? "标签已创建。" : "Tag created.");
     } catch (caught) {
       notify(errorText(caught), "error");
@@ -516,9 +787,11 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     }
     setTagBusyId(tag.id);
     try {
-      await api.updateTag(tag.id, { name: tagEditDraft.trim() });
+      const updated = await api.updateTag(tag.id, { name: tagEditDraft.trim(), color: tag.color });
+      const cleanupRefresh = invalidateAutoTagWorkflow();
+      setTags((current) => current.map((currentTag) => currentTag.id === tag.id ? { ...currentTag, ...updated } : currentTag));
       setEditingTagId(null);
-      await refreshTags();
+      await Promise.allSettled([refreshTags(), cleanupRefresh]);
       notify(locale === "zh-CN" ? "标签已重命名。" : "Tag renamed.");
     } catch (caught) {
       notify(errorText(caught), "error");
@@ -526,12 +799,92 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       setTagBusyId(null);
     }
   }
+  async function editTagDetails(tag: Tag) {
+    const description = window.prompt(
+      locale === "zh-CN" ? `“${tag.name}”的描述（可留空）` : `Description for “${tag.name}” (optional)`,
+      tag.description || "",
+    );
+    if (description === null) return;
+    const aliasesText = window.prompt(
+      locale === "zh-CN" ? "别名（用逗号或换行分隔）" : "Aliases (separate with commas or new lines)",
+      (tag.aliases || []).join(", "),
+    );
+    if (aliasesText === null) return;
+    const autoUse = window.prompt(
+      locale === "zh-CN" ? "允许自动使用此标签？输入 yes 或 no" : "Allow automatic use of this tag? Enter yes or no",
+      tag.auto_assignable === false ? "no" : "yes",
+    );
+    if (autoUse === null) return;
+    const normalizedAutoUse = autoUse.trim().toLocaleLowerCase();
+    if (!["yes", "y", "true", "1", "是", "no", "n", "false", "0", "否"].includes(normalizedAutoUse)) {
+      notify(locale === "zh-CN" ? "请输入 yes 或 no。" : "Enter yes or no.", "error");
+      return;
+    }
+    const aliases = aliasesText.split(/[,，\n]/).map((value) => value.trim()).filter(Boolean);
+    setTagBusyId(tag.id);
+    try {
+      const updated = await api.updateTag(tag.id, {
+        name: tag.name,
+        color: tag.color,
+        description,
+        aliases,
+        auto_assignable: ["yes", "y", "true", "1", "是"].includes(normalizedAutoUse),
+      });
+      const cleanupRefresh = invalidateAutoTagWorkflow();
+      setTags((current) => current.map((currentTag) => currentTag.id === tag.id ? { ...currentTag, ...updated } : currentTag));
+      await Promise.allSettled([refreshTags(), cleanupRefresh]);
+      notify(locale === "zh-CN" ? "标签详情已保存。" : "Tag details saved.");
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setTagBusyId(null);
+    }
+  }
+  async function mergeTagInto(sourceId: number, sourceName: string) {
+    const targetInput = window.prompt(
+      locale === "zh-CN"
+        ? `将“${sourceName}”合并到哪个正式标签？请输入目标标签的精确名称或 ID。`
+        : `Merge “${sourceName}” into which canonical tag? Enter the exact target name or ID.`,
+    );
+    if (targetInput === null || !targetInput.trim()) return;
+    const value = targetInput.trim();
+    const numericId = /^\d+$/.test(value) ? Number(value) : null;
+    const target = tags.find((tag) => tag.id !== sourceId && (tag.id === numericId || tag.name.toLocaleLowerCase() === value.toLocaleLowerCase()));
+    if (!target) {
+      notify(locale === "zh-CN" ? "没有找到该目标标签，或不能合并到自身。" : "That target tag was not found, or it is the source tag.", "error");
+      return;
+    }
+    const confirmed = window.confirm(locale === "zh-CN"
+      ? `确认把“${sourceName}”合并到“${target.name}”？文章、Feed、自动标签记录和活动简报计划都会重映射，旧名称会成为别名。`
+      : `Merge “${sourceName}” into “${target.name}”? Article and Feed links, auto-tag records, and active brief schedules will be remapped; the old name becomes an alias.`);
+    if (!confirmed) return;
+    setTagBusyId(sourceId);
+    try {
+      const mergedTarget = await api.mergeTags(sourceId, target.id);
+      const cleanupRefresh = invalidateAutoTagWorkflow();
+      setTags((current) => {
+        const remaining = current.filter((tag) => tag.id !== sourceId);
+        if (remaining.some((tag) => tag.id === target.id)) {
+          return remaining.map((tag) => tag.id === target.id ? { ...tag, ...mergedTarget } : tag);
+        }
+        return [...remaining, mergedTarget];
+      });
+      await Promise.allSettled([refreshTags(), cleanupRefresh]);
+      notify(locale === "zh-CN" ? `已合并到“${target.name}”。` : `Merged into “${target.name}”.`);
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setTagBusyId(null);
+    }
+  }
   async function removeTag(tag: Tag) {
-    if (!window.confirm(locale === "zh-CN" ? `删除标签“${tag.name}”？文章不会受影响。` : `Delete tag “${tag.name}”? Articles are not affected.`)) return;
+    if (!window.confirm(locale === "zh-CN" ? `删除未使用的标签“${tag.name}”？仍有关联或活动引用时服务器会拒绝删除。` : `Delete unused tag “${tag.name}”? The server will reject deletion while associations or active references remain.`)) return;
     setTagBusyId(tag.id);
     try {
       await api.deleteTag(tag.id);
-      await refreshTags();
+      const cleanupRefresh = invalidateAutoTagWorkflow();
+      setTags((current) => current.filter((currentTag) => currentTag.id !== tag.id));
+      await Promise.allSettled([refreshTags(), cleanupRefresh]);
       notify(locale === "zh-CN" ? "标签已删除。" : "Tag deleted.");
     } catch (caught) {
       notify(errorText(caught), "error");
@@ -822,15 +1175,30 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
         {tags.map((tag) => {
           const editing = editingTagId === tag.id;
           const count = tag.entry_count ?? 0;
+          const originLabel = tag.origin === "auto_promoted"
+            ? (zh ? "自动晋升" : "promoted")
+            : tag.origin === "legacy"
+              ? (zh ? "历史" : "legacy")
+              : (zh ? "手动" : "manual");
           return <div className={`tag-manager-card ${editing ? "is-editing" : ""}`} key={tag.id}>
             <span className="tag-manager-card__dot" style={{ backgroundColor: tag.color || "#8878e8" }} aria-hidden="true" />
             {editing
               ? <label className="field tag-manager-card__edit"><input aria-label={zh ? `重命名标签 ${tag.name}` : `Rename tag ${tag.name}`} value={tagEditDraft} onChange={(event) => setTagEditDraft(event.target.value)} maxLength={120} autoFocus onKeyDown={(event) => { if (event.key === "Enter") void renameTag(tag); if (event.key === "Escape") setEditingTagId(null); }} /></label>
-              : <><strong title={tag.name}>{tag.name}</strong><small title={zh ? `${count} 篇文章` : `${count} entries`}>{count}</small></>}
+              : <div className="tag-manager-card__body">
+                <strong title={tag.name}>{tag.name}</strong>
+                <small>{zh ? `${count} 篇 · ${originLabel}` : `${count} entries · ${originLabel}`} · {tag.auto_assignable === false ? (zh ? "禁止自动使用" : "manual only") : (zh ? "可自动使用" : "auto allowed")}</small>
+                {tag.description && <span>{tag.description}</span>}
+                {(tag.aliases?.length ?? 0) > 0 && <span>{zh ? "别名" : "Aliases"}: {tag.aliases?.join(" · ")}</span>}
+              </div>}
             <div className="tag-manager-card__actions">
               {editing
                 ? <><button type="button" className="button button--primary button--small" disabled={tagBusyId === tag.id || !tagEditDraft.trim()} onClick={() => void renameTag(tag)}>{t(locale, "save")}</button><button type="button" className="text-button" onClick={() => setEditingTagId(null)}>{zh ? "取消" : "Cancel"}</button></>
-                : <><button type="button" className="tag-manager-card__icon" aria-label={zh ? `重命名标签 ${tag.name}` : `Rename tag ${tag.name}`} onClick={() => { setEditingTagId(tag.id); setTagEditDraft(tag.name); }}>✎</button><button type="button" className="tag-manager-card__icon tag-manager-card__icon--danger" aria-label={zh ? `删除标签 ${tag.name}` : `Delete tag ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => void removeTag(tag)}>×</button></>}
+                : <>
+                  <button type="button" className="tag-manager-card__icon" aria-label={zh ? `编辑标签详情 ${tag.name}` : `Edit tag details ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => void editTagDetails(tag)}>ⓘ</button>
+                  <button type="button" className="tag-manager-card__icon" aria-label={zh ? `合并标签 ${tag.name}` : `Merge tag ${tag.name}`} disabled={tagBusyId === tag.id || tags.length < 2} onClick={() => void mergeTagInto(tag.id, tag.name)}>⇢</button>
+                  <button type="button" className="tag-manager-card__icon" aria-label={zh ? `重命名标签 ${tag.name}` : `Rename tag ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => { setEditingTagId(tag.id); setTagEditDraft(tag.name); }}>✎</button>
+                  <button type="button" className="tag-manager-card__icon tag-manager-card__icon--danger" aria-label={zh ? `删除标签 ${tag.name}` : `Delete tag ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => void removeTag(tag)}>×</button>
+                </>}
             </div>
           </div>;
         })}
@@ -841,21 +1209,31 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
         {autoTag && <Toggle checked={autoTag.enabled} onChange={(value) => void saveAutoTag(value)} label={autoTag.enabled ? "On" : "Off"} />}
       </div>
       <p className="provider-warning">{locale === "zh-CN"
-        ? `开启后，文章标题与摘要会发送给所选 LLM 服务以自动附加标签（每篇最多 ${autoTag?.max_tags_per_entry ?? 5} 个）。自动附加的标签会随内容变化更新；你手动添加的标签不会被改动。`
-        : `When enabled, article titles and summaries are sent to the selected LLM provider for tagging (up to ${autoTag?.max_tags_per_entry ?? 5} per article). Auto-attached tags update when content changes; tags you add by hand are never touched.`}</p>
+        ? "文章数据只外发批次内临时编号、标题与摘要；为选择受控主题，还会发送筛选后的正式标签/候选名称、描述和别名。作者、Feed、领域、RSS categories、正文及数据库 ID 仅在本地使用。每篇允许 0–3 个自动标签，手动标签永远不会被自动重打改动。"
+        : "Article data sent to the selected LLM is limited to a batch-local identifier, title, and summary. The selected canonical/proposal names, descriptions, and aliases are also sent so the model can choose controlled topics. Authors, Feeds, domains, RSS categories, full text, and database IDs stay local. Each article may receive 0–3 automatic tags; automatic retagging never changes manual tags."}</p>
       <div className="translation-settings__grid">
         <label className="field"><span>{locale === "zh-CN" ? "用于打标签的 LLM 连接" : "LLM connection for tagging"}</span>
           {llmConnections.length ? <SelectMenu value={autoTagLlmConnectionId} onChange={(value) => setAutoTagLlmConnectionId(value)} label={locale === "zh-CN" ? "用于打标签的 LLM 连接" : "LLM connection for tagging"} placeholder={locale === "zh-CN" ? "选择 LLM 连接" : "Choose LLM connection"} options={llmConnections.map((connection) => ({ value: String(connection.id), label: `${connection.name} · ${connection.model}` }))} /> : <p className="provider-warning">{locale === "zh-CN" ? "尚未添加 LLM 连接。请先在上方“LLM 连接”区域添加。" : "No LLM connection exists. Add one in the LLM connections section above."}</p>}
         </label>
+        <label className="field"><span>{locale === "zh-CN" ? "标签库增长方式" : "Tag-library growth"}</span>
+          <SelectMenu value={autoTagGrowthMode} onChange={setAutoTagGrowthMode} label={locale === "zh-CN" ? "标签库增长方式" : "Tag-library growth"} options={[
+            { value: "closed", label: locale === "zh-CN" ? "受控标签库" : "Closed library" },
+            { value: "threshold", label: locale === "zh-CN" ? "阈值扩展" : "Threshold growth" },
+          ]} />
+        </label>
       </div>
-      {autoTag?.enabled && (
-        <div className="translation-settings__fallback-note auto-tag-create-new">
-          <Toggle checked={autoTagCreateNew} onChange={setAutoTagCreateNew} label={locale === "zh-CN" ? "允许 LLM 创建新标签，并将新标签纳入标签库" : "Allow the LLM to create new tags and add them to the library"} />
-          <p>{locale === "zh-CN"
-            ? "关闭时只从现有标签中选择；开启后 LLM 可在找不到合适标签时新建标签。"
-            : "Off: the LLM picks only from existing tags. On: it may also invent new tags."}</p>
-        </div>
-      )}
+      <div className="translation-settings__fallback-note auto-tag-policy-note">
+        <strong>{autoTagGrowthMode === "closed" ? (locale === "zh-CN" ? "受控标签库" : "Closed library") : (locale === "zh-CN" ? "阈值扩展" : "Threshold growth")}</strong>
+        <p>{autoTagGrowthMode === "closed"
+          ? (locale === "zh-CN" ? "LLM 只能选择已有标签；没有合适标签时返回空结果。" : "The LLM can only select existing tags and returns no tags when none fit.")
+          : (locale === "zh-CN" ? "新主题先进入候选池；只有在 365 天内获得至少 10 个不同 Work 支持后才会晋升，不会因单篇文章立即创建标签。" : "New topics enter a proposal pool and are promoted only after support from at least 10 distinct Works within 365 days; one article never creates a tag immediately.")}</p>
+      </div>
+      <div className="auto-tag-policy-grid" aria-label={locale === "zh-CN" ? "自动打标签固定参数" : "Fixed auto-tagging parameters"}>
+        <div><span>{locale === "zh-CN" ? "每篇标签" : "Tags per article"}</span><strong>0–{autoTag?.max_tags_per_entry ?? AUTO_TAG_SETTINGS.max_tags_per_entry}</strong></div>
+        <div><span>{locale === "zh-CN" ? "晋升阈值" : "Promotion threshold"}</span><strong>{autoTag?.promotion_threshold ?? AUTO_TAG_SETTINGS.promotion_threshold} Work / {autoTag?.support_window_days ?? AUTO_TAG_SETTINGS.support_window_days} {locale === "zh-CN" ? "天" : "days"}</strong></div>
+        <div><span>{locale === "zh-CN" ? "规范语言" : "Canonical language"}</span><strong>English</strong></div>
+        <div><span>{locale === "zh-CN" ? "最低置信度" : "Minimum confidence"}</span><strong>{Math.round((autoTag?.min_confidence ?? MIN_AUTO_TAG_CONFIDENCE) * 100)}%</strong></div>
+      </div>
       <div className="translation-settings__actions">
         <button type="button" className="button button--primary button--small" disabled={autoTagSaving || (autoTag?.enabled && !autoTagLlmConnectionId)} onClick={() => void saveAutoTag()}>{autoTagSaving ? (locale === "zh-CN" ? "正在保存…" : "Saving…") : t(locale, "save")}</button>
       </div>
@@ -877,7 +1255,72 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
           <strong>{autoTag?.failed_count ?? 0}</strong>
         </div>
       </div>
+      <div className="auto-tag-summary-grid" aria-label={locale === "zh-CN" ? "自动标签增长统计" : "Auto-tag growth statistics"}>
+        <div><span>{locale === "zh-CN" ? "候选主题" : "Proposals"}</span><strong>{autoTag?.proposal_count ?? 0}</strong></div>
+        <div><span>{locale === "zh-CN" ? "已晋升" : "Promoted"}</span><strong>{autoTag?.promoted_count ?? 0}</strong></div>
+        <div><span>{locale === "zh-CN" ? "预计 LLM 调用" : "Estimated LLM calls"}</span><strong>{autoTag?.estimated_calls ?? 0}</strong></div>
+        <div><span>{locale === "zh-CN" ? "需要重建" : "Needs rebuild"}</span><strong>{autoTag?.outdated_count ?? 0}</strong></div>
+      </div>
+      {autoTag?.needs_rebuild && <div className="auto-tag-rebuild-notice" role="status">
+        <strong>{locale === "zh-CN" ? "策略或标签库已变化" : "The policy or tag library changed"}</strong>
+        <span>{locale === "zh-CN"
+          ? `${autoTag.outdated_count} 篇文章的旧结果需要重建。系统不会静默调用 LLM；请重新试跑并明确批准。`
+          : `${autoTag.outdated_count} articles have outdated results. The system will not call the LLM silently; run a new preview and explicitly approve it.`}</span>
+      </div>}
       <p className="muted">{autoTag?.configured ? (locale === "zh-CN" ? "LLM 连接已就绪。" : "LLM connection ready.") : (locale === "zh-CN" ? "尚未绑定 LLM 连接，开启前请先选择。" : "No LLM connection bound; choose one before enabling.")}</p>
+      {autoTagProposals.length > 0 && <div className="auto-tag-proposals">
+        <div className="auto-tag-workflow__heading"><strong>{locale === "zh-CN" ? "候选主题与晋升记录" : "Topic proposals and promotions"}</strong><span>{locale === "zh-CN" ? `活跃 ${autoTag?.proposal_count ?? 0} · 已晋升 ${autoTag?.promoted_count ?? 0}` : `Active ${autoTag?.proposal_count ?? 0} · promoted ${autoTag?.promoted_count ?? 0}`}</span></div>
+        <div className="auto-tag-proposal-list">{autoTagProposals.map((proposal) => <div key={proposal.id}>
+          <span><strong>{proposal.name}</strong>{proposal.description && <small>{proposal.description}</small>}{proposal.aliases.length > 0 && <small>{locale === "zh-CN" ? "别名" : "Aliases"}: {proposal.aliases.join(" · ")}</small>}</span>
+          <span>{proposal.support_count} Work · {autoTagStateLabel(proposal.status, locale)}{proposal.promoted_tag_id ? ` → ${tags.find((tag) => tag.id === proposal.promoted_tag_id)?.name || `#${proposal.promoted_tag_id}`}` : ""}</span>
+        </div>)}</div>
+      </div>}
+      {(autoTag?.preview_required || autoTag?.needs_rebuild) && <div className="auto-tag-workflow">
+        <div className="auto-tag-workflow__heading">
+          <div><span className="eyebrow">SAFE START</span><strong>{locale === "zh-CN" ? "清理并试跑" : "Clean up and preview"}</strong></div>
+          <span>{locale === "zh-CN" ? "批准前不会全量处理" : "No full run before approval"}</span>
+        </div>
+        <p>{locale === "zh-CN" ? "先检查旧的低质量标签，再用跨订阅源抽样的 50 篇文章验证新规则。试跑遵循上方相同的数据外发边界。" : "Review low-quality legacy tags, then validate the new policy on a 50-article cross-Feed sample. The preview uses the same outbound-data boundary described above."}</p>
+        <div className="translation-settings__actions">
+          <button type="button" className="button button--secondary button--small" disabled={autoTagCleanupBusy} onClick={() => void loadAutoTagCleanupPreview()}>{autoTagCleanupBusy ? (locale === "zh-CN" ? "正在检查…" : "Checking…") : autoTagCleanup ? (locale === "zh-CN" ? "刷新清理预览" : "Refresh cleanup preview") : (locale === "zh-CN" ? "预览可清理标签" : "Preview cleanup")}</button>
+          <button type="button" className="button button--secondary button--small" disabled={autoTagPreviewBusy || autoTagCleanupBusy || !autoTag?.configured || !autoTagCleanup?.reviewed} title={!autoTagCleanup?.reviewed ? (locale === "zh-CN" ? "请先加载并确认清理预览" : "Load and confirm the cleanup preview first") : undefined} onClick={() => void startAutoTagPreview()}>{autoTagPreviewBusy ? (locale === "zh-CN" ? "正在启动…" : "Starting…") : (locale === "zh-CN" ? "运行 50 篇试跑" : "Run 50-article preview")}</button>
+        </div>
+        {autoTagCleanup && <div className="auto-tag-cleanup-preview">
+          <div className="auto-tag-workflow__heading"><strong>{locale === "zh-CN" ? "清理预览" : "Cleanup preview"}</strong><span>{autoTagCleanup.inferred_auto_association_count} {locale === "zh-CN" ? "条推断自动关联" : "inferred automatic links"} · {autoTagCleanup.reviewed ? (locale === "zh-CN" ? "已确认" : "confirmed") : (locale === "zh-CN" ? "待确认" : "confirmation required")}</span></div>
+          {autoTagCleanup.items.length === 0 ? <p>{locale === "zh-CN" ? "没有需要清理的标签。" : "No cleanup candidates found."}</p> : <div className="auto-tag-cleanup-list">{autoTagCleanup.items.map((item) => <div className="auto-tag-cleanup-row" key={item.tag_id}>
+            <label>
+              <input type="checkbox" checked={autoTagCleanupRemoveIds.includes(item.tag_id)} onChange={() => toggleAutoTagCleanupItem(item.tag_id)} />
+              <span><strong>{item.name}</strong><small>{locale === "zh-CN" ? `共 ${item.total_count} · 自动来源 ${item.auto_count} · 疑似记录 ${item.inferred_auto_count} · 历史 ${item.legacy_count} · 手动 ${item.manual_count}` : `Total ${item.total_count} · auto sources ${item.auto_count} · inferred records ${item.inferred_auto_count} · legacy ${item.legacy_count} · manual ${item.manual_count}`}</small></span>
+            </label>
+            <div className="auto-tag-cleanup-row__actions">
+              {!item.deletable && <em>{locale === "zh-CN" ? "移除关联后保留标签" : "Tag retained after unlinking"}</em>}
+              <button type="button" className="button button--secondary button--small" disabled={autoTagCleanupBusy} onClick={() => void keepAutoTagCleanupItem(item.tag_id, item.name)}>{locale === "zh-CN" ? "保留为手动" : "Keep as manual"}</button>
+              <button type="button" className="button button--secondary button--small" disabled={autoTagCleanupBusy || tags.length < 2} onClick={() => void mergeTagInto(item.tag_id, item.name)}>{locale === "zh-CN" ? "合并" : "Merge"}</button>
+            </div>
+          </div>)}</div>}
+          <div className="translation-settings__actions">
+            <button type="button" className="button button--danger-quiet button--small" disabled={autoTagCleanupBusy || autoTagCleanupRemoveIds.length === 0} onClick={() => void runAutoTagCleanup()}>{locale === "zh-CN" ? `移除所选疑似关联 (${autoTagCleanupRemoveIds.length})` : `Remove selected inferred links (${autoTagCleanupRemoveIds.length})`}</button>
+            {!autoTagCleanup.reviewed && <button type="button" className="button button--primary button--small" disabled={autoTagCleanupBusy} onClick={() => void confirmAutoTagCleanupReview()}>{locale === "zh-CN" ? "确认已审阅清理预览" : "Confirm cleanup review"}</button>}
+          </div>
+          {autoTagCleanup.reviewed && <div className="auto-tag-review-status" role="status"><strong>✓ {locale === "zh-CN" ? "清理预览已确认" : "Cleanup review confirmed"}</strong><span>{locale === "zh-CN" ? "现在可以运行 50 篇试跑；若清理快照变化，必须重新确认。" : "You can now run the 50-article preview. A changed cleanup snapshot must be confirmed again."}</span></div>}
+        </div>}
+        {autoTagPreview && <div className="auto-tag-preview-result" aria-live="polite">
+          <div className="auto-tag-workflow__heading"><strong>{locale === "zh-CN" ? "试跑结果" : "Preview result"}</strong><span>{autoTagStateLabel(autoTagPreview.status, locale)} · {autoTagPreview.sample_size}</span></div>
+          {autoTagPreview.last_error && <ErrorNotice message={autoTagPreview.last_error} />}
+          {Object.keys(autoTagPreview.metrics).length > 0 && <div className="auto-tag-preview-metrics">
+            <div><span>{locale === "zh-CN" ? "已分类" : "Classified"}</span><strong>{Number(autoTagPreview.metrics.classified_count ?? 0)}</strong></div>
+            <div><span>{locale === "zh-CN" ? "主题结果" : "Topic results"}</span><strong>{Number(autoTagPreview.metrics.topic_count ?? 0)}</strong></div>
+            <div><span>{locale === "zh-CN" ? "空结果" : "No-topic results"}</span><strong>{Number(autoTagPreview.metrics.zero_topic_count ?? 0)}</strong></div>
+            <div><span>{locale === "zh-CN" ? "新候选" : "New proposals"}</span><strong>{Number(autoTagPreview.metrics.new_candidate_count ?? 0)}</strong></div>
+            <div><span>{locale === "zh-CN" ? "预计全量调用" : "Estimated full calls"}</span><strong>{Number(autoTagPreview.metrics.estimated_full_calls ?? autoTag?.estimated_calls ?? 0)}</strong></div>
+          </div>}
+          {autoTagPreview.results.length > 0 && <div className="auto-tag-preview-list">{autoTagPreview.results.map((result) => <div key={result.entry_id}>
+            <strong>{result.title}</strong>
+            <span>{result.topics.length ? result.topics.map((topic) => `${topic.name} · ${Math.round(topic.confidence * 100)}%`).join(" · ") : (locale === "zh-CN" ? "无相关标签" : "No relevant tags")}</span>
+          </div>)}</div>}
+          {READY_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status) && <button type="button" className="button button--primary button--small" disabled={autoTagApproving || autoTagCleanupBusy || !autoTagCleanup?.reviewed} title={!autoTagCleanup?.reviewed ? (locale === "zh-CN" ? "清理快照已变化，请重新审阅并试跑" : "The cleanup snapshot changed; review it and run a new preview") : undefined} onClick={() => void approveAutoTagPreview()}>{autoTagApproving ? (locale === "zh-CN" ? "正在批准…" : "Approving…") : (locale === "zh-CN" ? "批准全量处理" : "Approve full run")}</button>}
+        </div>}
+      </div>}
     </section>
     </>}
     {settingsPage === "activity" && <>
