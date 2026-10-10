@@ -1,9 +1,10 @@
-import { type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import type { Domain, Entry, EntryState, LanguageMode, Locale, Tag } from "../types";
+import { type KeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { Domain, Entry, EntryState, EntryTag, LanguageMode, Locale, Tag } from "../types";
 import { t } from "../i18n";
-import { authors, formatArxivIdentifier, formatFullDate, safeHttpUrl } from "../utils";
+import { authors, errorText, formatArxivIdentifier, safeHttpUrl, sortedEntryTags } from "../utils";
 import { EmptyState, ErrorNotice, SegmentedControl, Spinner } from "./Common";
 import { MathJaxScope } from "./MathJax";
+import { EntryDate } from "./EntryDate";
 
 function DetailActionIcon({ kind, filled = false }: {
   kind: "read" | "later" | "star" | "archive";
@@ -17,12 +18,13 @@ function DetailActionIcon({ kind, filled = false }: {
   </svg>;
 }
 
-function TagPicker({ locale, allTags, selectedTags, onAddTag, onCreateTag }: {
+function TagPicker({ locale, allTags, selectedTags, onAddTag, onCreateTag, disabled = false }: {
   locale: Locale;
   allTags: Tag[];
   selectedTags: Tag[];
   onAddTag: (tag: Tag) => void;
   onCreateTag: (name: string) => Promise<Tag>;
+  disabled?: boolean;
 }) {
   const [input, setInput] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -49,7 +51,7 @@ function TagPicker({ locale, allTags, selectedTags, onAddTag, onCreateTag }: {
 
   async function addTypedTag() {
     const name = input.trim();
-    if (!name || busy) return;
+    if (!name || busy || disabled) return;
     setBusy(true);
     try {
       const existing = allTags.find((tag) => tag.name.toLocaleLowerCase() === name.toLocaleLowerCase());
@@ -85,6 +87,7 @@ function TagPicker({ locale, allTags, selectedTags, onAddTag, onCreateTag }: {
   return <div className="tag-input-wrap" ref={rootRef}>
     <div className={`tag-picker__field ${menuOpen ? "is-open" : ""}`}>
       <input
+        disabled={disabled}
         ref={inputRef}
         value={input}
         onChange={(event) => setInput(event.target.value)}
@@ -95,6 +98,7 @@ function TagPicker({ locale, allTags, selectedTags, onAddTag, onCreateTag }: {
       <button
         type="button"
         className="tag-picker__toggle"
+        disabled={disabled}
         aria-label={toggleLabel}
         aria-expanded={menuOpen}
         aria-controls="tag-picker-menu"
@@ -107,7 +111,7 @@ function TagPicker({ locale, allTags, selectedTags, onAddTag, onCreateTag }: {
         <span>{availableTags.length}</span>
       </div>
       {availableTags.length > 0 ? <div className="tag-picker__options">
-        {availableTags.map((tag) => <button type="button" role="option" aria-selected="false" key={tag.id} onClick={() => chooseTag(tag)}>
+        {availableTags.map((tag) => <button type="button" disabled={disabled} role="option" aria-selected="false" key={tag.id} onClick={() => chooseTag(tag)}>
           <span className="tag-picker__color" style={{ backgroundColor: tag.color || undefined }} />
           <span className="tag-picker__name">{tag.name}</span>
           {typeof tag.entry_count === "number" && <small>{tag.entry_count}</small>}
@@ -120,10 +124,108 @@ function TagPicker({ locale, allTags, selectedTags, onAddTag, onCreateTag }: {
   </div>;
 }
 
-export function EntryDetail({ locale, entry, loading, error, languageMode, allTags, allDomains, onLanguageMode, onState, onAddTag, onRemoveTag, onCreateTag, onDomains, onBack, onRetry }: {
+function ArticleTags({ locale, tags, allTags, onAddTag, onRemoveTag, onReorderTags, onCreateTag }: {
+  locale: Locale; tags: EntryTag[]; allTags: Tag[];
+  onAddTag: (tag: Tag) => void; onRemoveTag: (tag: Tag) => void;
+  onReorderTags: (ids: number[]) => Promise<void>; onCreateTag: (name: string) => Promise<Tag>;
+}) {
+  const sorted = useMemo(() => sortedEntryTags(tags), [tags]);
+  const [preview, setPreview] = useState<EntryTag[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [failed, setFailed] = useState(false);
+  const [dragging, setDragging] = useState<number | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const gesture = useRef<{ id: number; pointerId: number; x: number; y: number; moved: boolean; order: EntryTag[] } | null>(null);
+  const savedOrder = useRef(sorted);
+  const tagSnapshot = JSON.stringify(sorted.map((tag) => [tag.id, tag.name, tag.weight]));
+  useEffect(() => { savedOrder.current = sorted; gesture.current = null; setDragging(null); setPreview(null); }, [tagSnapshot]);
+  const displayed = preview ?? sorted;
+
+  async function save(order: EntryTag[]) {
+    if (busy) return;
+    if (order.every((tag, index) => tag.id === savedOrder.current[index]?.id)) { setPreview(savedOrder.current); return; }
+    const weighted = order.map((tag, index) => ({ ...tag, weight: order.length - index }));
+    setPreview(weighted);
+    setBusy(true);
+    setFailed(false);
+    setMessage(locale === "zh-CN" ? "正在保存标签顺序…" : "Saving tag order…");
+    try {
+      await onReorderTags(order.map((tag) => tag.id));
+      savedOrder.current = weighted;
+      setMessage(locale === "zh-CN" ? "标签顺序已保存" : "Tag order saved");
+    } catch (caught) {
+      setPreview(savedOrder.current);
+      setFailed(true);
+      setMessage(`${locale === "zh-CN" ? "标签顺序保存失败" : "Could not save tag order"}: ${errorText(caught)}`);
+    } finally { setBusy(false); }
+  }
+
+  function start(event: ReactPointerEvent<HTMLSpanElement>, id: number) {
+    if (busy || gesture.current || event.isPrimary === false || tags.length < 2 || event.button !== 0 || (event.target as HTMLElement).closest(".tag-editor__remove")) return;
+    gesture.current = { id, pointerId: event.pointerId, x: event.clientX, y: event.clientY, moved: false, order: displayed };
+    // Capture on the stable container: moving a chip in the DOM loses its capture.
+    rootRef.current?.setPointerCapture?.(event.pointerId);
+  }
+  function move(event: ReactPointerEvent<HTMLElement>) {
+    const active = gesture.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    if (!active.moved && Math.hypot(event.clientX - active.x, event.clientY - active.y) < 5) return;
+    active.moved = true;
+    setDragging(active.id);
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-tag-id]");
+    if (!target || !rootRef.current?.contains(target)) return;
+    const from = active.order.findIndex((tag) => tag.id === active.id);
+    const to = active.order.findIndex((tag) => tag.id === Number(target.dataset.tagId));
+    if (from === to || to < 0) return;
+    const order = [...active.order];
+    order.splice(to, 0, order.splice(from, 1)[0]);
+    active.order = order;
+    setPreview(order);
+  }
+  function finish(event: ReactPointerEvent<HTMLElement>) {
+    const active = gesture.current;
+    if (!active || active.pointerId !== event.pointerId) return;
+    gesture.current = null;
+    setDragging(null);
+    if (active.moved) void save(active.order);
+  }
+  function cancel() { gesture.current = null; setDragging(null); setPreview(null); }
+  function keydown(event: KeyboardEvent<HTMLSpanElement>, id: number) {
+    if (event.target !== event.currentTarget) return;
+    if (event.key === "Escape") { cancel(); return; }
+    const offset = ({ ArrowLeft: -1, ArrowUp: -1, ArrowRight: 1, ArrowDown: 1 } as Record<string, number>)[event.key];
+    if (!offset || busy) return;
+    event.preventDefault();
+    const index = displayed.findIndex((tag) => tag.id === id);
+    const to = index + offset;
+    if (to < 0 || to >= displayed.length) return;
+    const order = [...displayed];
+    order.splice(to, 0, order.splice(index, 1)[0]);
+    void save(order);
+  }
+  return <>
+    <div className="tag-editor" ref={rootRef} aria-busy={busy} onPointerMove={move} onPointerUp={finish} onPointerCancel={cancel} onLostPointerCapture={() => { if (gesture.current) cancel(); }}>
+      {displayed.map((tag) => <span className={`tag-editor__tag${dragging === tag.id ? " is-dragging" : ""}`} key={tag.id} data-tag-id={tag.id}
+        role="group" tabIndex={tags.length > 1 ? 0 : -1} aria-disabled={busy}
+        aria-label={locale === "zh-CN" ? `排序标签 ${tag.name}` : `Reorder tag ${tag.name}`}
+        title={locale === "zh-CN" ? "拖动排序，或使用方向键移动" : "Drag to reorder, or use arrow keys"}
+        onPointerDown={(event) => start(event, tag.id)} onKeyDown={(event) => keydown(event, tag.id)}>
+        <span className="tag-editor__color" style={{ backgroundColor: tag.color || undefined }} />
+        <span className="tag-editor__name">{tag.name}</span>
+        <button type="button" className="tag-editor__remove" disabled={busy || dragging !== null} aria-label={locale === "zh-CN" ? `移除标签 ${tag.name}` : `Remove tag ${tag.name}`} onClick={() => onRemoveTag(tag)}>×</button>
+      </span>)}
+      <TagPicker locale={locale} allTags={allTags} selectedTags={tags} onAddTag={onAddTag} onCreateTag={onCreateTag} disabled={busy || dragging !== null} />
+    </div>
+    {message && <p className="tag-editor__status" role={failed ? "alert" : "status"}>{message}</p>}
+  </>;
+}
+
+export function EntryDetail({ locale, entry, loading, error, languageMode, allTags, allDomains, onLanguageMode, onState, onAddTag, onRemoveTag, onReorderTags, onCreateTag, onDomains, onBack, onRetry }: {
   locale: Locale; entry: Entry | null; loading: boolean; error: string; languageMode: LanguageMode; allTags: Tag[]; allDomains: Domain[];
   onLanguageMode: (mode: LanguageMode) => void; onState: (state: Partial<EntryState>) => void; onAddTag: (tag: Tag) => void;
   onRemoveTag: (tag: Tag) => void; onCreateTag: (name: string) => Promise<Tag>; onDomains: (ids: number[]) => void;
+  onReorderTags: (ids: number[]) => Promise<void>;
   onBack: () => void; onRetry: () => void;
 }) {
   if (loading && !entry) return <section className="detail-pane detail-pane--center"><Spinner /></section>;
@@ -138,7 +240,11 @@ export function EntryDetail({ locale, entry, loading, error, languageMode, allTa
   const archiveLabel = entry.state.archived ? (locale === "zh-CN" ? "取消归档" : "Unarchive") : (locale === "zh-CN" ? "归档" : "Archive");
   const translationPlaceholder = entry.translation_status === "failed" ? t(locale, "translationFailed") : t(locale, "notTranslated");
   const originalUrl = safeHttpUrl(entry.url);
-  return <article className={`detail-pane ${entry.state.read ? "is-read" : ""}`}><header className="detail-toolbar"><button className="mobile-back" onClick={onBack}>←</button><SegmentedControl label="Summary language" value={languageMode} onChange={onLanguageMode} options={[{ value: "original", label: t(locale, "original") }, { value: "translated", label: t(locale, "translated") }, { value: "bilingual", label: t(locale, "bilingual") }]} /><div className="detail-toolbar__actions"><button aria-label={readLabel} data-tooltip={readLabel} onClick={() => onState({ read: !entry.state.read })}><DetailActionIcon kind="read" /></button><button aria-label={laterLabel} data-tooltip={laterLabel} className={entry.state.later ? "is-active" : ""} onClick={() => onState({ later: !entry.state.later })}><DetailActionIcon kind="later" /></button><button aria-label={starLabel} data-tooltip={starLabel} className={`star-button ${entry.state.starred ? "is-active" : ""}`} onClick={() => onState({ starred: !entry.state.starred })}><DetailActionIcon kind="star" filled={entry.state.starred} /></button><button aria-label={archiveLabel} data-tooltip={archiveLabel} className={entry.state.archived ? "is-active" : ""} onClick={() => onState({ archived: !entry.state.archived })}><DetailActionIcon kind="archive" /></button></div></header><div className="detail-scroll"><div className="article-meta-top"><div>{(entry.feed_titles ?? ["RSS"]).map((feed) => <span className="source-pill source-pill--large" key={feed}>{feed}</span>)}</div><time>{formatFullDate(entry.published_at, locale)}</time></div>{showTranslation && entry.translated_title && <h1 className="article-title article-title--translated"><MathJaxScope source={entry.translated_title} inline>{entry.translated_title}</MathJaxScope></h1>}{(showOriginal || !entry.translated_title) && <h1 className={`article-title ${entry.translated_title && showTranslation ? "article-title--original" : ""}`}><MathJaxScope source={entry.title} inline>{entry.title}</MathJaxScope></h1>}<div className="author-list">{authors(entry).map((author) => <span key={author}>{author}</span>)}</div><div className="article-actions">{originalUrl ? <a className="button button--primary" href={originalUrl} target="_blank" rel="noreferrer">{t(locale, "openOriginal")} ↗</a> : <span className="button button--primary is-disabled" aria-disabled="true">{t(locale, "openOriginal")}</span>}{entry.doi && <a className="button button--secondary" href={`https://doi.org/${entry.doi.replace(/^https?:\/\/doi\.org\//, "")}`} target="_blank" rel="noreferrer">DOI</a>}{entry.arxiv_id && <span className="identifier">{formatArxivIdentifier(entry.arxiv_id, entry.arxiv_version)}</span>}{entry.announce_type && <span className="announce-type">{entry.announce_type}</span>}</div><hr /><section className="abstract-section"><span className="eyebrow">SUMMARY</span>{showTranslation && <div className="abstract-block abstract-block--translated"><h2>{t(locale, "translatedSummary")}</h2><MathJaxScope source={entry.translated_summary || translationPlaceholder}><p>{entry.translated_summary || translationPlaceholder}</p></MathJaxScope></div>}{showOriginal && <div className="abstract-block"><h2>{t(locale, "originalSummary")}</h2><MathJaxScope source={entry.summary || t(locale, "noSummary")}><p>{entry.summary || t(locale, "noSummary")}</p></MathJaxScope></div>}</section>
+  return <article className={`detail-pane ${entry.state.read ? "is-read" : ""}`}><header className="detail-toolbar"><button className="mobile-back" onClick={onBack}>←</button><SegmentedControl label="Summary language" value={languageMode} onChange={onLanguageMode} options={[{ value: "original", label: t(locale, "original") }, { value: "translated", label: t(locale, "translated") }, { value: "bilingual", label: t(locale, "bilingual") }]} /><div className="detail-toolbar__actions"><button aria-label={readLabel} data-tooltip={readLabel} onClick={() => onState({ read: !entry.state.read })}><DetailActionIcon kind="read" /></button><button aria-label={laterLabel} data-tooltip={laterLabel} className={entry.state.later ? "is-active" : ""} onClick={() => onState({ later: !entry.state.later })}><DetailActionIcon kind="later" /></button><button aria-label={starLabel} data-tooltip={starLabel} className={`star-button ${entry.state.starred ? "is-active" : ""}`} onClick={() => onState({ starred: !entry.state.starred })}><DetailActionIcon kind="star" filled={entry.state.starred} /></button><button aria-label={archiveLabel} data-tooltip={archiveLabel} className={entry.state.archived ? "is-active" : ""} onClick={() => onState({ archived: !entry.state.archived })}><DetailActionIcon kind="archive" /></button></div></header><div className="detail-scroll"><div className="article-meta-top"><div>{(entry.feed_titles ?? ["RSS"]).map((feed) => <span className="source-pill source-pill--large" key={feed}>{feed}</span>)}</div><EntryDate entry={entry} locale={locale} /></div>{showTranslation && entry.translated_title && <h1 className="article-title article-title--translated"><MathJaxScope source={entry.translated_title} inline>{entry.translated_title}</MathJaxScope></h1>}{(showOriginal || !entry.translated_title) && <h1 className={`article-title ${entry.translated_title && showTranslation ? "article-title--original" : ""}`}><MathJaxScope source={entry.title} inline>{entry.title}</MathJaxScope></h1>}<div className="author-list">{authors(entry).map((author) => <span key={author}>{author}</span>)}</div><div className="article-actions">{originalUrl ? <a className="button button--primary" href={originalUrl} target="_blank" rel="noreferrer">{t(locale, "openOriginal")} ↗</a> : <span className="button button--primary is-disabled" aria-disabled="true">{t(locale, "openOriginal")}</span>}{entry.doi && <a className="button button--secondary" href={`https://doi.org/${entry.doi.replace(/^https?:\/\/doi\.org\//, "")}`} target="_blank" rel="noreferrer">DOI</a>}{entry.arxiv_id && <span className="identifier">{formatArxivIdentifier(entry.arxiv_id, entry.arxiv_version)}</span>}{entry.announce_type && <span className="announce-type">{entry.announce_type}</span>}</div><hr /><section className="abstract-section"><span className="eyebrow">SUMMARY</span>{showTranslation && <div className="abstract-block abstract-block--translated"><h2>{t(locale, "translatedSummary")}</h2><MathJaxScope source={entry.translated_summary || translationPlaceholder}><p>{entry.translated_summary || translationPlaceholder}</p></MathJaxScope></div>}{showOriginal && <div className="abstract-block"><h2>{t(locale, "originalSummary")}</h2><MathJaxScope source={entry.summary || t(locale, "noSummary")}><p>{entry.summary || t(locale, "noSummary")}</p></MathJaxScope></div>}</section>
     {allDomains.length > 0 && <section className="metadata-section"><span className="eyebrow">DOMAINS</span><div className="tag-editor">{allDomains.map((domain) => <button className={entry.domains.some((item) => item.id === domain.id) ? "is-active" : ""} key={domain.id} onClick={() => onDomains(entry.domains.some((item) => item.id === domain.id) ? entry.domains.filter((item) => item.id !== domain.id).map((item) => item.id) : [...entry.domains.map((item) => item.id), domain.id])}><span style={{ backgroundColor: domain.color || undefined }} />{domain.name}</button>)}</div></section>}
-    {entry.categories && entry.categories.length > 0 && <section className="metadata-section"><span className="eyebrow">CATEGORIES</span><div className="category-list">{entry.categories.map((item) => <span key={item}>{item}</span>)}</div></section>}<section className="metadata-section"><span className="eyebrow">{t(locale, "yourTags")}</span><div className="tag-editor">{entry.tags.map((tag) => <button key={tag.id} onClick={() => onRemoveTag(tag)}><span style={{ backgroundColor: tag.color || undefined }} />{tag.name} ×</button>)}<TagPicker key={entry.id} locale={locale} allTags={allTags} selectedTags={entry.tags} onAddTag={onAddTag} onCreateTag={onCreateTag} /></div></section><footer className="article-footer"><p>{locale === "zh-CN" ? "内容来自所订阅的 RSS/Atom 源，版权归原作者及发布方所有。" : "Content comes from subscribed RSS/Atom sources and remains the property of its authors and publishers."}</p>{arxivUsed && <p>arXiv data courtesy of arXiv.org · <a href="https://info.arxiv.org/help/api/index.html" target="_blank" rel="noreferrer">Usage terms</a></p>}</footer></div></article>;
+    {entry.categories && entry.categories.length > 0 && <section className="metadata-section"><span className="eyebrow">CATEGORIES</span><div className="category-list">{entry.categories.map((item) => <span key={item}>{item}</span>)}</div></section>}
+    <section className="metadata-section"><span className="eyebrow">{t(locale, "yourTags")}</span>
+      <ArticleTags key={entry.id} locale={locale} tags={entry.tags} allTags={allTags} onAddTag={onAddTag} onRemoveTag={onRemoveTag} onReorderTags={onReorderTags} onCreateTag={onCreateTag} />
+    </section>
+    <footer className="article-footer"><p>{locale === "zh-CN" ? "内容来自所订阅的 RSS/Atom 源，版权归原作者及发布方所有。" : "Content comes from subscribed RSS/Atom sources and remains the property of its authors and publishers."}</p>{arxivUsed && <p>arXiv data courtesy of arXiv.org · <a href="https://info.arxiv.org/help/api/index.html" target="_blank" rel="noreferrer">Usage terms</a></p>}</footer></div></article>;
 }

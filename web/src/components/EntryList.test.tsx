@@ -24,6 +24,39 @@ afterEach(() => {
   resetMathJaxForTests();
 });
 
+const cardProps = {
+  locale: "en" as const, title: "All articles", subtitle: "LIBRARY", total: 1,
+  loading: false, error: "", activeId: null, activeFeedId: null, languageMode: "original" as const,
+  selectedIds: new Set<number>(), query: "", hasMore: false, canRefreshSource: false,
+  refreshingSource: false, markingAllRead: false, unreadOnly: false,
+  onQuery: vi.fn(), onLanguageMode: vi.fn(), onOpen: vi.fn(), onSelect: vi.fn(),
+  onSelectAll: vi.fn(), onClearSelection: vi.fn(), onState: vi.fn(), onBulkState: vi.fn(),
+  onRefreshSource: vi.fn(), onToggleUnread: vi.fn(), onMarkAllRead: vi.fn(), onRetry: vi.fn(), onLoadMore: vi.fn(),
+};
+
+describe("EntryList top article tags", () => {
+  it("shows only the highest two weights after domain badges, alphabetically breaking ties", () => {
+    const tags = [
+      { id: 1, name: "Low", weight: 0.7 },
+      { id: 2, name: "beta", weight: 0.9 },
+      { id: 3, name: "Alpha", weight: 0.9 },
+    ];
+    const domain = { id: 1, name: "量子物理", description: "", position: 0, feed_count: 1, entry_count: 1 };
+    const result = render(<EntryList {...cardProps} entries={[{ ...entry, domains: [domain], tags }]} />);
+    expect(Array.from(result.container.querySelectorAll(".entry-card__topics span"), (node) => node.textContent)).toEqual(["Alpha", "beta"]);
+    expect(result.container.querySelector(".entry-card__labels")?.firstElementChild).toHaveClass("entry-card__tags");
+    expect(screen.getByText("量子物理")).toBeVisible();
+    expect(screen.queryByText("Low")).not.toBeInTheDocument();
+    expect(tags.map((tag) => tag.id)).toEqual([1, 2, 3]);
+    result.rerender(<EntryList {...cardProps} entries={[{ ...entry, domains: [domain], tags: tags.map((tag) => ({ ...tag, weight: tag.id === 1 ? 3 : tag.id === 2 ? 2 : 1 })) }]} />);
+    expect(Array.from(result.container.querySelectorAll(".entry-card__topics span"), (node) => node.textContent)).toEqual(["Low", "beta"]);
+  });
+  it.each([{ tags: [] }, { tags: [{ id: 1, name: "Only tag", weight: 1 }] }])("handles articles with fewer than two tags", ({ tags }) => {
+    const result = render(<EntryList {...cardProps} entries={[{ ...entry, tags }]} />);
+    expect(result.container.querySelectorAll(".entry-card__topics span")).toHaveLength(tags.length);
+  });
+});
+
 describe("EntryList read tracking", () => {
   it("marks an unread card after it was visible and then leaves the scroll viewport", () => {
     let callback: IntersectionObserverCallback | undefined;

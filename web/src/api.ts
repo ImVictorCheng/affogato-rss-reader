@@ -290,11 +290,17 @@ class ApiClient {
   deleteTag(id: number) {
     return this.request<void>(`/tags/${id}`, { method: "DELETE" });
   }
+  deleteTags(tagIds: number[]) {
+    return this.request<void>("/tags/delete", { method: "POST", body: JSON.stringify({ tag_ids: tagIds }) });
+  }
   addEntryTag(entryId: number, tagId: number) {
     return this.request<void>(`/entries/${entryId}/tags/${tagId}`, { method: "POST" });
   }
   removeEntryTag(entryId: number, tagId: number) {
     return this.request<void>(`/entries/${entryId}/tags/${tagId}`, { method: "DELETE" });
+  }
+  reorderEntryTags(entryId: number, tagIds: number[]) {
+    return this.request<Entry>(`/entries/${entryId}/tags/order`, { method: "PUT", body: JSON.stringify({ tag_ids: tagIds }) });
   }
 
   async jobs(limit = 20) {
@@ -338,8 +344,11 @@ class ApiClient {
   cleanupAutoTags(input: { remove_tag_ids: number[]; keep_tag_ids: number[]; review_token: string }) {
     return this.request<AutoTagCleanupResult>("/auto-tag/cleanup", { method: "POST", body: JSON.stringify(input) });
   }
-  autoTagProposals(offset = 0, limit = 50) {
-    return this.request<AutoTagProposalList>(`/auto-tag/proposals?offset=${offset}&limit=${limit}`);
+  autoTagProposals(offset = 0, limit = 50, status?: "active") {
+    return this.request<AutoTagProposalList>(`/auto-tag/proposals?offset=${offset}&limit=${limit}${status ? `&status=${status}` : ""}`);
+  }
+  promoteAutoTagProposal(id: number) {
+    return this.request<Tag>(`/auto-tag/proposals/${id}/promote`, { method: "POST" });
   }
   mergeTags(sourceId: number, targetId: number) {
     return this.request<Tag>(`/tags/${sourceId}/merge/${targetId}`, { method: "POST" });

@@ -45,6 +45,8 @@ from backend.app.models import (
 )
 from backend.app.sync import _merge_entry_into
 
+pytestmark = pytest.mark.usefixtures("enabled_auto_tag_preview")
+
 
 def _add_entry(db, title: str, *, published_at=None) -> Entry:
     digest = hashlib.sha256(title.encode("utf-8")).hexdigest()
@@ -212,8 +214,9 @@ def test_preview_request_cannot_lower_the_fixed_fifty_entry_target(
 
 
 def test_preview_api_requires_empty_cleanup_snapshot_to_be_confirmed(
-    authenticated_client,
+    authenticated_client, monkeypatch,
 ):
+    monkeypatch.setattr("backend.app.auto_tag.LEGACY_AUTO_TAG_CLEANUP_ENABLED", True)
     client, factory, headers = authenticated_client
     with factory() as db:
         _add_entry(db, "API cleanup-gated preview")
@@ -256,7 +259,38 @@ def test_preview_api_requires_empty_cleanup_snapshot_to_be_confirmed(
     assert created.json()["sample_size"] == 1
 
 
-def test_cleanup_api_rejects_a_stale_review_token(authenticated_client):
+def test_legacy_cleanup_routes_are_disabled_by_default(authenticated_client):
+    client, factory, headers = authenticated_client
+    assert client.get("/api/v1/auto-tag/cleanup-preview").status_code == 404
+    response = client.post("/api/v1/auto-tag/cleanup", headers=headers, json={
+        "review_token": "a" * 64, "remove_tag_ids": [], "keep_tag_ids": [],
+    })
+    assert response.status_code == 404
+
+
+def test_preview_runs_and_approves_without_any_cleanup_review(db_factory, monkeypatch):
+    def empty_response(*args, **kwargs):
+        request = json.loads(kwargs["user_prompt"])
+        return json.dumps({"entries": [
+            {"entry_id": article["entry_id"], "topics": []}
+            for article in request["articles"]
+        ]})
+
+    monkeypatch.setattr("backend.app.auto_tag.complete_feature_chat", empty_response)
+    with db_factory() as db:
+        _add_entry(db, "Preview without cleanup")
+        _bind_auto_tag_connection(db)
+        assert db.get(AppSetting, "auto_tag_cleanup_review_token") is None
+        preview = create_preview(db)
+        run_auto_tag_preview(db, preview.id)
+        approved = approve_preview(db, preview.id)
+        assert approved.status == "applied"
+        assert db.get(AppSetting, "auto_tag_enabled").value == "true"
+        assert db.get(AppSetting, "auto_tag_cleanup_review_token") is None
+
+
+def test_cleanup_api_rejects_a_stale_review_token(authenticated_client, monkeypatch):
+    monkeypatch.setattr("backend.app.auto_tag.LEGACY_AUTO_TAG_CLEANUP_ENABLED", True)
     client, factory, headers = authenticated_client
     stale = client.get("/api/v1/auto-tag/cleanup-preview")
     assert stale.status_code == 200
@@ -364,7 +398,8 @@ def test_preview_fills_fifty_distinct_works_past_recent_duplicate_versions(
         assert len({entry.work_id for entry in selected if entry is not None}) == 50
 
 
-def test_preview_requires_explicit_cleanup_confirmation_even_when_empty(db_factory):
+def test_preview_requires_explicit_cleanup_confirmation_even_when_empty(db_factory, monkeypatch):
+    monkeypatch.setattr("backend.app.auto_tag.LEGACY_AUTO_TAG_CLEANUP_ENABLED", True)
     with db_factory() as db:
         _add_entry(db, "Cleanup-gated preview")
         _bind_auto_tag_connection(db)
@@ -427,6 +462,7 @@ def test_preview_approval_requires_cleanup_snapshot_to_remain_reviewed(
     db_factory,
     monkeypatch,
 ):
+    monkeypatch.setattr("backend.app.auto_tag.LEGACY_AUTO_TAG_CLEANUP_ENABLED", True)
     def empty_response(*args, **kwargs):
         request = json.loads(kwargs["user_prompt"])
         return json.dumps(

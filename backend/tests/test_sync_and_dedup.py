@@ -84,6 +84,72 @@ def test_cross_source_dedup_and_arxiv_versions(db_factory):
         assert db.scalar(select(func.count()).select_from(EntryFeed)) == 3
 
 
+def test_date_only_refresh_backfills_and_corrects_dates_without_reprocessing(db_factory):
+    with db_factory() as db:
+        feed = Feed(title="Journal", url="https://journal.test/rss")
+        db.add(feed)
+        db.commit()
+        original = ParsedEntry(
+            guid="paper", title="Paper", summary="Abstract", content=None,
+            url="https://journal.test/paper",
+        )
+        entry, _ = upsert_entry(db, feed, original)
+        translation = entry.translation
+        translation.status = "complete"
+        translation.title = "Translated paper"
+        record = AutoTagRecord(
+            entry_id=entry.id, source_hash=entry.source_hash, status="complete", tag_ids=[]
+        )
+        db.add(record)
+        db.commit()
+        collected_at = entry.created_at
+        dated = replace(
+            original, published_at=datetime(2026, 10, 8), updated_at=datetime(2026, 10, 9)
+        )
+
+        same, action = upsert_entry(db, feed, dated)
+        db.commit()
+        assert same.id == entry.id
+        assert action == "updated"
+        assert same.published_at == dated.published_at
+        assert same.source_updated_at == dated.updated_at
+        assert same.created_at == collected_at
+        assert same.source_hash == original.source_hash
+        assert translation.status == record.status == "complete"
+        assert translation.title == "Translated paper"
+        assert upsert_entry(db, feed, dated)[1] == "unchanged"
+
+        corrected = replace(dated, published_at=datetime(2026, 10, 7))
+        assert upsert_entry(db, feed, corrected)[1] == "updated"
+        assert entry.published_at == corrected.published_at
+        assert upsert_entry(db, feed, original)[1] == "unchanged"
+        assert entry.published_at == corrected.published_at
+        assert entry.source_updated_at == dated.updated_at
+
+
+def test_mirror_can_fill_missing_dates_but_cannot_overwrite_primary_dates(db_factory):
+    with db_factory() as db:
+        feed = Feed(title="Journal", url="https://journal.test/rss")
+        mirror = Feed(title="Mirror", url="https://mirror.test/rss")
+        db.add_all([feed, mirror])
+        db.commit()
+        original = ParsedEntry(
+            guid="paper", title="Paper", summary="Abstract", content=None,
+            url="https://journal.test/paper", published_at=datetime(2026, 10, 8),
+        )
+        entry, _ = upsert_entry(db, feed, original)
+        incoming = replace(
+            original, published_at=datetime(2026, 10, 9), updated_at=datetime(2026, 10, 10)
+        )
+        same, action = upsert_entry(db, mirror, incoming)
+        assert same.id == entry.id
+        assert action == "updated"
+        assert entry.published_at == original.published_at
+        assert entry.source_updated_at == incoming.updated_at
+        assert upsert_entry(db, mirror, replace(incoming, updated_at=datetime(2026, 10, 11)))[1] == "unchanged"
+        assert entry.source_updated_at == incoming.updated_at
+
+
 def test_upsert_locks_cleanup_snapshot_before_entry_insert_and_update(db_factory):
     """Keep sync's SQL lock order aligned with automatic classification."""
 

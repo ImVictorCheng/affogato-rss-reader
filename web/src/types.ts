@@ -89,6 +89,10 @@ export interface Tag {
   entry_count?: number;
 }
 
+export interface EntryTag extends Tag {
+  weight?: number;
+}
+
 export interface Domain {
   id: number;
   name: string;
@@ -140,6 +144,8 @@ export interface Entry {
   authors: string[] | string;
   categories?: string[];
   published_at?: string | null;
+  source_updated_at?: string | null;
+  created_at?: string | null;
   updated_at?: string | null;
   arxiv_id?: string | null;
   arxiv_version?: number | null;
@@ -148,7 +154,7 @@ export interface Entry {
   feed_titles?: string[];
   feed_ids?: number[];
   state: EntryState;
-  tags: Tag[];
+  tags: EntryTag[];
   domains: Domain[];
   translation_status?: string | null;
   translation_error?: string | null;

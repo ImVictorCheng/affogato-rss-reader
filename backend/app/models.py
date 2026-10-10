@@ -378,6 +378,8 @@ class EntryTag(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     entry_id: Mapped[int] = mapped_column(ForeignKey("entries.id", ondelete="CASCADE"), index=True)
     tag_id: Mapped[int] = mapped_column(ForeignKey("tags.id", ondelete="CASCADE"), index=True)
+    # A user ordering overrides the automatic source confidence for this article.
+    weight: Mapped[float | None] = mapped_column(Float)
 
 
 class EntryTagSource(Base):

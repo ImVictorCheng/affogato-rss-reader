@@ -32,6 +32,12 @@ def pytest_configure(config) -> None:
 
 
 @pytest.fixture
+def enabled_auto_tag_preview(monkeypatch):
+    """Exercise the retained workflow without changing its production default."""
+    monkeypatch.setattr("backend.app.auto_tag.AUTO_TAG_PREVIEW_ENABLED", True)
+
+
+@pytest.fixture
 def db_factory(tmp_path: Path):
     database = tmp_path / "test.db"
     engine = create_engine(

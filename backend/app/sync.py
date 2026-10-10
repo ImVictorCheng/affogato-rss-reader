@@ -587,10 +587,28 @@ def upsert_entry(
         entry.arxiv_version = parsed.arxiv_version or entry.arxiv_version
         entry.doi = parsed.doi
         entry.announce_type = parsed.announce_type
-        entry.published_at = parsed.published_at or entry.published_at
-        entry.source_updated_at = parsed.updated_at
         entry.source_hash = parsed.source_hash
         action = "updated"
+    if action != "created":
+        date_changes = [
+            (field, value)
+            for field, value in (
+                ("published_at", parsed.published_at),
+                ("source_updated_at", parsed.updated_at),
+            )
+            if value is not None and value != getattr(entry, field)
+        ]
+        if date_changes:
+            may_update = _source_may_update_entry(
+                db, entry, parsed, existing_link, cross_source_fallback
+            )
+            for field, value in date_changes:
+                # Dates are not part of the content hash: fill historical gaps
+                # without invalidating translations or automatic tags. Mirrors
+                # may fill missing dates, but cannot replace authoritative ones.
+                if may_update or getattr(entry, field) is None:
+                    setattr(entry, field, value)
+                    action = "updated"
     link = existing_link or db.scalar(
         select(EntryFeed).where(EntryFeed.entry_id == entry.id, EntryFeed.feed_id == feed.id)
     )

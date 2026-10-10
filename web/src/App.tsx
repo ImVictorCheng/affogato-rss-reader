@@ -423,8 +423,32 @@ function ReaderApp({ auth, locale, onLocale, onSignedOut, onDebugReset, onTheme 
     }
   }
   async function createTag(name: string) { const tag = await api.createTag(name); await loadNavigation(); return tag; }
-  async function addTag(tag: Tag) { if (!detailEntry) return; await api.addEntryTag(detailEntry.id, tag.id); setDetailEntry({ ...detailEntry, tags: [...detailEntry.tags, tag] }); await loadNavigation(); }
-  async function removeTag(tag: Tag) { if (!detailEntry) return; await api.removeEntryTag(detailEntry.id, tag.id); setDetailEntry({ ...detailEntry, tags: detailEntry.tags.filter((item) => item.id !== tag.id) }); await loadNavigation(); }
+  function applyArticleTags(value: Entry) {
+    setDetailEntry((current) => current?.id === value.id ? { ...current, tags: value.tags } : current);
+    setEntries((items) => items.map((item) => item.id === value.id ? { ...item, tags: value.tags } : item));
+  }
+  async function addTag(tag: Tag) {
+    if (!detailEntry) return;
+    const entryId = detailEntry.id;
+    try {
+      await api.addEntryTag(entryId, tag.id);
+      applyArticleTags(await api.entry(entryId));
+      await loadNavigation();
+    } catch (caught) { notify(errorText(caught), "error"); }
+  }
+  async function removeTag(tag: Tag) {
+    if (!detailEntry) return;
+    const entryId = detailEntry.id;
+    try {
+      await api.removeEntryTag(entryId, tag.id);
+      applyArticleTags(await api.entry(entryId));
+      await loadNavigation();
+    } catch (caught) { notify(errorText(caught), "error"); }
+  }
+  async function reorderTags(tagIds: number[]) {
+    if (!detailEntry) return;
+    applyArticleTags(await api.reorderEntryTags(detailEntry.id, tagIds));
+  }
   async function setEntryDomains(ids: number[]) { if (!detailEntry) return; const value = await api.setEntryDomains(detailEntry.id, ids); setDetailEntry(value); setEntries((items) => items.map((item) => item.id === value.id ? value : item)); await loadNavigation(); }
 
   useEffect(() => {
@@ -493,7 +517,7 @@ function ReaderApp({ auth, locale, onLocale, onSignedOut, onDebugReset, onTheme 
     ) : <>
       <EntryList locale={locale} title={heading.title} subtitle={heading.subtitle} entries={entries} total={total} loading={loading} error={listError} activeId={detailEntry?.id ?? null} activeFeedId={feedId} languageMode={languageMode} selectedIds={selectedIds} query={query} hasMore={entries.length < total} canRefreshSource={Boolean(activeFeed)} refreshingSource={refreshingSource} markingAllRead={markingAllRead} unreadOnly={view === "unread"} onQuery={setQuery} onLanguageMode={setLanguageMode} onOpen={open} onSelect={(id, selected) => setSelectedIds((items) => { const next = new Set(items); selected ? next.add(id) : next.delete(id); return next; })} onSelectAll={() => setSelectedIds((items) => items.size === entries.length ? new Set() : new Set(entries.map((entry) => entry.id)))} onClearSelection={() => setSelectedIds(new Set())} onState={updateState} onBulkState={(state) => void bulk(state)} onRefreshSource={() => void refreshCurrentSource()} onToggleUnread={() => setView((current) => current === "unread" ? "all" : "unread")} onMarkAllRead={() => void markAllRead()} onRetry={() => void loadEntries()} onLoadMore={() => void loadEntries(page + 1, true)} />
       <PaneResizer variant="list" label={locale === "zh-CN" ? "调整文章列表宽度" : "Resize article list pane"} value={paneWidths.list} minimum={LIST_MIN} maximum={LIST_MAX} onChange={setListWidth} onReset={() => setListWidth(DEFAULT_PANE_WIDTHS.list)} />
-      <EntryDetail locale={locale} entry={detailEntry} loading={detailLoading} error="" languageMode={languageMode} allTags={tags} allDomains={domains} onLanguageMode={setLanguageMode} onState={(state) => detailEntry && void updateState(detailEntry, state)} onAddTag={(tag) => void addTag(tag)} onRemoveTag={(tag) => void removeTag(tag)} onCreateTag={createTag} onDomains={(ids) => void setEntryDomains(ids)} onBack={() => setMobilePane("list")} onRetry={() => detailEntry && void api.entry(detailEntry.id).then(setDetailEntry)} />
+      <EntryDetail locale={locale} entry={detailEntry} loading={detailLoading} error="" languageMode={languageMode} allTags={tags} allDomains={domains} onLanguageMode={setLanguageMode} onState={(state) => detailEntry && void updateState(detailEntry, state)} onAddTag={(tag) => void addTag(tag)} onRemoveTag={(tag) => void removeTag(tag)} onReorderTags={reorderTags} onCreateTag={createTag} onDomains={(ids) => void setEntryDomains(ids)} onBack={() => setMobilePane("list")} onRetry={() => detailEntry && void api.entry(detailEntry.id).then(setDetailEntry)} />
     </>}
     {mobilePane === "navigation" && <button className="mobile-nav-scrim" onClick={() => setMobilePane("list")} aria-label="Close navigation" />}
     {modal === "settings" && <SettingsModal locale={locale} auth={auth} onLocale={onLocale} onClose={() => setModal(null)} onLogout={() => void logout()} onDebugReset={onDebugReset} onBrandChanged={onTheme} onInstallUpdate={installAvailableUpdate} notify={notify} />}

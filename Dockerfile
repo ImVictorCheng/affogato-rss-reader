@@ -36,7 +36,7 @@ COPY --from=wheel-builder /wheels/*.whl /tmp/
 RUN python -m pip install --no-cache-dir --no-deps /tmp/*.whl \
     && rm -rf /tmp/*.whl /tmp/requirements.lock
 COPY LICENSE THIRD_PARTY_NOTICES.md licenses/MathJax-APACHE-2.0.txt /usr/share/licenses/affogato-rss-reader/
-ARG VERSION=0.5.0
+ARG VERSION=0.5.1
 ARG VCS_REF=unknown
 ARG SOURCE_URL=https://github.com/OWNER/affogato-rss-reader
 LABEL org.opencontainers.image.title="Affogato RSS Reader" \

@@ -21,15 +21,19 @@ from .auto_tag import (
     add_manual_tag,
     apply_cleanup,
     approve_preview,
+    auto_tag_preview_enabled,
     auto_tag_status,
     cleanup_preview as build_auto_tag_cleanup_preview,
     configure_auto_tag,
     create_preview,
+    delete_tags,
     get_preview,
+    legacy_auto_tag_cleanup_enabled,
     list_previews,
     list_proposals,
     merge_tags,
     normalize_topic_name,
+    promote_proposal,
     remove_manual_tag,
     retire_tag_proposals,
 )
@@ -65,6 +69,7 @@ from .models import (
     EntryDomain,
     EntryFeed,
     EntryTag,
+    EntryTagSource,
     Feed,
     FeedDomain,
     FeedTag,
@@ -112,6 +117,7 @@ from .schemas import (
     EntriesPage,
     EntryDomainsPatch,
     EntryOut,
+    EntryTagOrder,
     FeedCreate,
     FeedDomainAssociation,
     FeedDiscoveryOut,
@@ -141,6 +147,7 @@ from .schemas import (
     StatePatch,
     SourceSortSettings,
     SyncRunListOut,
+    TagBulkDelete,
     TagCreate,
     TagListOut,
     TagOut,
@@ -603,14 +610,26 @@ def serialize_entry(db: Session, entry: Entry, owner_id: int) -> dict:
             .order_by(Feed.title)
         )
     )
-    tags = list(
-        db.scalars(
-            select(Tag)
-            .join(EntryTag, EntryTag.tag_id == Tag.id)
-            .where(EntryTag.entry_id == entry.id)
-            .order_by(Tag.name)
+    confidence = (
+        select(
+            EntryTagSource.entry_tag_id,
+            func.max(EntryTagSource.confidence).label("confidence"),
         )
+        .join(EntryTag, EntryTag.id == EntryTagSource.entry_tag_id)
+        .where(EntryTag.entry_id == entry.id)
+        .group_by(EntryTagSource.entry_tag_id)
+        .subquery()
     )
+    tags = [
+        {"id": tag.id, "name": tag.name, "color": tag.color, "weight": weight}
+        for tag, weight in db.execute(
+            select(Tag, func.coalesce(EntryTag.weight, confidence.c.confidence, 1))
+            .join(EntryTag, EntryTag.tag_id == Tag.id)
+            .outerjoin(confidence, confidence.c.entry_tag_id == EntryTag.id)
+            .where(EntryTag.entry_id == entry.id)
+        )
+    ]
+    tags.sort(key=lambda tag: (-tag["weight"], tag["name"].casefold(), tag["id"]))
     translated = (
         translation
         if (
@@ -638,11 +657,13 @@ def serialize_entry(db: Session, entry: Entry, owner_id: int) -> dict:
         "doi": entry.doi,
         "announce_type": entry.announce_type,
         "published_at": as_utc(entry.published_at),
+        "source_updated_at": as_utc(entry.source_updated_at),
+        "created_at": as_utc(entry.created_at),
         "updated_at": as_utc(entry.updated_at),
         "feed_titles": [feed.title for feed in feeds],
         "feed_ids": [feed.id for feed in feeds],
         "state": serialize_state(state),
-        "tags": [{"id": tag.id, "name": tag.name, "color": tag.color} for tag in tags],
+        "tags": tags,
         "translation_status": translation.status if translation else None,
         "translation_error": translation.last_error if translation and translation.status == "failed" else None,
         "translation_language": translation.language if translation else target,
@@ -840,6 +861,30 @@ def update_entry_state(
     row = get_or_create_state(db, owner.id, entry_id)
     for key, value in body.model_dump(exclude_none=True).items():
         setattr(row, key, value)
+    db.commit()
+    return serialize_entry(db, entry, owner.id)
+
+
+@router.put("/entries/{entry_id}/tags/order", response_model=EntryOut)
+def reorder_entry_tags(
+    entry_id: int,
+    body: EntryTagOrder,
+    owner: Owner = Depends(current_owner),
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    acquire_cleanup_snapshot(db)
+    entry = db.get(Entry, entry_id)
+    if entry is None:
+        raise not_found("Entry")
+    links = {
+        link.tag_id: link
+        for link in db.scalars(select(EntryTag).where(EntryTag.entry_id == entry_id))
+    }
+    if set(body.tag_ids) != set(links):
+        raise HTTPException(status_code=409, detail="Article tags have changed; reload before sorting")
+    for position, tag_id in enumerate(body.tag_ids):
+        links[tag_id].weight = len(body.tag_ids) - position
     db.commit()
     return serialize_entry(db, entry, owner.id)
 
@@ -1635,6 +1680,20 @@ def update_tag(
     }
 
 
+@router.post("/tags/delete", status_code=204)
+def delete_selected_tags(
+    body: TagBulkDelete,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> None:
+    try:
+        delete_tags(db, body.tag_ids)
+        db.commit()
+    except (IntegrityError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.delete("/tags/{tag_id}", status_code=204)
 def delete_tag(
     tag_id: int,
@@ -1830,6 +1889,8 @@ def start_auto_tag_preview(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> object:
+    if not auto_tag_preview_enabled():
+        raise not_found("Auto-tag preview feature")
     try:
         preview = create_preview(db, sample_size=body.sample_size if body else 50)
         preview_id = (
@@ -1855,6 +1916,8 @@ def list_auto_tag_previews(
     db: Session = Depends(get_db),
     limit: int = Query(default=10, ge=1, le=50),
 ) -> dict:
+    if not auto_tag_preview_enabled():
+        raise not_found("Auto-tag preview feature")
     return list_previews(db, limit=limit)
 
 
@@ -1867,6 +1930,8 @@ def read_auto_tag_preview(
     _owner: Owner = Depends(current_owner),
     db: Session = Depends(get_db),
 ) -> object:
+    if not auto_tag_preview_enabled():
+        raise not_found("Auto-tag preview feature")
     preview = get_preview(db, preview_id)
     if preview is None:
         raise not_found("Auto-tag preview")
@@ -1883,6 +1948,8 @@ def approve_auto_tag_preview(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
+    if not auto_tag_preview_enabled():
+        raise not_found("Auto-tag preview feature")
     if get_preview(db, preview_id) is None:
         raise not_found("Auto-tag preview")
     try:
@@ -1902,6 +1969,8 @@ def get_auto_tag_cleanup_preview(
     _owner: Owner = Depends(current_owner),
     db: Session = Depends(get_db),
 ) -> dict:
+    if not legacy_auto_tag_cleanup_enabled():
+        raise HTTPException(status_code=404, detail="Legacy tag cleanup is disabled")
     return build_auto_tag_cleanup_preview(db)
 
 
@@ -1911,6 +1980,8 @@ def clean_up_auto_tags(
     _csrf: LoginSession = Depends(require_csrf),
     db: Session = Depends(get_db),
 ) -> dict:
+    if not legacy_auto_tag_cleanup_enabled():
+        raise HTTPException(status_code=404, detail="Legacy tag cleanup is disabled")
     try:
         result = apply_cleanup(
             db,
@@ -1938,8 +2009,35 @@ def get_auto_tag_proposals(
     db: Session = Depends(get_db),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
+    status: Literal["active", "promoted", "retired", "merged"] | None = Query(default=None),
 ) -> dict:
-    return list_proposals(db, offset=offset, limit=limit)
+    return list_proposals(db, offset=offset, limit=limit, status=status)
+
+
+@router.post("/auto-tag/proposals/{proposal_id}/promote", response_model=TagWithCountOut)
+def promote_auto_tag_proposal(
+    proposal_id: int,
+    _csrf: LoginSession = Depends(require_csrf),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        tag = promote_proposal(db, proposal_id)
+    except LookupError as exc:
+        db.rollback()
+        raise not_found("Topic candidate") from exc
+    except (IntegrityError, ValueError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "id": tag.id,
+        "name": tag.name,
+        "color": tag.color,
+        "description": tag.description or "",
+        "aliases": list(db.scalars(select(TagAlias.alias).where(TagAlias.tag_id == tag.id).order_by(TagAlias.alias))),
+        "origin": tag.origin,
+        "auto_assignable": tag.auto_assignable,
+        "entry_count": int(db.scalar(select(func.count(EntryTag.id)).where(EntryTag.tag_id == tag.id)) or 0),
+    }
 
 
 @router.post("/translations/test", response_model=TranslationTestOut)

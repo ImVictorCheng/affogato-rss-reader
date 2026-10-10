@@ -5,6 +5,7 @@ import { afterEach, vi } from "vitest";
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 Object.defineProperty(window, "matchMedia", {

@@ -6,6 +6,42 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 describe("API client", () => {
   beforeEach(() => vi.stubGlobal("fetch", vi.fn()));
 
+  it("persists the full article tag order with CSRF protection", async () => {
+    const entry = { id: 8, tags: [{ id: 3, weight: 2 }, { id: 1, weight: 1 }] };
+    vi.mocked(fetch).mockResolvedValueOnce(json({ csrf_token: "order-csrf" })).mockResolvedValueOnce(json(entry));
+    await api.authStatus();
+    expect(await api.reorderEntryTags(8, [3, 1])).toEqual(entry);
+    const [url, init] = vi.mocked(fetch).mock.calls[1];
+    expect(String(url)).toContain("/entries/8/tags/order");
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(String(init?.body))).toEqual({ tag_ids: [3, 1] });
+    expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe("order-csrf");
+  });
+
+  it("deletes selected tags in one authenticated mutation", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await api.deleteTags([2, 5]);
+    const [url, init] = vi.mocked(fetch).mock.calls[0];
+    expect(String(url)).toContain("/tags/delete");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toEqual({ tag_ids: [2, 5] });
+  });
+
+  it("fetches active candidates and sends authenticated manual promotions", async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(json({ authenticated: true, csrf_token: "promotion-csrf" }))
+      .mockResolvedValueOnce(json({ items: [], total: 0 }))
+      .mockResolvedValueOnce(json({ id: 4, name: "Quantum networks" }));
+    await api.authStatus();
+    await api.autoTagProposals(0, 50, "active");
+    await api.promoteAutoTagProposal(7);
+    expect(String(vi.mocked(fetch).mock.calls[1][0])).toContain("/auto-tag/proposals?offset=0&limit=50&status=active");
+    const [url, init] = vi.mocked(fetch).mock.calls[2];
+    expect(String(url)).toContain("/auto-tag/proposals/7/promote");
+    expect(init?.method).toBe("POST");
+    expect(new Headers(init?.headers).get("X-CSRF-Token")).toBe("promotion-csrf");
+  });
+
   it("sends the auth CSRF token with mutations", async () => {
     vi.mocked(fetch).mockResolvedValueOnce(json({ authenticated: true, setup_required: false, mode: "owner", csrf_token: "token" })).mockResolvedValueOnce(json({}));
     await api.authStatus();

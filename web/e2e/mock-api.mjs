@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 
 const host = "127.0.0.1";
 const port = 18081;
+const previewEnabled = process.env.VITE_AUTO_TAG_PREVIEW_ENABLED === "true";
 const domains = [
   { id: 1, name: "Science", description: "", color: "#2bc7c3", position: 0, feed_count: 1, entry_count: 2 },
   { id: 2, name: "Technology", description: "", color: "#8878e8", position: 1, feed_count: 1, entry_count: 1 },
@@ -66,7 +67,7 @@ const defaultAutoTagStatus = {
   enabled: false, create_new: true, growth_mode: "threshold",
   llm_connection_id: 1, llm_connection_name: "Test LLM", model: "test-model", configured: true,
   max_tags_per_entry: 3, promotion_threshold: 10, support_window_days: 365,
-  canonical_language: "en", min_confidence: 0.8, preview_required: true,
+  canonical_language: "en", min_confidence: 0.8, preview_required: previewEnabled,
   proposal_count: 1, promoted_count: 1, estimated_calls: 200,
   outdated_count: 0, needs_rebuild: false,
   pending_count: 0, running_count: 0, complete_count: 0, failed_count: 0,
@@ -76,10 +77,11 @@ let autoTagPreview = null;
 let autoTagPreviewFinal = null;
 let nextAutoTagPreviewId = 1;
 let autoTagPreviewMode = "success";
-let autoTagProposals = [
+const originalAutoTagProposals = [
   { id: 7, name: "reproducibility", description: "Reproducible research", status: "active", support_count: 4, promoted_tag_id: null, aliases: ["reproducible science"], created_at: "2026-07-27T01:00:00Z", updated_at: "2026-07-27T01:00:00Z" },
   { id: 8, name: "Quantum Sensing", description: "Quantum-enhanced sensing", status: "promoted", support_count: 10, promoted_tag_id: 3, aliases: ["量子传感"], created_at: "2026-07-26T01:00:00Z", updated_at: "2026-07-27T01:00:00Z" },
 ];
+let autoTagProposals = structuredClone(originalAutoTagProposals);
 
 function json(response, status, value) {
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-CSRF-Token": "e2e-token" });
@@ -114,10 +116,15 @@ const server = createServer(async (request, response) => {
       autoTagPreviewFinal = null;
       nextAutoTagPreviewId = 1;
       autoTagPreviewMode = "success";
+      autoTagProposals = structuredClone(originalAutoTagProposals);
       return empty(response);
     }
     if (path === "/__test__/auto-tag-scenario" && request.method === "POST") {
       const input = await body(request);
+      if (Array.isArray(input.candidates)) {
+        autoTagProposals = structuredClone(input.candidates);
+        autoTagStatus.proposal_count = autoTagProposals.filter((item) => item.status === "active").length;
+      }
       if (input.rebuild) {
         autoTagStatus = { ...autoTagStatus, needs_rebuild: true, outdated_count: Number(input.outdated_count || 23) };
       }
@@ -149,6 +156,18 @@ const server = createServer(async (request, response) => {
       autoTagStatus = { ...autoTagStatus, preview_required: true, needs_rebuild: true, outdated_count: 50 };
       return json(response, 201, tag);
     }
+    if (path === "/api/v1/tags/delete" && request.method === "POST") {
+      const input = await body(request);
+      const selectedIds = new Set(input.tag_ids);
+      if (!input.tag_ids.length || input.tag_ids.some((id) => !tags.some((tag) => tag.id === id))) {
+        return json(response, 409, { detail: "Some selected tags no longer exist" });
+      }
+      tags = tags.filter((tag) => !selectedIds.has(tag.id));
+      cleanupItems = cleanupItems.filter((item) => !selectedIds.has(item.tag_id));
+      autoTagPolicyRevision += 1;
+      autoTagStatus = { ...autoTagStatus, preview_required: true, needs_rebuild: true, outdated_count: 50 };
+      return empty(response);
+    }
     const tagDetail = path.match(/^\/api\/v1\/tags\/(\d+)$/);
     if (tagDetail && request.method === "PATCH") {
       const tag = tags.find((item) => item.id === Number(tagDetail[1]));
@@ -177,7 +196,7 @@ const server = createServer(async (request, response) => {
         create_new: growthMode === "threshold",
         llm_connection_id: llmConnectionId,
         configured: Boolean(llmConnectionId),
-        ...(policyChanged ? { enabled: false, preview_required: true, needs_rebuild: true, outdated_count: 50 } : {}),
+        ...(policyChanged ? { ...(previewEnabled ? { enabled: false } : {}), preview_required: previewEnabled, needs_rebuild: false, outdated_count: 0 } : {}),
       };
       return json(response, 200, autoTagStatus);
     }
@@ -185,7 +204,6 @@ const server = createServer(async (request, response) => {
     if (path === "/api/v1/auto-tag/previews" && request.method === "GET") return json(response, 200, { items: autoTagPreview ? [autoTagPreview] : [] });
     if (path === "/api/v1/auto-tag/previews" && request.method === "POST") {
       const input = await body(request);
-      if (!cleanupReviewed) return json(response, 409, { detail: "Review the current cleanup preview before creating an auto-tag preview" });
       const previewId = nextAutoTagPreviewId++;
       if (autoTagPreviewMode === "failed") {
         autoTagPreview = {
@@ -217,7 +235,6 @@ const server = createServer(async (request, response) => {
     const autoTagPreviewApprove = path.match(/^\/api\/v1\/auto-tag\/previews\/(\d+)\/approve$/);
     if (autoTagPreviewApprove && request.method === "POST") {
       const input = await body(request);
-      if (!cleanupReviewed) return json(response, 409, { detail: "Cleanup review changed; run a new preview" });
       if (input.scope !== "all" || autoTagPreview?.status !== "complete") return json(response, 409, { detail: "The preview must complete successfully before approval" });
       if (autoTagPreview.metrics?.policy_version !== autoTagPolicyVersion()) return json(response, 409, { detail: "The auto-tag policy or taxonomy changed; run a new preview" });
       autoTagStatus = { ...autoTagStatus, enabled: true, preview_required: false, needs_rebuild: false, outdated_count: 0, pending_count: 50 };
@@ -262,10 +279,25 @@ const server = createServer(async (request, response) => {
       cleanupReviewed = true;
       return json(response, 200, { removed_tag_ids: [...deletableIds], kept_tag_ids: input.keep_tag_ids, removed_count: selected.reduce((total, item) => total + item.inferred_auto_count, 0) });
     }
-    if (path === "/api/v1/auto-tag/proposals") return json(response, 200, {
-      items: autoTagProposals.slice(Number(url.searchParams.get("offset") || 0), Number(url.searchParams.get("offset") || 0) + Number(url.searchParams.get("limit") || 50)),
-      total: autoTagProposals.length, offset: Number(url.searchParams.get("offset") || 0), limit: Number(url.searchParams.get("limit") || 50),
-    });
+    if (path === "/api/v1/auto-tag/proposals") {
+      const filtered = autoTagProposals.filter((item) => !url.searchParams.has("status") || item.status === url.searchParams.get("status"));
+      const offset = Number(url.searchParams.get("offset") || 0);
+      const limit = Number(url.searchParams.get("limit") || 50);
+      return json(response, 200, { items: filtered.slice(offset, offset + limit), total: filtered.length, offset, limit });
+    }
+    const promoteProposal = path.match(/^\/api\/v1\/auto-tag\/proposals\/(\d+)\/promote$/);
+    if (promoteProposal && request.method === "POST") {
+      const proposal = autoTagProposals.find((item) => item.id === Number(promoteProposal[1]));
+      if (!proposal) return json(response, 404, { detail: "Topic candidate not found" });
+      if (proposal.status === "promoted") return json(response, 200, tags.find((tag) => tag.id === proposal.promoted_tag_id));
+      const tag = { id: Math.max(...tags.map((item) => item.id), 0) + 1, name: proposal.name, color: null, description: proposal.description, aliases: proposal.aliases, origin: "manual_promoted", auto_assignable: true, entry_count: proposal.support_count };
+      tags.push(tag);
+      proposal.status = "promoted";
+      proposal.promoted_tag_id = tag.id;
+      autoTagPolicyRevision += 1;
+      autoTagStatus = { ...autoTagStatus, proposal_count: autoTagProposals.filter((item) => item.status === "active").length, promoted_count: autoTagProposals.filter((item) => item.status === "promoted").length, outdated_count: 0, needs_rebuild: false };
+      return json(response, 200, tag);
+    }
     const mergeTags = path.match(/^\/api\/v1\/tags\/(\d+)\/merge\/(\d+)$/);
     if (mergeTags && request.method === "POST") {
       const sourceId = Number(mergeTags[1]);
@@ -306,6 +338,25 @@ const server = createServer(async (request, response) => {
       const entry = entries.find((item) => item.id === Number(state[1]));
       entry.state = { ...entry.state, ...(await body(request)) };
       return json(response, 200, entry);
+    }
+    const tagOrder = path.match(/^\/api\/v1\/entries\/(\d+)\/tags\/order$/);
+    if (tagOrder && request.method === "PUT") {
+      const entry = entries.find((item) => item.id === Number(tagOrder[1]));
+      if (!entry) return json(response, 404, { detail: "Entry not found" });
+      const { tag_ids: ids } = await body(request);
+      if (ids.length !== entry.tags.length || new Set(ids).size !== ids.length || ids.some((id) => !entry.tags.some((tag) => tag.id === id))) return json(response, 409, { detail: "Article tags have changed" });
+      entry.tags = ids.map((id, index) => ({ ...entry.tags.find((tag) => tag.id === id), weight: ids.length - index }));
+      return json(response, 200, entry);
+    }
+    const entryTag = path.match(/^\/api\/v1\/entries\/(\d+)\/tags\/(\d+)$/);
+    if (entryTag && ["POST", "DELETE"].includes(request.method)) {
+      const entry = entries.find((item) => item.id === Number(entryTag[1]));
+      const tag = tags.find((item) => item.id === Number(entryTag[2]));
+      if (!entry || !tag) return json(response, 404, { detail: "Entry or tag not found" });
+      if (request.method === "DELETE") entry.tags = entry.tags.filter((item) => item.id !== tag.id);
+      else if (!entry.tags.some((item) => item.id === tag.id)) entry.tags.push({ ...tag, weight: 1 });
+      entry.tags.sort((a, b) => b.weight - a.weight || a.name.localeCompare(b.name));
+      return empty(response);
     }
     const detail = path.match(/^\/api\/v1\/entries\/(\d+)$/);
     if (detail && request.method === "GET") return json(response, 200, entries.find((item) => item.id === Number(detail[1])));

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from backend.app.parsing import (
@@ -32,6 +34,7 @@ def test_parse_rss_cleans_html_and_normalizes_metadata():
     assert "bad" not in entries[0].summary
     assert entries[0].url == "https://example.test/paper"
     assert entries[0].categories == ["optics"]
+    assert entries[0].published_at == datetime(2026, 7, 24, 12)
 
 
 def test_parse_arxiv_atom_version_announce_categories_and_doi():
@@ -59,6 +62,51 @@ def test_parse_arxiv_atom_version_announce_categories_and_doi():
     assert entry.announce_type == "replace"
     assert entry.categories == ["physics.atom-ph", "quant-ph"]
     assert entry.doi == "10.1234/abc.5"
+    assert entry.published_at == datetime(2026, 7, 23, 12)
+    assert entry.updated_at == datetime(2026, 7, 24, 12)
+
+
+@pytest.mark.parametrize("date, expected", [
+    ("2026-10-08T10:00:00+00:00", datetime(2026, 10, 8, 10)),
+    ("2026-10-08T18:00:00+08:00", datetime(2026, 10, 8, 10)),
+    ("2026-10-08", datetime(2026, 10, 8)),
+    ("invalid date", None),
+])
+def test_parse_rdf_item_date_is_independent_of_channel_date(date, expected):
+    rss = f"""<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+        xmlns="http://purl.org/rss/1.0/"
+        xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <channel rdf:about="https://journal.test/"><title>Journal</title>
+        <dc:date>2026-10-10T00:00:00Z</dc:date></channel>
+      <item rdf:about="https://journal.test/paper"><title>Paper</title>
+        <link>https://journal.test/paper</link><dc:date>{date}</dc:date>
+      </item>
+      <item rdf:about="https://journal.test/undated"><title>Undated</title>
+        <link>https://journal.test/undated</link></item>
+    </rdf:RDF>""".encode()
+
+    _, entries = parse_feed(rss, "application/rdf+xml")
+
+    assert entries[0].published_at is None
+    assert entries[0].updated_at == expected
+    assert entries[1].published_at is None
+    assert entries[1].updated_at is None
+
+
+def test_parse_atom_updated_only_and_undated_entries_do_not_invent_publication_dates():
+    atom = b"""<feed xmlns="http://www.w3.org/2005/Atom">
+      <title>Atom sample</title><updated>2026-10-10T00:00:00Z</updated>
+      <entry><id>https://example.test/updated</id><title>Updated</title>
+        <updated>2026-10-09T00:00:00Z</updated></entry>
+      <entry><id>https://example.test/undated</id><title>Undated</title></entry>
+    </feed>"""
+
+    _, entries = parse_feed(atom, "application/atom+xml")
+
+    assert entries[0].published_at is None
+    assert entries[0].updated_at == datetime(2026, 10, 9)
+    assert entries[1].published_at is None
+    assert entries[1].updated_at is None
 
 
 def test_parse_arxiv_rss_creator_as_opaque_credit_text():

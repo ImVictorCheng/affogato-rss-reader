@@ -1,4 +1,22 @@
-import type { Entry, LanguageMode, Locale } from "./types";
+import type { Entry, EntryTag, LanguageMode, Locale } from "./types";
+
+export function sortedEntryTags(tags: readonly EntryTag[]): EntryTag[] {
+  return [...tags].sort((a, b) =>
+    (b.weight ?? 1) - (a.weight ?? 1) || a.name.localeCompare(b.name, "en", { sensitivity: "base" }) || a.id - b.id,
+  );
+}
+
+export function entryDate(entry: Entry): { value: string | null; source: "published" | "updated" | "collected" | null } {
+  const dates = [
+    ["updated", entry.source_updated_at],
+    ["published", entry.published_at],
+    ["collected", entry.created_at],
+  ] as const;
+  for (const [source, value] of dates) {
+    if (value && Number.isFinite(new Date(value).getTime())) return { value, source };
+  }
+  return { value: null, source: null };
+}
 
 export function formatDateTime(value?: string | null, locale: Locale = "en"): string {
   if (!value) return "—";

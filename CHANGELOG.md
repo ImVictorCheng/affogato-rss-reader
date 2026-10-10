@@ -4,6 +4,37 @@ All notable changes are documented here. This project follows Semantic Versionin
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-10
+
+### Changed
+
+- Show the two highest-weight article tags beside the domain badges on cards.
+- Sort article tags by descending weight and then alphabetically. Dragging or
+  moving tags with the keyboard saves article-specific weights from N down to 1.
+- Show active topic candidates after the tag settings in the same card grid and
+  allow manual promotion, retaining promotion history in the application log.
+- Replace the inferred automatic-tag cleanup workflow with tag selection and
+  deletion, including select-all and invert-selection controls.
+- Temporarily disable auto-tag trials and approval gates while retaining the
+  workflow for restoration; configured automatic tagging can be enabled directly.
+
+### Fixed
+
+- Remove an article tag only through its compact dedicated close button;
+  clicking the tag name no longer removes it.
+- Show the RSS/Atom entry's update date (including Dublin Core `dc:date`) in
+  article lists and details, falling back to publication or labeled collection
+  dates. Refresh date metadata even when article content is unchanged.
+- Keep completed automatic-tag results valid after model, policy, topic-library,
+  and alias updates instead of marking historical articles as needing a rebuild.
+- Preserve article and feed tag associations when upgrading SQLite databases
+  with foreign-key enforcement enabled.
+
+### Internal
+
+- Update both READMEs to describe current behavior and require README and
+  changelog review during release preparation.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added

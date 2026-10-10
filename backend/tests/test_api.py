@@ -195,15 +195,23 @@ def test_auto_tag_status_can_be_configured(authenticated_client):
     assert body["support_window_days"] == 365
     assert body["canonical_language"] == "en"
     assert body["min_confidence"] == 0.8
-    assert body["preview_required"] is True
-    blocked = client.patch(
+    assert body["preview_required"] is False
+    enabled = client.patch(
         "/api/v1/auto-tag/status",
         json={"enabled": True, "growth_mode": "closed"},
         headers=headers,
     )
-    assert blocked.status_code == 400
-    assert "preview" in blocked.json()["detail"].lower()
-    assert client.get("/api/v1/auto-tag/status").json()["enabled"] is False
+    assert enabled.status_code == 200, enabled.text
+    assert enabled.json()["preview_required"] is False
+    assert client.get("/api/v1/auto-tag/status").json()["enabled"] is True
+    changed = client.patch(
+        "/api/v1/auto-tag/status",
+        json={"enabled": True, "growth_mode": "threshold"},
+        headers=headers,
+    )
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["enabled"] is True
+    assert changed.json()["preview_required"] is False
     disabled = client.patch(
         "/api/v1/auto-tag/status",
         json={"enabled": False, "create_new": True, "llm_connection_id": connection["id"]},
@@ -212,12 +220,24 @@ def test_auto_tag_status_can_be_configured(authenticated_client):
     assert disabled.json()["enabled"] is False
     assert disabled.json()["growth_mode"] == "threshold"
     assert disabled.json()["create_new"] is True
-    assert disabled.json()["preview_required"] is True
+    assert disabled.json()["preview_required"] is False
+
+
+def test_auto_tag_preview_routes_are_dormant(authenticated_client, monkeypatch):
+    client, factory, headers = authenticated_client
+    monkeypatch.setattr(api_module, "create_preview", lambda *args, **kwargs: pytest.fail("Preview creation must stay dormant"))
+    assert client.get("/api/v1/auto-tag/previews").status_code == 404
+    assert client.get("/api/v1/auto-tag/previews/1").status_code == 404
+    assert client.post("/api/v1/auto-tag/previews", json={"sample_size": 50}, headers=headers).status_code == 404
+    assert client.post("/api/v1/auto-tag/previews/1/approve", json={"scope": "all"}, headers=headers).status_code == 404
+    with factory() as db:
+        assert db.scalar(select(AutoTagPreview.id)) is None
 
 
 def test_auto_tag_preview_cleanup_and_proposal_routes(
-    authenticated_client, monkeypatch
+    authenticated_client, monkeypatch, enabled_auto_tag_preview
 ):
+    monkeypatch.setattr("backend.app.auto_tag.LEGACY_AUTO_TAG_CLEANUP_ENABLED", True)
     client, factory, headers = authenticated_client
     now = datetime(2026, 8, 21, 8)
 
@@ -277,7 +297,7 @@ def test_auto_tag_preview_cleanup_and_proposal_routes(
     monkeypatch.setattr(
         api_module,
         "list_proposals",
-        lambda _db, *, offset, limit: {
+        lambda _db, *, offset, limit, status: {
             "items": [
                 {
                     "id": 9,
@@ -330,6 +350,70 @@ def test_auto_tag_preview_cleanup_and_proposal_routes(
     proposals = client.get("/api/v1/auto-tag/proposals?offset=0&limit=10")
     assert proposals.status_code == 200
     assert proposals.json()["items"][0]["support_count"] == 4
+
+
+def test_candidate_listing_filters_before_pagination(authenticated_client):
+    client, factory, _headers = authenticated_client
+    with factory() as db:
+        db.add_all([
+            TagProposal(name="Candidate one", normalized_name="candidate one", status="active"),
+            TagProposal(name="Candidate two", normalized_name="candidate two", status="active"),
+            TagProposal(name="Previously promoted", normalized_name="previously promoted", status="promoted"),
+            TagProposal(name="Retired topic", normalized_name="retired topic", status="retired"),
+        ])
+        db.commit()
+    first = client.get("/api/v1/auto-tag/proposals?status=active&limit=1")
+    second = client.get("/api/v1/auto-tag/proposals?status=active&limit=1&offset=1")
+    assert first.status_code == second.status_code == 200
+    assert first.json()["total"] == second.json()["total"] == 2
+    assert first.json()["items"][0]["name"] == "Candidate one"
+    assert second.json()["items"][0]["name"] == "Candidate two"
+    assert client.get("/api/v1/auto-tag/proposals").json()["total"] == 4
+
+
+def test_manual_candidate_promotion_requires_csrf_and_is_idempotent(authenticated_client):
+    client, factory, headers = authenticated_client
+    with factory() as db:
+        proposal = TagProposal(name="Quantum networks", normalized_name="quantum networks", description="Quantum communication.", status="active")
+        db.add(proposal)
+        db.flush()
+        db.add(TagProposalAlias(proposal_id=proposal.id, alias="QNet", normalized_alias="qnet"))
+        db.commit()
+        proposal_id = proposal.id
+    endpoint = f"/api/v1/auto-tag/proposals/{proposal_id}/promote"
+    assert client.post(endpoint).status_code == 403
+    result = client.post(endpoint, headers=headers)
+    assert result.status_code == 200, result.text
+    assert result.json()["name"] == "Quantum networks"
+    assert result.json()["description"] == "Quantum communication."
+    assert result.json()["aliases"] == ["QNet"]
+    assert result.json()["origin"] == "manual_promoted"
+    assert result.json()["auto_assignable"] is True
+    assert result.json()["entry_count"] == 0
+    assert client.post(endpoint, headers=headers).json()["id"] == result.json()["id"]
+    assert client.get("/api/v1/auto-tag/proposals?status=active").json()["total"] == 0
+    assert len(client.get("/api/v1/tags").json()["items"]) == 1
+    status = client.get("/api/v1/auto-tag/status").json()
+    assert status["proposal_count"] == 0 and status["promoted_count"] == 1
+    assert status["enabled"] is False and status["configured"] is False
+    assert status["needs_rebuild"] is False
+    assert client.post("/api/v1/auto-tag/proposals/9999/promote", headers=headers).status_code == 404
+
+
+def test_manual_candidate_promotion_rejects_retired_and_unavailable_topics(authenticated_client):
+    client, factory, headers = authenticated_client
+    with factory() as db:
+        retired = TagProposal(name="Retired topic", normalized_name="retired topic", status="retired")
+        conflict = TagProposal(name="Unavailable topic", normalized_name="unavailable topic", status="active")
+        db.add_all([retired, conflict, Tag(name="Unavailable topic", normalized_name="unavailable topic", auto_assignable=False)])
+        db.commit()
+        retired_id, conflict_id = retired.id, conflict.id
+    for proposal_id in [retired_id, conflict_id]:
+        assert client.post(f"/api/v1/auto-tag/proposals/{proposal_id}/promote", headers=headers).status_code == 409
+    with factory() as db:
+        assert db.get(TagProposal, retired_id).status == "retired"
+        assert db.get(TagProposal, conflict_id).status == "active"
+        assert db.scalar(select(Tag)).auto_assignable is False
 
 
 def test_manual_tag_provenance_suppression_and_merge(authenticated_client):
@@ -796,7 +880,79 @@ def test_merge_tag_remaps_all_references_and_preserves_target_metadata(
         assert aliases == {"QEC", "Quantum EC"}
 
 
-def test_cleanup_only_changes_explicitly_selected_associations(authenticated_client):
+def test_bulk_tag_deletion_removes_links_without_deleting_articles_or_feeds(authenticated_client):
+    client, factory, headers = authenticated_client
+    entry_id = add_entry(factory, title="Bulk tag deletion")
+    with factory() as db:
+        selected = Tag(name="AI", normalized_name="ai", origin="auto_promoted")
+        second = Tag(name="Old topic", normalized_name="old topic")
+        retained = Tag(name="Physics", normalized_name="physics")
+        feed = Feed(title="Retained feed", url="https://bulk-delete.test/feed")
+        db.add_all([selected, second, retained, feed])
+        db.flush()
+        ids = [selected.id, second.id]
+        retained_id, feed_id = retained.id, feed.id
+        link = EntryTag(entry_id=entry_id, tag_id=selected.id)
+        db.add(link)
+        db.flush()
+        db.add_all([
+            EntryTagSource(entry_tag_id=link.id, source="manual"),
+            EntryTagSource(entry_tag_id=link.id, source="auto"),
+            EntryTag(entry_id=entry_id, tag_id=retained.id),
+            FeedTag(feed_id=feed.id, tag_id=selected.id),
+            FeedTag(feed_id=feed.id, tag_id=retained.id),
+            TagAlias(tag_id=selected.id, alias="Artificial Intelligence", normalized_alias="artificial intelligence"),
+            AutoTagSuppression(entry_id=entry_id, tag_id=second.id),
+            AutoTagRecord(entry_id=entry_id, source_hash="a" * 64, status="complete", tag_ids=[*ids, retained.id]),
+            TagProposal(name="AI", normalized_name="ai", status="promoted", promoted_tag_id=selected.id),
+            BriefSchedule(name="Disabled plan", period="daily", timezone="UTC", cutoff_time="09:00", tag_ids=[*ids, retained.id], enabled=False),
+            BriefSchedule(name="Unrelated active plan", period="daily", timezone="UTC", cutoff_time="09:00", tag_ids=[retained.id], enabled=True),
+        ])
+        db.commit()
+
+    response = client.post("/api/v1/tags/delete", headers=headers, json={"tag_ids": [*ids, ids[0]]})
+    assert response.status_code == 204, response.text
+    with factory() as db:
+        assert all(db.get(Tag, tag_id) is None for tag_id in ids)
+        assert db.get(Tag, retained_id) is not None
+        assert db.get(Entry, entry_id) is not None
+        assert db.get(Feed, feed_id) is not None
+        assert list(db.scalars(select(EntryTag.tag_id))) == [retained_id]
+        assert list(db.scalars(select(FeedTag.tag_id))) == [retained_id]
+        assert db.scalar(select(func.count(EntryTagSource.id))) == 0
+        assert db.scalar(select(func.count(TagAlias.id))) == 0
+        assert db.scalar(select(func.count(AutoTagSuppression.id))) == 0
+        assert db.scalar(select(AutoTagRecord)).tag_ids == [retained_id]
+        assert all(schedule.tag_ids == [retained_id] for schedule in db.scalars(select(BriefSchedule)))
+        proposal = db.scalar(select(TagProposal))
+        assert proposal.status == "retired"
+        assert proposal.promoted_tag_id is None
+
+
+def test_bulk_tag_deletion_is_atomic_and_requires_csrf(authenticated_client):
+    client, factory, headers = authenticated_client
+    with factory() as db:
+        first = Tag(name="Keep first", normalized_name="keep first")
+        second = Tag(name="Scheduled", normalized_name="scheduled")
+        db.add_all([first, second])
+        db.flush()
+        ids = [first.id, second.id]
+        db.add(BriefSchedule(name="Active plan", period="daily", timezone="UTC", cutoff_time="09:00", tag_ids=[second.id], enabled=True))
+        db.commit()
+
+    assert client.post("/api/v1/tags/delete", json={"tag_ids": ids}).status_code == 403
+    for selection, detail in [([ids[0], 999999], "no longer exist"), (ids, "active brief schedules")]:
+        response = client.post("/api/v1/tags/delete", headers=headers, json={"tag_ids": selection})
+        assert response.status_code == 409, response.text
+        assert detail in response.json()["detail"]
+        with factory() as db:
+            assert all(db.get(Tag, tag_id) is not None for tag_id in ids)
+    for selection in ([], [0], [-1]):
+        assert client.post("/api/v1/tags/delete", headers=headers, json={"tag_ids": selection}).status_code == 422
+
+
+def test_cleanup_only_changes_explicitly_selected_associations(authenticated_client, monkeypatch):
+    monkeypatch.setattr("backend.app.auto_tag.LEGACY_AUTO_TAG_CLEANUP_ENABLED", True)
     client, factory, headers = authenticated_client
     remove_entry_id = add_entry(factory, title="Cleanup remove")
     keep_entry_id = add_entry(factory, title="Cleanup keep")
@@ -1058,6 +1214,27 @@ def test_login_rate_limit_bounds_attacker_controlled_client_keys(monkeypatch):
     finally:
         with security._login_attempt_lock:
             security._login_attempts.clear()
+
+
+def test_entry_list_and_detail_expose_source_and_collection_dates(authenticated_client):
+    client, factory, _headers = authenticated_client
+    entry_id = add_entry(factory)
+    with factory() as db:
+        entry = db.get(Entry, entry_id)
+        entry.published_at = None
+        entry.source_updated_at = datetime(2026, 10, 8, 10)
+        entry.created_at = datetime(2026, 10, 9, 12)
+        entry.updated_at = datetime(2026, 10, 10, 14)
+        db.commit()
+
+    detail = client.get(f"/api/v1/entries/{entry_id}")
+    listing = client.get("/api/v1/entries")
+    assert detail.status_code == listing.status_code == 200
+    for item in (detail.json(), listing.json()["items"][0]):
+        assert item["published_at"] is None
+        assert item["source_updated_at"] == "2026-10-08T10:00:00Z"
+        assert item["created_at"] == "2026-10-09T12:00:00Z"
+        assert item["updated_at"] == "2026-10-10T14:00:00Z"
 
 
 def test_entry_states_search_tags_and_translation(authenticated_client):

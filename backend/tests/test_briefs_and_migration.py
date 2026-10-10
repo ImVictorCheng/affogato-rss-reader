@@ -27,6 +27,7 @@ from backend.app.briefs import (
     schedule_window,
 )
 from backend.app.config import get_settings
+from backend.app.db import init_database, make_engine
 from backend.app.llm import (
     LLMConnectionError,
     LLMRequestCancelled,
@@ -605,7 +606,7 @@ def test_proxy_migrations_preserve_links_and_repair_arxiv_orphans(
         ).fetchone()[0] == "direct"
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == "0015"
+        ).fetchone()[0] == "0016"
     get_settings.cache_clear()
 
 
@@ -691,8 +692,124 @@ def test_governed_auto_tag_migration_preserves_legacy_links_and_pauses_growth(
         }
         assert connection.execute(
             "SELECT version_num FROM alembic_version"
-        ).fetchone()[0] == "0015"
+        ).fetchone()[0] == "0016"
     get_settings.cache_clear()
+
+
+def test_entry_tag_weight_migration_preserves_sources(tmp_path: Path, settings):
+    database = tmp_path / "tag-weight-migration.db"
+    configured = settings.model_copy(update={"database_url": f"sqlite:///{database.as_posix()}"})
+    engine = make_engine(configured)
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0015")
+            connection.exec_driver_sql("INSERT INTO works(id,dedup_key,created_at) VALUES(1,'tag-weight-test','2026-10-10')")
+            connection.exec_driver_sql("""INSERT INTO entries(id,work_id,version_key,title,summary,url,authors,categories,source_hash,created_at,updated_at)
+                VALUES(1,1,'default','Article','','https://example.test','[]','[]','hash','2026-10-10','2026-10-10')""")
+            connection.exec_driver_sql("""INSERT INTO tags(id,name,description,origin,auto_assignable,created_at)
+                VALUES(1,'Topic','','manual',1,'2026-10-10')""")
+            connection.exec_driver_sql("INSERT INTO entry_tags(id,entry_id,tag_id) VALUES(1,1,1)")
+            connection.exec_driver_sql("""INSERT INTO entry_tag_sources(id,entry_tag_id,source,confidence,created_at,updated_at)
+                VALUES(1,1,'auto',0.9,'2026-10-10','2026-10-10')""")
+            command.upgrade(config, "head")
+            assert connection.exec_driver_sql("SELECT weight FROM entry_tags").scalar() is None
+            connection.exec_driver_sql("UPDATE entry_tags SET weight=3")
+            assert connection.exec_driver_sql("SELECT weight FROM entry_tags").scalar() == 3
+            command.downgrade(config, "0015")
+            assert connection.exec_driver_sql("SELECT entry_tag_id,confidence FROM entry_tag_sources").all() == [(1, 0.9)]
+            command.upgrade(config, "head")
+            assert connection.exec_driver_sql("SELECT id,entry_id,tag_id,weight FROM entry_tags").all() == [(1, 1, 1, None)]
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+    finally:
+        engine.dispose()
+
+
+def test_governed_auto_tag_startup_preserves_foreign_key_dependents(
+    tmp_path: Path, settings
+):
+    database = tmp_path / "governed-auto-tags-startup.db"
+    configured = settings.model_copy(
+        update={"database_url": f"sqlite:///{database.as_posix()}"}
+    )
+    engine = make_engine(configured)
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    try:
+        with engine.begin() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+            config.attributes["connection"] = connection
+            command.upgrade(config, "0014")
+
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.executescript(
+                """
+                INSERT INTO works(id,dedup_key,created_at)
+                VALUES(1,'url:https://migration.test/startup','2026-08-01');
+                INSERT INTO entries(
+                    id,work_id,version_key,title,summary,url,authors,categories,
+                    source_hash,created_at,updated_at
+                ) VALUES(
+                    1,1,'default','Startup migration article','Summary',
+                    'https://migration.test/startup','[]','[]','source-hash',
+                    '2026-08-01','2026-08-01'
+                );
+                INSERT INTO feeds(
+                    id,title,url,position,enabled,poll_interval_minutes,
+                    error_count,created_at,updated_at
+                ) VALUES(
+                    1,'Migration feed','https://migration.test/feed',0,1,60,0,
+                    '2026-08-01','2026-08-01'
+                );
+                INSERT INTO tags(id,name,color)
+                VALUES(10,'Article topic','#123456'),(20,'Feed topic',NULL);
+                INSERT INTO entry_tags(id,entry_id,tag_id)
+                VALUES(101,1,10),(102,1,20);
+                INSERT INTO feed_tags(id,feed_id,tag_id)
+                VALUES(201,1,10),(202,1,20);
+                INSERT INTO entry_feeds(id,entry_id,feed_id,first_seen_at)
+                VALUES(301,1,1,'2026-08-01');
+                INSERT INTO auto_tag_records(
+                    id,entry_id,source_hash,status,attempts,tag_ids,
+                    created_at,updated_at
+                ) VALUES(
+                    401,1,'source-hash','complete',1,'[10,20]',
+                    '2026-08-01','2026-08-01'
+                );
+                """
+            )
+            connection.commit()
+
+        # Exercise the startup/CLI path, which keeps SQLite foreign keys ON.
+        # A standalone Alembic engine does not enable that pragma and would
+        # hide cascading deletes caused by a batch rebuild of the tags table.
+        init_database(engine, configured)
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
+            assert connection.exec_driver_sql(
+                "SELECT id,entry_id,tag_id FROM entry_tags ORDER BY id"
+            ).all() == [(101, 1, 10), (102, 1, 20)]
+            assert connection.exec_driver_sql(
+                "SELECT id,feed_id,tag_id FROM feed_tags ORDER BY id"
+            ).all() == [(201, 1, 10), (202, 1, 20)]
+            assert connection.exec_driver_sql(
+                "SELECT entry_tag_id,source FROM entry_tag_sources ORDER BY entry_tag_id"
+            ).all() == [(101, "legacy"), (102, "legacy")]
+            assert connection.exec_driver_sql(
+                "SELECT id,entry_id,feed_id FROM entry_feeds"
+            ).all() == [(301, 1, 1)]
+            assert connection.exec_driver_sql(
+                "SELECT id,entry_id,tag_ids,policy_version FROM auto_tag_records"
+            ).all() == [(401, 1, "[10,20]", None)]
+            assert connection.exec_driver_sql(
+                "SELECT count(*) FROM tags WHERE created_at IS NULL"
+            ).scalar() == 0
+
+    finally:
+        engine.dispose()
 
 
 def test_stream_completion_aborts_on_stop_check():

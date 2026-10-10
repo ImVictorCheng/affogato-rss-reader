@@ -9,7 +9,19 @@ workflow (`.github/workflows/release.yml`) validates that the tag equals
 `VERSION` and that the tagged commit is contained in `main`, then reruns the
 full CI as a quality gate before building and publishing images.
 
-1. **Bump the version on `dev`.** Update `VERSION` and every location that
+1. **Update release documentation and bump the version on `dev`.** Before
+   changing the version:
+
+   - Update `README.md` and `backend/README.md` against the final implementation,
+     including current configuration, enabled or dormant workflows,
+     user-facing behavior, and relevant API or migration changes.
+   - Review `CHANGELOG.md`'s `[Unreleased]` section. Consolidate duplicate or
+     superseded entries and describe the final behavior being released. Preserve
+     published version sections as historical records.
+   - Complete the documentation review in `docs/RELEASE_CHECKLIST.md` for every
+     release, even when no README changes are needed.
+
+   Update `VERSION` and every location that
    `scripts/check_version.py` verifies: `web/package.json`,
    `web/package-lock.json`, `backend/pyproject.toml`,
    `backend/app/config.py`, `web/src/brand.ts`, `compose.yaml`,

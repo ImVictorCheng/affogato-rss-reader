@@ -1,5 +1,6 @@
-import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
+import { autoTagPreviewEnabled } from "../features";
 import { composeSiteIdentity, customizeSiteIdentity, supportsGeneratedIdentity } from "../domainThemes";
 import { t } from "../i18n";
 import type { AppSettings, AuthStatus, AutoTagCleanupPreview, AutoTagGrowthMode, AutoTagPreview, AutoTagProposal, AutoTagStatus, CallLog, Domain, Feed, Folder, Job, LLMConnection, Locale, NetworkProxy, NetworkProxyTestResult, OnboardingProfile, ProxyMode, SiteIdentity, Tag, ThemeConfig, TranslationFallbackMode, TranslationProvider, TranslationProxyService, TranslationStatus, UpdateStatus } from "../types";
@@ -22,8 +23,11 @@ const AUTO_TAG_SETTINGS = {
   canonical_language: "en" as const,
 };
 const MIN_AUTO_TAG_CONFIDENCE = 0.8;
+const PROPOSAL_PAGE_SIZE = 50;
 const ACTIVE_AUTO_TAG_PREVIEW_STATUSES = new Set(["pending", "queued", "running"]);
 const READY_AUTO_TAG_PREVIEW_STATUSES = new Set(["complete", "completed", "ready", "success"]);
+// Dormant provenance cleanup workflow; restoration notes: docs/LEGACY_TAG_CLEANUP.md.
+const LEGACY_AUTO_TAG_CLEANUP_ENABLED = false;
 
 function autoTagPolicyChanged(previous: AutoTagStatus | null, next: AutoTagStatus): boolean {
   if (!previous) return false;
@@ -84,6 +88,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
 }) {
   const zh = locale === "zh-CN";
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("home");
+  const previewEnabled = autoTagPreviewEnabled();
   const [translation, setTranslation] = useState<TranslationStatus | null>(null);
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -115,6 +120,15 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   const [tagEditDraft, setTagEditDraft] = useState("");
   const [tagBusyId, setTagBusyId] = useState<number | null>(null);
   const [tagBusy, setTagBusy] = useState(false);
+  const [selectedTagIds, setSelectedTagIds] = useState<number[]>([]);
+  const [tagDeleting, setTagDeleting] = useState(false);
+  const [proposals, setProposals] = useState<AutoTagProposal[]>([]);
+  const [proposalTotal, setProposalTotal] = useState(0);
+  const [proposalOffset, setProposalOffset] = useState(0);
+  const [proposalsLoading, setProposalsLoading] = useState(false);
+  const [proposalError, setProposalError] = useState("");
+  const [promotingProposalId, setPromotingProposalId] = useState<number | null>(null);
+  const proposalRequestId = useRef(0);
   const [networkProxy, setNetworkProxy] = useState<NetworkProxy | null>(null);
   const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxyUrl, setProxyUrl] = useState("");
@@ -148,7 +162,6 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   const [autoTagGrowthMode, setAutoTagGrowthMode] = useState<AutoTagGrowthMode>("closed");
   const [autoTagLlmConnectionId, setAutoTagLlmConnectionId] = useState("");
   const [autoTagSaving, setAutoTagSaving] = useState(false);
-  const [autoTagProposals, setAutoTagProposals] = useState<AutoTagProposal[]>([]);
   const [autoTagPreview, setAutoTagPreview] = useState<AutoTagPreview | null>(null);
   const [autoTagPreviewBusy, setAutoTagPreviewBusy] = useState(false);
   const [autoTagApproving, setAutoTagApproving] = useState(false);
@@ -164,6 +177,28 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   const [loading, setLoading] = useState(false);
   const [resetting, setResetting] = useState(false);
   const [error, setError] = useState("");
+  const refreshActiveProposals = useCallback(async (showLoading = false) => {
+    const requestId = ++proposalRequestId.current;
+    if (showLoading) setProposalsLoading(true);
+    try {
+      const result = await api.autoTagProposals(proposalOffset, PROPOSAL_PAGE_SIZE, "active");
+      if (requestId !== proposalRequestId.current) return;
+      setProposalTotal(result.total);
+      setProposalError("");
+      if (proposalOffset > 0 && proposalOffset >= result.total) {
+        setProposalOffset(Math.max(0, Math.floor((result.total - 1) / PROPOSAL_PAGE_SIZE) * PROPOSAL_PAGE_SIZE));
+      } else {
+        setProposals(result.items.filter((proposal) => proposal.status === "active"));
+      }
+    } catch (caught) {
+      if (requestId === proposalRequestId.current) setProposalError(errorText(caught));
+    } finally {
+      if (requestId === proposalRequestId.current) setProposalsLoading(false);
+    }
+  }, [proposalOffset]);
+  useEffect(() => {
+    setSelectedTagIds((current) => current.filter((id) => tags.some((tag) => tag.id === id)));
+  }, [tags]);
   useEffect(() => {
     if (settingsPage === "appearance") {
       setLoading(true);
@@ -243,14 +278,14 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       }
     };
     void refresh();
-    void api.autoTagProposals(0, 200).then((value) => setAutoTagProposals(value.items)).catch(() => undefined);
-    const previewGeneration = autoTagPreviewGeneration.current;
-    void api.autoTagPreviews()
-      .then((items) => setAutoTagPreviewForGeneration(items.at(0) || null, previewGeneration))
-      .catch(() => undefined);
+    if (previewEnabled) {
+      const previewGeneration = autoTagPreviewGeneration.current;
+      void api.autoTagPreviews()
+        .then((items) => setAutoTagPreviewForGeneration(items.at(0) || null, previewGeneration))
+        .catch(() => undefined);
+    }
     const timer = window.setInterval(() => {
       void api.autoTagStatus().then(setAutoTag).catch(() => undefined);
-      void api.autoTagProposals(0, 200).then((value) => setAutoTagProposals(value.items)).catch(() => undefined);
     }, 5000);
     return () => {
       window.clearInterval(timer);
@@ -258,7 +293,16 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     };
   }, [settingsPage]);
   useEffect(() => {
-    if (settingsPage !== "content" || !autoTagPreview || !ACTIVE_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status)) return;
+    if (settingsPage !== "content") return;
+    void refreshActiveProposals(true);
+    const timer = window.setInterval(() => void refreshActiveProposals(), 5000);
+    return () => {
+      window.clearInterval(timer);
+      proposalRequestId.current += 1;
+    };
+  }, [settingsPage, refreshActiveProposals]);
+  useEffect(() => {
+    if (!previewEnabled || settingsPage !== "content" || !autoTagPreview || !ACTIVE_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status)) return;
     const previewGeneration = autoTagPreviewGeneration.current;
     let latestPollRequestId = 0;
     const timer = window.setInterval(() => {
@@ -275,7 +319,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       latestPollRequestId += 1;
       window.clearInterval(timer);
     };
-  }, [autoTagPreview?.id, autoTagPreview?.status, settingsPage]);
+  }, [autoTagPreview?.id, autoTagPreview?.status, settingsPage, previewEnabled]);
   useEffect(() => {
     if (settingsPage !== "activity") return;
     void api.jobs(20).then(setJobs).catch((caught) => setError(errorText(caught)));
@@ -606,6 +650,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     clearAutoTagPreview();
     setAutoTagCleanupRemoveIds([]);
     setAutoTagCleanup((current) => current ? { ...current, reviewed: false } : null);
+    if (!LEGACY_AUTO_TAG_CLEANUP_ENABLED) return true;
     try {
       const cleanup = await api.autoTagCleanupPreview();
       if (refreshId === autoTagCleanupRefreshId.current) setAutoTagCleanup(cleanup);
@@ -700,20 +745,22 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     }
   }
   async function startAutoTagPreview() {
-    if (!autoTagCleanup?.reviewed) {
+    if (LEGACY_AUTO_TAG_CLEANUP_ENABLED && !autoTagCleanup?.reviewed) {
       notify(locale === "zh-CN" ? "请先预览并确认清理结果。" : "Preview and confirm cleanup before running the 50-article preview.", "error");
       return;
     }
     setAutoTagPreviewBusy(true);
     const previewGeneration = nextAutoTagPreviewGeneration();
     try {
-      const review = await api.autoTagCleanupPreview();
-      if (previewGeneration !== autoTagPreviewGeneration.current) return;
-      setAutoTagCleanup(review);
-      if (!review.reviewed) {
-        clearAutoTagPreview();
-        notify(locale === "zh-CN" ? "清理内容已变化，请重新审阅并确认。" : "Cleanup candidates changed. Review and confirm them again.", "error");
-        return;
+      if (LEGACY_AUTO_TAG_CLEANUP_ENABLED) {
+        const review = await api.autoTagCleanupPreview();
+        if (previewGeneration !== autoTagPreviewGeneration.current) return;
+        setAutoTagCleanup(review);
+        if (!review.reviewed) {
+          clearAutoTagPreview();
+          notify(locale === "zh-CN" ? "清理内容已变化，请重新审阅并确认。" : "Cleanup candidates changed. Review and confirm them again.", "error");
+          return;
+        }
       }
       const preview = await api.createAutoTagPreview({ sample_size: 50 });
       if (!setAutoTagPreviewForGeneration(preview, previewGeneration)) return;
@@ -728,7 +775,8 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     }
   }
   async function approveAutoTagPreview() {
-    if (!autoTagPreview || !READY_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status) || !autoTagCleanup?.reviewed) return;
+    if (!autoTagPreview || !READY_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status)
+      || (LEGACY_AUTO_TAG_CLEANUP_ENABLED && !autoTagCleanup?.reviewed)) return;
     const calls = autoTag?.estimated_calls ?? 0;
     const confirmed = window.confirm(locale === "zh-CN"
       ? `批准试跑结果并处理全部待处理文章？预计需要 ${calls} 次 LLM 调用。`
@@ -738,13 +786,15 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
     const preview = autoTagPreview;
     const previewGeneration = nextAutoTagPreviewGeneration();
     try {
-      const review = await api.autoTagCleanupPreview();
-      if (previewGeneration !== autoTagPreviewGeneration.current) return;
-      setAutoTagCleanup(review);
-      if (!review.reviewed) {
-        clearAutoTagPreview();
-        notify(locale === "zh-CN" ? "清理内容已变化，请重新审阅并重新试跑。" : "Cleanup candidates changed. Review them and run a new preview.", "error");
-        return;
+      if (LEGACY_AUTO_TAG_CLEANUP_ENABLED) {
+        const review = await api.autoTagCleanupPreview();
+        if (previewGeneration !== autoTagPreviewGeneration.current) return;
+        setAutoTagCleanup(review);
+        if (!review.reviewed) {
+          clearAutoTagPreview();
+          notify(locale === "zh-CN" ? "清理内容已变化，请重新审阅并重新试跑。" : "Cleanup candidates changed. Review them and run a new preview.", "error");
+          return;
+        }
       }
       const updated = await api.approveAutoTagPreview(preview.id, { scope: "all" });
       if (previewGeneration !== autoTagPreviewGeneration.current) return;
@@ -762,6 +812,23 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
   }
   async function refreshTags() {
     setTags(await api.tags());
+  }
+  async function promoteCandidate(proposal: AutoTagProposal) {
+    if (promotingProposalId !== null) return;
+    setPromotingProposalId(proposal.id);
+    proposalRequestId.current += 1;
+    try {
+      const tag = await api.promoteAutoTagProposal(proposal.id);
+      setProposals((current) => current.filter((candidate) => candidate.id !== proposal.id));
+      setProposalTotal((current) => Math.max(0, current - 1));
+      setTags((current) => current.some((item) => item.id === tag.id) ? current : [...current, tag]);
+      await Promise.allSettled([refreshTags(), refreshActiveProposals(), invalidateAutoTagWorkflow()]);
+      notify(zh ? `“${proposal.name}”已晋升为正式标签。` : `“${proposal.name}” promoted to a tag.`);
+    } catch (caught) {
+      notify(errorText(caught), "error");
+    } finally {
+      setPromotingProposalId(null);
+    }
   }
   async function createTag(event: FormEvent) {
     event.preventDefault();
@@ -877,19 +944,30 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       setTagBusyId(null);
     }
   }
-  async function removeTag(tag: Tag) {
-    if (!window.confirm(locale === "zh-CN" ? `删除未使用的标签“${tag.name}”？仍有关联或活动引用时服务器会拒绝删除。` : `Delete unused tag “${tag.name}”? The server will reject deletion while associations or active references remain.`)) return;
-    setTagBusyId(tag.id);
+  function toggleTagSelection(tagId: number) {
+    setSelectedTagIds((current) => current.includes(tagId) ? current.filter((id) => id !== tagId) : [...current, tagId]);
+  }
+  async function removeTags(targets: Tag[]) {
+    if (!targets.length || tagDeleting) return;
+    const names = targets.slice(0, 10).map((tag) => tag.name).join(zh ? "、" : ", ");
+    const suffix = targets.length > 10 ? " …" : "";
+    if (!window.confirm(zh
+      ? `删除 ${targets.length} 个标签及其文章、订阅源关联？文章和订阅源本身会保留。此操作无法撤销。\n\n${names}${suffix}`
+      : `Delete ${targets.length} tags and their article/feed associations? Articles and feeds are kept. This cannot be undone.\n\n${names}${suffix}`)) return;
+    setTagDeleting(true);
     try {
-      await api.deleteTag(tag.id);
+      const ids = targets.map((tag) => tag.id);
+      await api.deleteTags(ids);
       const cleanupRefresh = invalidateAutoTagWorkflow();
-      setTags((current) => current.filter((currentTag) => currentTag.id !== tag.id));
+      setTags((current) => current.filter((tag) => !ids.includes(tag.id)));
+      setSelectedTagIds((current) => current.filter((id) => !ids.includes(id)));
+      if (editingTagId !== null && ids.includes(editingTagId)) setEditingTagId(null);
       await Promise.allSettled([refreshTags(), cleanupRefresh]);
-      notify(locale === "zh-CN" ? "标签已删除。" : "Tag deleted.");
+      notify(zh ? `已删除 ${ids.length} 个标签。` : `Deleted ${ids.length} tags.`);
     } catch (caught) {
       notify(errorText(caught), "error");
     } finally {
-      setTagBusyId(null);
+      setTagDeleting(false);
     }
   }
   async function testTranslationConnection() {
@@ -1169,26 +1247,25 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       <div className="section-heading">
         <div><span className="eyebrow">TAGS</span><h3>{locale === "zh-CN" ? "标签" : "Tags"}</h3></div>
       </div>
-      <form className="field-with-action category-manager__create" onSubmit={createTag}><input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder={locale === "zh-CN" ? "新建标签" : "New tag"} maxLength={120} /><button className="button button--primary" disabled={tagBusy || !tagDraft.trim()}>+</button></form>
+      <form className="field-with-action category-manager__create" onSubmit={createTag}><input value={tagDraft} onChange={(event) => setTagDraft(event.target.value)} placeholder={locale === "zh-CN" ? "新建标签" : "New tag"} maxLength={120} /><button className="button button--primary" disabled={tagBusy || tagDeleting || !tagDraft.trim()}>+</button></form>
+      {tags.length > 0 && <div className="tag-manager-selection" role="group" aria-label={zh ? "标签多选" : "Tag selection"}>
+        <span role="status">{zh ? `已选 ${selectedTagIds.length} / ${tags.length}` : `Selected ${selectedTagIds.length} / ${tags.length}`}</span>
+        <button type="button" className="button button--secondary button--small" disabled={tagDeleting} onClick={() => setSelectedTagIds(tags.map((tag) => tag.id))}>{zh ? "全选" : "Select all"}</button>
+        <button type="button" className="button button--secondary button--small" disabled={tagDeleting} onClick={() => setSelectedTagIds((current) => tags.filter((tag) => !current.includes(tag.id)).map((tag) => tag.id))}>{zh ? "反选" : "Invert selection"}</button>
+        <button type="button" className="button button--danger-quiet button--small" disabled={tagDeleting || tagBusy || tagBusyId !== null || selectedTagIds.length === 0} onClick={() => void removeTags(tags.filter((tag) => selectedTagIds.includes(tag.id)))}>{tagDeleting ? (zh ? "正在删除…" : "Deleting…") : (zh ? `删除所选 (${selectedTagIds.length})` : `Delete selected (${selectedTagIds.length})`)}</button>
+      </div>}
       <div className="tag-manager-list">
         {tags.length === 0 && <p className="category-manager__empty">{locale === "zh-CN" ? "还没有标签。可以手动创建，或开启下面的自动打标签。" : "No tags yet. Create one manually or enable auto tagging below."}</p>}
         {tags.map((tag) => {
           const editing = editingTagId === tag.id;
           const count = tag.entry_count ?? 0;
-          const originLabel = tag.origin === "auto_promoted"
-            ? (zh ? "自动晋升" : "promoted")
-            : tag.origin === "legacy"
-              ? (zh ? "历史" : "legacy")
-              : (zh ? "手动" : "manual");
-          return <div className={`tag-manager-card ${editing ? "is-editing" : ""}`} key={tag.id}>
-            <span className="tag-manager-card__dot" style={{ backgroundColor: tag.color || "#8878e8" }} aria-hidden="true" />
+          return <div className={`tag-manager-card ${editing ? "is-editing" : ""} ${selectedTagIds.includes(tag.id) ? "is-selected" : ""}`} key={tag.id}>
+            <input className="tag-manager-card__select" type="checkbox" aria-label={zh ? `选择标签 ${tag.name}` : `Select tag ${tag.name}`} checked={selectedTagIds.includes(tag.id)} disabled={tagDeleting} onChange={() => toggleTagSelection(tag.id)} />
             {editing
               ? <label className="field tag-manager-card__edit"><input aria-label={zh ? `重命名标签 ${tag.name}` : `Rename tag ${tag.name}`} value={tagEditDraft} onChange={(event) => setTagEditDraft(event.target.value)} maxLength={120} autoFocus onKeyDown={(event) => { if (event.key === "Enter") void renameTag(tag); if (event.key === "Escape") setEditingTagId(null); }} /></label>
               : <div className="tag-manager-card__body">
                 <strong title={tag.name}>{tag.name}</strong>
-                <small>{zh ? `${count} 篇 · ${originLabel}` : `${count} entries · ${originLabel}`} · {tag.auto_assignable === false ? (zh ? "禁止自动使用" : "manual only") : (zh ? "可自动使用" : "auto allowed")}</small>
-                {tag.description && <span>{tag.description}</span>}
-                {(tag.aliases?.length ?? 0) > 0 && <span>{zh ? "别名" : "Aliases"}: {tag.aliases?.join(" · ")}</span>}
+                <small>{zh ? `${count} 篇` : `${count} entries`}</small>
               </div>}
             <div className="tag-manager-card__actions">
               {editing
@@ -1197,7 +1274,7 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
                   <button type="button" className="tag-manager-card__icon" aria-label={zh ? `编辑标签详情 ${tag.name}` : `Edit tag details ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => void editTagDetails(tag)}>ⓘ</button>
                   <button type="button" className="tag-manager-card__icon" aria-label={zh ? `合并标签 ${tag.name}` : `Merge tag ${tag.name}`} disabled={tagBusyId === tag.id || tags.length < 2} onClick={() => void mergeTagInto(tag.id, tag.name)}>⇢</button>
                   <button type="button" className="tag-manager-card__icon" aria-label={zh ? `重命名标签 ${tag.name}` : `Rename tag ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => { setEditingTagId(tag.id); setTagEditDraft(tag.name); }}>✎</button>
-                  <button type="button" className="tag-manager-card__icon tag-manager-card__icon--danger" aria-label={zh ? `删除标签 ${tag.name}` : `Delete tag ${tag.name}`} disabled={tagBusyId === tag.id} onClick={() => void removeTag(tag)}>×</button>
+                  <button type="button" className="tag-manager-card__icon tag-manager-card__icon--danger" aria-label={zh ? `删除标签 ${tag.name}` : `Delete tag ${tag.name}`} disabled={tagDeleting || tagBusyId !== null} onClick={() => void removeTags([tag])}>×</button>
                 </>}
             </div>
           </div>;
@@ -1264,28 +1341,21 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
       {autoTag?.needs_rebuild && <div className="auto-tag-rebuild-notice" role="status">
         <strong>{locale === "zh-CN" ? "策略或标签库已变化" : "The policy or tag library changed"}</strong>
         <span>{locale === "zh-CN"
-          ? `${autoTag.outdated_count} 篇文章的旧结果需要重建。系统不会静默调用 LLM；请重新试跑并明确批准。`
-          : `${autoTag.outdated_count} articles have outdated results. The system will not call the LLM silently; run a new preview and explicitly approve it.`}</span>
+          ? `${autoTag.outdated_count} 篇文章的旧结果需要重建。${previewEnabled ? "系统不会静默调用 LLM；请重新试跑并明确批准。" : "系统会保留现有标签，不会自动重打这些文章。"}`
+          : `${autoTag.outdated_count} articles have outdated results. ${previewEnabled ? "The system will not call the LLM silently; run a new preview and explicitly approve it." : "Existing tags are preserved; these articles will not be retagged automatically."}`}</span>
       </div>}
       <p className="muted">{autoTag?.configured ? (locale === "zh-CN" ? "LLM 连接已就绪。" : "LLM connection ready.") : (locale === "zh-CN" ? "尚未绑定 LLM 连接，开启前请先选择。" : "No LLM connection bound; choose one before enabling.")}</p>
-      {autoTagProposals.length > 0 && <div className="auto-tag-proposals">
-        <div className="auto-tag-workflow__heading"><strong>{locale === "zh-CN" ? "候选主题与晋升记录" : "Topic proposals and promotions"}</strong><span>{locale === "zh-CN" ? `活跃 ${autoTag?.proposal_count ?? 0} · 已晋升 ${autoTag?.promoted_count ?? 0}` : `Active ${autoTag?.proposal_count ?? 0} · promoted ${autoTag?.promoted_count ?? 0}`}</span></div>
-        <div className="auto-tag-proposal-list">{autoTagProposals.map((proposal) => <div key={proposal.id}>
-          <span><strong>{proposal.name}</strong>{proposal.description && <small>{proposal.description}</small>}{proposal.aliases.length > 0 && <small>{locale === "zh-CN" ? "别名" : "Aliases"}: {proposal.aliases.join(" · ")}</small>}</span>
-          <span>{proposal.support_count} Work · {autoTagStateLabel(proposal.status, locale)}{proposal.promoted_tag_id ? ` → ${tags.find((tag) => tag.id === proposal.promoted_tag_id)?.name || `#${proposal.promoted_tag_id}`}` : ""}</span>
-        </div>)}</div>
-      </div>}
-      {(autoTag?.preview_required || autoTag?.needs_rebuild) && <div className="auto-tag-workflow">
+      {previewEnabled && (autoTag?.preview_required || autoTag?.needs_rebuild) && <div className="auto-tag-workflow">
         <div className="auto-tag-workflow__heading">
-          <div><span className="eyebrow">SAFE START</span><strong>{locale === "zh-CN" ? "清理并试跑" : "Clean up and preview"}</strong></div>
+          <div><span className="eyebrow">PREVIEW</span><strong>{LEGACY_AUTO_TAG_CLEANUP_ENABLED ? (zh ? "清理并试跑" : "Clean up and preview") : (zh ? "试跑自动打标签" : "Preview auto tagging")}</strong></div>
           <span>{locale === "zh-CN" ? "批准前不会全量处理" : "No full run before approval"}</span>
         </div>
-        <p>{locale === "zh-CN" ? "先检查旧的低质量标签，再用跨订阅源抽样的 50 篇文章验证新规则。试跑遵循上方相同的数据外发边界。" : "Review low-quality legacy tags, then validate the new policy on a 50-article cross-Feed sample. The preview uses the same outbound-data boundary described above."}</p>
+        <p>{zh ? "从不同订阅源抽样最多 50 篇文章试跑，检查标签建议后再批准全量处理。试跑不会修改文章标签，数据外发范围与上方说明一致。" : "Preview tag suggestions on up to 50 articles sampled across feeds, then approve the full run. The preview does not change article tags and uses the outbound data described above."}</p>
         <div className="translation-settings__actions">
-          <button type="button" className="button button--secondary button--small" disabled={autoTagCleanupBusy} onClick={() => void loadAutoTagCleanupPreview()}>{autoTagCleanupBusy ? (locale === "zh-CN" ? "正在检查…" : "Checking…") : autoTagCleanup ? (locale === "zh-CN" ? "刷新清理预览" : "Refresh cleanup preview") : (locale === "zh-CN" ? "预览可清理标签" : "Preview cleanup")}</button>
-          <button type="button" className="button button--secondary button--small" disabled={autoTagPreviewBusy || autoTagCleanupBusy || !autoTag?.configured || !autoTagCleanup?.reviewed} title={!autoTagCleanup?.reviewed ? (locale === "zh-CN" ? "请先加载并确认清理预览" : "Load and confirm the cleanup preview first") : undefined} onClick={() => void startAutoTagPreview()}>{autoTagPreviewBusy ? (locale === "zh-CN" ? "正在启动…" : "Starting…") : (locale === "zh-CN" ? "运行 50 篇试跑" : "Run 50-article preview")}</button>
+          {LEGACY_AUTO_TAG_CLEANUP_ENABLED && <button type="button" className="button button--secondary button--small" disabled={autoTagCleanupBusy} onClick={() => void loadAutoTagCleanupPreview()}>{autoTagCleanupBusy ? (locale === "zh-CN" ? "正在检查…" : "Checking…") : autoTagCleanup ? (locale === "zh-CN" ? "刷新清理预览" : "Refresh cleanup preview") : (locale === "zh-CN" ? "预览可清理标签" : "Preview cleanup")}</button>}
+          <button type="button" className="button button--secondary button--small" disabled={autoTagPreviewBusy || tagDeleting || autoTagCleanupBusy || !autoTag?.configured || (LEGACY_AUTO_TAG_CLEANUP_ENABLED && !autoTagCleanup?.reviewed)} onClick={() => void startAutoTagPreview()}>{autoTagPreviewBusy ? (locale === "zh-CN" ? "正在启动…" : "Starting…") : (locale === "zh-CN" ? "运行 50 篇试跑" : "Run 50-article preview")}</button>
         </div>
-        {autoTagCleanup && <div className="auto-tag-cleanup-preview">
+        {LEGACY_AUTO_TAG_CLEANUP_ENABLED && autoTagCleanup && <div className="auto-tag-cleanup-preview">
           <div className="auto-tag-workflow__heading"><strong>{locale === "zh-CN" ? "清理预览" : "Cleanup preview"}</strong><span>{autoTagCleanup.inferred_auto_association_count} {locale === "zh-CN" ? "条推断自动关联" : "inferred automatic links"} · {autoTagCleanup.reviewed ? (locale === "zh-CN" ? "已确认" : "confirmed") : (locale === "zh-CN" ? "待确认" : "confirmation required")}</span></div>
           {autoTagCleanup.items.length === 0 ? <p>{locale === "zh-CN" ? "没有需要清理的标签。" : "No cleanup candidates found."}</p> : <div className="auto-tag-cleanup-list">{autoTagCleanup.items.map((item) => <div className="auto-tag-cleanup-row" key={item.tag_id}>
             <label>
@@ -1318,8 +1388,31 @@ export function SettingsModal({ locale, auth, onLocale, onClose, onLogout, onDeb
             <strong>{result.title}</strong>
             <span>{result.topics.length ? result.topics.map((topic) => `${topic.name} · ${Math.round(topic.confidence * 100)}%`).join(" · ") : (locale === "zh-CN" ? "无相关标签" : "No relevant tags")}</span>
           </div>)}</div>}
-          {READY_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status) && <button type="button" className="button button--primary button--small" disabled={autoTagApproving || autoTagCleanupBusy || !autoTagCleanup?.reviewed} title={!autoTagCleanup?.reviewed ? (locale === "zh-CN" ? "清理快照已变化，请重新审阅并试跑" : "The cleanup snapshot changed; review it and run a new preview") : undefined} onClick={() => void approveAutoTagPreview()}>{autoTagApproving ? (locale === "zh-CN" ? "正在批准…" : "Approving…") : (locale === "zh-CN" ? "批准全量处理" : "Approve full run")}</button>}
+          {READY_AUTO_TAG_PREVIEW_STATUSES.has(autoTagPreview.status) && <button type="button" className="button button--primary button--small" disabled={autoTagApproving || tagDeleting || autoTagCleanupBusy || (LEGACY_AUTO_TAG_CLEANUP_ENABLED && !autoTagCleanup?.reviewed)} onClick={() => void approveAutoTagPreview()}>{autoTagApproving ? (locale === "zh-CN" ? "正在批准…" : "Approving…") : (locale === "zh-CN" ? "批准全量处理" : "Approve full run")}</button>}
         </div>}
+      </div>}
+    </section>
+    <section className="settings-section tag-proposals-section" aria-labelledby="tag-proposals-heading">
+      <div className="section-heading">
+        <div><span className="eyebrow">CANDIDATE TOPICS</span><h3 id="tag-proposals-heading">{zh ? "候选主题" : "Candidate topics"}</h3></div>
+        <span className="muted">{zh ? `${proposalTotal} 个` : `${proposalTotal} candidates`}</span>
+      </div>
+      <p className="muted">{zh ? "尚未成为正式标签的主题。可以手动晋升，无需等待自动晋升阈值。" : "Topics awaiting promotion to the tag library. Promote a candidate manually without waiting for the support threshold."}</p>
+      {proposalError && <div className="tag-proposals-error"><ErrorNotice message={proposalError} /><button type="button" className="button button--secondary button--small" disabled={proposalsLoading} onClick={() => void refreshActiveProposals(true)}>{zh ? "重试" : "Retry"}</button></div>}
+      <div className="tag-manager-list tag-proposals-list" aria-busy={proposalsLoading}>
+        {proposals.length === 0 && !proposalError && <p className="category-manager__empty">{proposalsLoading ? (zh ? "正在加载候选主题…" : "Loading candidates…") : (zh ? "暂无候选主题。" : "No candidate topics.")}</p>}
+        {proposals.map((proposal) => <div className="tag-manager-card tag-proposal-card" key={proposal.id}>
+          <div className="tag-manager-card__body" title={[proposal.description, proposal.aliases.length ? `${zh ? "别名" : "Aliases"}: ${proposal.aliases.join(" · ")}` : ""].filter(Boolean).join("\n")}>
+            <strong title={proposal.name}>{proposal.name}</strong>
+            <small>{zh ? `${proposal.support_count} 个 Work 支持` : `${proposal.support_count} supporting Works`}</small>
+          </div>
+          <button type="button" className="button button--secondary button--small tag-proposal-card__promote" aria-label={zh ? `手动晋升 ${proposal.name}` : `Promote ${proposal.name}`} disabled={promotingProposalId !== null || tagDeleting} onClick={() => void promoteCandidate(proposal)}>{promotingProposalId === proposal.id ? (zh ? "晋升中…" : "Promoting…") : (zh ? "手动晋升" : "Promote")}</button>
+        </div>)}
+      </div>
+      {proposalTotal > PROPOSAL_PAGE_SIZE && <div className="tag-proposals-pagination">
+        <button type="button" className="button button--secondary button--small" disabled={proposalOffset === 0 || proposalsLoading || promotingProposalId !== null} onClick={() => setProposalOffset(Math.max(0, proposalOffset - PROPOSAL_PAGE_SIZE))}>{zh ? "上一页" : "Previous"}</button>
+        <span>{Math.floor(proposalOffset / PROPOSAL_PAGE_SIZE) + 1} / {Math.ceil(proposalTotal / PROPOSAL_PAGE_SIZE)}</span>
+        <button type="button" className="button button--secondary button--small" disabled={proposalOffset + PROPOSAL_PAGE_SIZE >= proposalTotal || proposalsLoading || promotingProposalId !== null} onClick={() => setProposalOffset(proposalOffset + PROPOSAL_PAGE_SIZE)}>{zh ? "下一页" : "Next"}</button>
       </div>}
     </section>
     </>}

@@ -20,9 +20,12 @@ from backend.app.auto_tag import (
     auto_tag_status,
     cleanup_preview,
     configure_auto_tag,
+    create_preview,
     ensure_auto_tag_queue,
     normalize_topic_name,
+    promote_proposal,
     remove_manual_tag,
+    run_auto_tag_preview,
     tag_entry,
     tag_entries_batch,
 )
@@ -262,7 +265,7 @@ def test_alias_and_punctuation_variant_resolve_to_existing_tag(db_factory, monke
         assert db.scalar(select(TagProposal.id)) is None
 
 
-def test_threshold_requires_approved_preview(db_factory):
+def test_threshold_requires_approved_preview(db_factory, enabled_auto_tag_preview):
     with db_factory() as db:
         connection_id = add_llm_connection(db_factory)
         configure_auto_tag(
@@ -280,6 +283,29 @@ def test_threshold_requires_approved_preview(db_factory):
                 enabled=True,
                 growth_mode="threshold",
             )
+
+
+def test_disabled_preview_does_not_block_a_stored_requirement(db_factory, monkeypatch):
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles({"kind": "new", "name": "Quantum sensing", "confidence": 0.93}),
+    )
+    with db_factory() as db:
+        add_entry(db_factory, title="Direct tagging", published_at=utcnow())
+        enable_threshold(db, db_factory)
+        db.get(AppSetting, "auto_tag_preview_required").value = "true"
+        db.commit()
+        configure_auto_tag(db, enabled=True, growth_mode="threshold")
+        assert auto_tag_status(db)["enabled"] is True
+        assert auto_tag_status(db)["preview_required"] is False
+        assert db.get(AppSetting, "auto_tag_preview_required").value == "true"
+        assert auto_tag_due(db) is True
+        records = auto_tag_pending(db)
+        assert len(records) == 1 and records[0].status == "complete"
+        with pytest.raises(ValueError, match="currently disabled"):
+            create_preview(db)
+        with pytest.raises(ValueError, match="currently disabled"):
+            run_auto_tag_preview(db, 1)
 
 
 def test_nine_works_remain_a_proposal(db_factory, monkeypatch):
@@ -309,7 +335,8 @@ def test_nine_works_remain_a_proposal(db_factory, monkeypatch):
         assert db.scalar(select(EntryTag.id)) is None
 
 
-def test_tenth_distinct_work_promotes_and_backfills(db_factory, monkeypatch):
+def test_tenth_distinct_work_promotes_and_backfills(db_factory, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="uvicorn.error.auto_tag")
     monkeypatch.setattr(
         "backend.app.auto_tag.complete_feature_chat",
         response_for_articles(
@@ -336,6 +363,118 @@ def test_tenth_distinct_work_promotes_and_backfills(db_factory, monkeypatch):
         assert db.scalars(select(EntryTag).where(EntryTag.tag_id == tag.id)).all()
         assert len(db.scalars(select(EntryTag).where(EntryTag.tag_id == tag.id)).all()) == 10
         assert len(db.scalars(select(TagAlias).where(TagAlias.tag_id == tag.id)).all()) == 2
+        status = auto_tag_status(db)
+        assert status["counts"]["complete"] == 10
+        assert status["outdated_count"] == 0
+        assert status["needs_rebuild"] is False
+        assert status["estimated_calls"] == 0
+        assert auto_tag_due(db) is False
+        promotion_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "uvicorn.error.auto_tag"
+        ]
+        assert promotion_logs == [
+            f"Auto-tag topic promoted: proposal_id={proposal.id} "
+            f"name='Quantum error correction' tag_id={tag.id} "
+            "support_count=10 threshold=10 window_days=365"
+        ]
+
+
+def test_failed_promotion_commit_does_not_write_a_promotion_log(db_factory, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="uvicorn.error.auto_tag")
+    monkeypatch.setattr(
+        "backend.app.auto_tag.complete_feature_chat",
+        response_for_articles({
+            "kind": "new",
+            "name": "Quantum error correction",
+            "confidence": 0.93,
+        }),
+    )
+    with db_factory() as db:
+        for index in range(2):
+            add_entry(db_factory, title=f"Paper {index}", published_at=utcnow())
+        enable_threshold(db, db_factory, threshold=2)
+        commit = db.commit
+
+        def fail_promotion_commit():
+            if db.scalar(select(Tag).where(Tag.origin == "auto_promoted")) is not None:
+                raise RuntimeError("Promotion commit failed")
+            commit()
+
+        monkeypatch.setattr(db, "commit", fail_promotion_commit)
+        records = auto_tag_pending(db, limit=AUTO_TAG_BATCH_SIZE)
+        assert all(record.status == "failed" for record in records)
+        assert db.scalar(select(Tag).where(Tag.origin == "auto_promoted")) is None
+        assert not [record for record in caplog.records if record.name == "uvicorn.error.auto_tag"]
+
+
+def test_manual_promotion_below_threshold_transfers_aliases_and_valid_supports(
+    db_factory, monkeypatch, caplog,
+):
+    caplog.set_level("INFO", logger="uvicorn.error.auto_tag")
+    calls = []
+    response = response_for_articles({
+        "kind": "new", "name": "Quantum networking",
+        "description": "Distribution of quantum information.",
+        "aliases": ["QNet"], "confidence": 0.93,
+    })
+
+    def complete(*args, **kwargs):
+        calls.append(kwargs)
+        return response(*args, **kwargs)
+
+    monkeypatch.setattr("backend.app.auto_tag.complete_feature_chat", complete)
+    with db_factory() as db:
+        first_id = add_entry(db_factory, title="First manual support", published_at=utcnow())
+        second_id = add_entry(db_factory, title="Changed manual support", published_at=utcnow())
+        enable_threshold(db, db_factory)
+        records = auto_tag_pending(db)
+        assert all(record.status == "complete" for record in records)
+        proposal = db.scalar(select(TagProposal))
+        assert proposal.status == "active" and proposal.support_count == 2
+        db.get(Entry, second_id).source_hash = "z" * 64
+        db.commit()
+        calls_before = len(calls)
+
+        tag = promote_proposal(db, proposal.id)
+
+        assert len(calls) == calls_before
+        assert tag.origin == "manual_promoted" and tag.auto_assignable is True
+        assert tag.description == "Distribution of quantum information."
+        assert proposal.status == "promoted" and proposal.promoted_tag_id == tag.id
+        assert proposal.support_count == 1
+        assert db.scalar(select(TagAlias).where(TagAlias.tag_id == tag.id)).alias == "QNet"
+        assert db.scalar(select(TagProposalAlias)) is None
+        assert db.scalar(select(EntryTag).where(EntryTag.entry_id == first_id)).tag_id == tag.id
+        assert db.scalar(select(EntryTag).where(EntryTag.entry_id == second_id)) is None
+        assert all(record.status == "complete" for record in records)
+        assert auto_tag_status(db)["needs_rebuild"] is False
+        assert promote_proposal(db, proposal.id).id == tag.id
+        assert len(db.scalars(select(Tag)).all()) == 1
+        assert len(db.scalars(select(EntryTagSource)).all()) == 1
+        logs = [record.getMessage() for record in caplog.records if record.name == "uvicorn.error.auto_tag"]
+        assert len(logs) == 1 and "topic manually promoted:" in logs[0]
+        assert ensure_auto_tag_queue(db) == 1  # Only the changed article enters the queue.
+
+
+def test_failed_manual_promotion_commit_does_not_log_success(db_factory, monkeypatch, caplog):
+    caplog.set_level("INFO", logger="uvicorn.error.auto_tag")
+    with db_factory() as db:
+        proposal = TagProposal(name="Manual topic", normalized_name="manual topic", status="active")
+        db.add(proposal)
+        db.commit()
+
+        def fail_commit():
+            raise RuntimeError("Promotion commit failed")
+
+        monkeypatch.setattr(db, "commit", fail_commit)
+        with pytest.raises(RuntimeError, match="Promotion commit failed"):
+            promote_proposal(db, proposal.id)
+        db.rollback()
+        assert db.scalar(select(Tag)) is None
+        assert proposal.status == "active"
+        assert not [record for record in caplog.records if record.name == "uvicorn.error.auto_tag"]
 
 
 def test_duplicate_versions_and_old_articles_do_not_inflate_support(db_factory, monkeypatch):
@@ -580,7 +719,7 @@ def test_complete_batch_prompt_is_bounded_uses_ordinals_and_excludes_local_metad
             assert private_value not in serialized_prompt
 
 
-def test_closed_mode_also_requires_an_approved_preview(db_factory):
+def test_closed_mode_also_requires_an_approved_preview(db_factory, enabled_auto_tag_preview):
     with db_factory() as db:
         connection_id = add_llm_connection(db_factory)
         configure_auto_tag(
@@ -825,14 +964,16 @@ def test_status_estimates_unrecorded_entries_without_populating_queue(db_factory
         assert db.scalar(select(AutoTagRecord.id)) is None
 
 
-def test_taxonomy_change_marks_rebuild_without_silently_requeueing(
-    db_factory, monkeypatch
+@pytest.mark.parametrize("change", ["add", "rename", "alias", "description", "auto_assignable"])
+def test_taxonomy_change_preserves_completed_results(
+    db_factory, monkeypatch, change
 ):
-    monkeypatch.setattr(
-        "backend.app.auto_tag.complete_feature_chat",
-        response_for_articles(),
-    )
     with db_factory() as db:
+        tag = add_approved_tag(db, "Established topic")
+        monkeypatch.setattr(
+            "backend.app.auto_tag.complete_feature_chat",
+            response_for_articles({"kind": "tag", "id": tag.id, "confidence": 0.95}),
+        )
         entry_id = add_entry(db_factory, title="Stable classified article")
         enable_closed(db, db_factory)
         record = db.scalar(
@@ -840,17 +981,53 @@ def test_taxonomy_change_marks_rebuild_without_silently_requeueing(
         )
         tag_entry(db, record)
         assert auto_tag_status(db)["needs_rebuild"] is False
+        original_policy_version = record.policy_version
+        original_tag_ids = list(record.tag_ids)
 
-        add_approved_tag(db, "New taxonomy topic")
+        if change == "add":
+            add_approved_tag(db, "New taxonomy topic")
+        elif change == "rename":
+            tag.name = "Renamed topic"
+            tag.normalized_name = normalize_topic_name(tag.name)
+        elif change == "alias":
+            db.add(TagAlias(tag_id=tag.id, alias="New alias", normalized_alias="new alias"))
+        elif change == "description":
+            tag.description = "Updated topic description."
+        else:
+            tag.auto_assignable = False
+        db.commit()
         status = auto_tag_status(db)
 
-        assert status["needs_rebuild"] is True
-        assert status["outdated_count"] == 1
-        # The UI may estimate the cost of an explicitly approved rebuild, but
-        # merely changing the taxonomy must not turn the completed row pending.
-        assert status["estimated_calls"] == 1
+        assert status["needs_rebuild"] is False
+        assert status["outdated_count"] == 0
+        assert status["counts"]["complete"] == 1
+        assert status["estimated_calls"] == 0
         assert ensure_auto_tag_queue(db) == 0
         assert record.status == "complete"
+        assert record.policy_version == original_policy_version
+        assert record.tag_ids == original_tag_ids == [tag.id]
+        assert db.scalar(select(EntryTag).where(EntryTag.entry_id == entry_id)).tag_id == tag.id
+        assert auto_tag_due(db) is False
+
+
+@pytest.mark.parametrize("policy_version", [None, "older-policy"])
+def test_completed_legacy_results_do_not_require_rebuild(db_factory, policy_version):
+    with db_factory() as db:
+        entry_id = add_entry(db_factory, title="Previously completed article")
+        enable_closed(db, db_factory)
+        record = db.scalar(select(AutoTagRecord).where(AutoTagRecord.entry_id == entry_id))
+        record.status = "complete"
+        record.policy_version = policy_version
+        db.commit()
+
+        status = auto_tag_status(db)
+
+        assert status["outdated_count"] == 0
+        assert status["needs_rebuild"] is False
+        assert status["estimated_calls"] == 0
+        assert ensure_auto_tag_queue(db) == 0
+        assert record.status == "complete"
+        assert record.policy_version == policy_version
         assert auto_tag_due(db) is False
 
 

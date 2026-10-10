@@ -2,13 +2,15 @@
 
 Automatic tagging deliberately separates classification from taxonomy growth:
 approved tags can be attached immediately, while new topics accumulate as
-proposals and are promoted only after repeated support across distinct works.
+proposals and are automatically promoted after repeated support across distinct
+works. Owners may also promote a candidate manually without the support threshold.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import unicodedata
@@ -64,6 +66,8 @@ from .topic_names import (
     validate_normalized_topic_name,
 )
 
+logger = logging.getLogger("uvicorn.error.auto_tag")
+
 MAX_AUTO_TAGS_PER_ENTRY = 3
 AUTO_TAG_BATCH_SIZE = 10
 AUTO_TAG_INPUT_CHAR_BUDGET = 24_000
@@ -82,6 +86,19 @@ TOPIC_NAMESPACE_LOCK_KEY = "auto_tag_topic_namespace_lock"
 AUTO_TAG_CLEANUP_LOCK_KEY = "auto_tag_cleanup_snapshot_lock"
 AUTO_TAG_CLEANUP_REVIEW_KEY = "auto_tag_cleanup_review_token"
 AUTO_TAG_CLEANUP_SNAPSHOT_REVISION = "legacy-auto-tag-cleanup-v1"
+# Retained for a possible return of the provenance cleanup workflow.
+# See docs/LEGACY_TAG_CLEANUP.md before enabling it again.
+LEGACY_AUTO_TAG_CLEANUP_ENABLED = False
+# Dormant preview workflow; restoration: docs/DORMANT_AUTO_TAG_PREVIEW.md.
+AUTO_TAG_PREVIEW_ENABLED = False
+
+
+def auto_tag_preview_enabled() -> bool:
+    return AUTO_TAG_PREVIEW_ENABLED
+
+
+def legacy_auto_tag_cleanup_enabled() -> bool:
+    return LEGACY_AUTO_TAG_CLEANUP_ENABLED
 
 
 class AutoTagFormatError(ValueError):
@@ -244,7 +261,7 @@ def auto_tag_create_new(db: Session) -> bool:
 
 
 def auto_tag_preview_required(db: Session) -> bool:
-    return _setting(db, "auto_tag_preview_required", "true").lower() == "true"
+    return auto_tag_preview_enabled() and _setting(db, "auto_tag_preview_required", "true").lower() == "true"
 
 
 def max_tags_per_entry(db: Session) -> int:
@@ -371,7 +388,7 @@ def configure_auto_tag(
         _set_setting(db, "auto_tag_preview_required", "true")
     if enabled and auto_tag_preview_required(db) and not policy_changed:
         raise ValueError("Run and approve the 50-entry preview before enabling auto tagging")
-    if enabled and policy_changed:
+    if enabled and policy_changed and auto_tag_preview_enabled():
         # Persist the new policy but pause execution until its preview is approved.
         enabled = False
     _set_setting(db, "auto_tag_enabled", "true" if enabled else "false")
@@ -1195,7 +1212,14 @@ def _support_proposal(
     _refresh_proposal_support_count(db, proposal)
 
 
-def _maybe_promote_proposal(db: Session, proposal: TagProposal, policy_version: str) -> Tag | None:
+def _maybe_promote_proposal(
+    db: Session,
+    proposal: TagProposal,
+    policy_version: str,
+    promotion_events: list[dict[str, Any]],
+    *,
+    manual: bool = False,
+) -> Tag | None:
     acquire_topic_namespace(db)
     locked = db.scalar(
         select(TagProposal)
@@ -1208,7 +1232,8 @@ def _maybe_promote_proposal(db: Session, proposal: TagProposal, policy_version: 
     proposal = locked
     if proposal.status != "active":
         return db.get(Tag, proposal.promoted_tag_id) if proposal.promoted_tag_id else None
-    if _refresh_proposal_support_count(db, proposal) < promotion_threshold(db):
+    support_count = _refresh_proposal_support_count(db, proposal)
+    if not manual and support_count < promotion_threshold(db):
         return None
 
     tag = _resolve_tag(db, proposal.name)
@@ -1217,7 +1242,7 @@ def _maybe_promote_proposal(db: Session, proposal: TagProposal, policy_version: 
             name=proposal.name,
             normalized_name=proposal.normalized_name,
             description=proposal.description or "",
-            origin="auto_promoted",
+            origin="manual_promoted" if manual else "auto_promoted",
             auto_assignable=True,
         )
         db.add(tag)
@@ -1256,6 +1281,46 @@ def _maybe_promote_proposal(db: Session, proposal: TagProposal, policy_version: 
             )
             if record is not None:
                 record.tag_ids = _current_auto_tag_ids(db, entry.id)
+    promotion_events.append({
+        "proposal_id": proposal.id,
+        "name": proposal.name,
+        "tag_id": tag.id,
+        "support_count": proposal.support_count,
+        "threshold": promotion_threshold(db),
+        "window_days": support_window_days(db),
+        "manual": manual,
+    })
+    return tag
+
+
+def _log_promotions(promotion_events: list[dict[str, Any]]) -> None:
+    # Call only after the transaction commits; a rollback is not a promotion.
+    for promotion in promotion_events:
+        logger.info(
+            ("Auto-tag topic manually promoted: " if promotion.get("manual") else "Auto-tag topic promoted: ")
+            + "proposal_id=%(proposal_id)s name=%(name)r "
+            "tag_id=%(tag_id)s support_count=%(support_count)s "
+            "threshold=%(threshold)s window_days=%(window_days)s",
+            promotion,
+        )
+
+
+def promote_proposal(db: Session, proposal_id: int) -> Tag:
+    """Promote an active candidate on request without requiring LLM calls."""
+    acquire_topic_namespace(db)
+    proposal = db.get(TagProposal, proposal_id)
+    if proposal is None:
+        raise LookupError("Topic candidate not found")
+    if proposal.status not in {"active", "promoted"}:
+        raise ValueError("Only active topic candidates can be promoted")
+    promotion_events: list[dict[str, Any]] = []
+    tag = _maybe_promote_proposal(
+        db, proposal, _policy_version(db), promotion_events, manual=True,
+    )
+    if tag is None:
+        raise ValueError("This topic conflicts with a tag that is unavailable for automatic tagging")
+    db.commit()
+    _log_promotions(promotion_events)
     return tag
 
 
@@ -1269,12 +1334,50 @@ def retire_tag_proposals(db: Session, tag_id: int) -> None:
         proposal.promoted_tag_id = None
 
 
+def delete_tags(db: Session, tag_ids: list[int]) -> list[int]:
+    """Delete selected tags and their links in the caller's transaction."""
+    acquire_topic_namespace(db)
+    selected_ids = set(tag_ids)
+    tags = list(db.scalars(select(Tag).where(Tag.id.in_(selected_ids)).order_by(Tag.id)))
+    if not selected_ids or {tag.id for tag in tags} != selected_ids:
+        raise ValueError("Some selected tags no longer exist; refresh the tag list")
+
+    schedules = list(db.scalars(select(BriefSchedule)))
+    referenced_ids = {
+        tag_id
+        for schedule in schedules
+        if schedule.enabled
+        for tag_id in schedule.tag_ids or []
+        if tag_id in selected_ids
+    }
+    if referenced_ids:
+        names = ", ".join(tag.name for tag in tags if tag.id in referenced_ids)
+        raise ValueError(
+            "Tags are used by active brief schedules; remove them from those "
+            f"schedules before deleting: {names}"
+        )
+
+    for schedule in schedules:
+        if selected_ids.intersection(schedule.tag_ids or []):
+            schedule.tag_ids = [value for value in schedule.tag_ids if value not in selected_ids]
+    for record in db.scalars(select(AutoTagRecord)):
+        if selected_ids.intersection(record.tag_ids or []):
+            record.tag_ids = [value for value in record.tag_ids if value not in selected_ids]
+    for tag in tags:
+        retire_tag_proposals(db, tag.id)
+        # Foreign-key cascades remove article/feed links, aliases and suppressions.
+        db.delete(tag)
+    db.flush()
+    return [tag.id for tag in tags]
+
+
 def _apply_classification(
     db: Session,
     record: AutoTagRecord,
     entry: Entry,
     result: EntryClassification,
     policy_version: str,
+    promotion_events: list[dict[str, Any]],
 ) -> None:
     acquire_cleanup_snapshot(db)
     selected: dict[int, float] = {}
@@ -1309,7 +1412,7 @@ def _apply_classification(
             )
 
     for proposal, confidence in supported.values():
-        promoted = _maybe_promote_proposal(db, proposal, policy_version)
+        promoted = _maybe_promote_proposal(db, proposal, policy_version, promotion_events)
         if promoted is not None:
             selected[promoted.id] = max(selected.get(promoted.id, 0), confidence)
 
@@ -1404,6 +1507,7 @@ def _process_records_once(db: Session, records: list[AutoTagRecord]) -> list[Aut
             .with_for_update()
         )
     }
+    promotion_events: list[dict[str, Any]] = []
     for record, intended_entry in zip(active_records, entries, strict=True):
         entry = locked_entries.get(intended_entry.id)
         if entry is None:
@@ -1433,8 +1537,9 @@ def _process_records_once(db: Session, records: list[AutoTagRecord]) -> list[Aut
                     minutes=AUTO_TAG_RETRY_MINUTES[delay_index]
                 )
             continue
-        _apply_classification(db, record, entry, valid[entry.id], policy_version)
+        _apply_classification(db, record, entry, valid[entry.id], policy_version, promotion_events)
     db.commit()
+    _log_promotions(promotion_events)
     return records
 
 
@@ -1611,19 +1716,6 @@ def auto_tag_status(db: Session) -> dict[str, Any]:
         )
         or 0
     )
-    policy = _policy_version(db)
-    outdated_count = int(
-        db.scalar(
-            select(func.count(AutoTagRecord.id)).where(
-                AutoTagRecord.status == "complete",
-                or_(
-                    AutoTagRecord.policy_version.is_(None),
-                    AutoTagRecord.policy_version != policy,
-                ),
-            )
-        )
-        or 0
-    )
     remaining_count = int(
         db.scalar(
             select(func.count(Entry.id))
@@ -1657,13 +1749,15 @@ def auto_tag_status(db: Session) -> dict[str, Any]:
         "estimated_calls": math.ceil(
             (
                 int(db.scalar(select(func.count(Entry.id))) or 0)
-                if auto_tag_preview_required(db) or outdated_count > 0
+                if auto_tag_preview_required(db)
                 else remaining_count
             )
             / AUTO_TAG_BATCH_SIZE
         ),
-        "outdated_count": outdated_count,
-        "needs_rebuild": outdated_count > 0,
+        # Completed results remain valid as the policy and taxonomy evolve.
+        # Retain these response fields for compatibility with existing clients.
+        "outdated_count": 0,
+        "needs_rebuild": False,
         "counts": {
             "pending": pending_count,
             "running": int(counts.get("running", 0)),
@@ -1742,6 +1836,8 @@ def _preview_dict(preview: AutoTagPreview) -> dict[str, Any]:
 
 
 def create_preview(db: Session, sample_size: int = 50) -> AutoTagPreview:
+    if not auto_tag_preview_enabled():
+        raise ValueError("Auto-tag previews are currently disabled")
     if get_feature_connection(db, AUTO_TAG_FEATURE) is None:
         raise ValueError("Select an existing LLM connection before running a preview")
     if sample_size != 50:
@@ -1859,6 +1955,8 @@ def _classify_preview_batch(
 
 
 def run_auto_tag_preview(db: Session, preview_id: int) -> AutoTagPreview:
+    if not auto_tag_preview_enabled():
+        raise ValueError("Auto-tag previews are currently disabled")
     preview = db.get(AutoTagPreview, preview_id)
     if preview is None:
         raise ValueError("Auto-tag preview not found")
@@ -1947,6 +2045,8 @@ def run_auto_tag_preview(db: Session, preview_id: int) -> AutoTagPreview:
 
 
 def approve_preview(db: Session, preview_id: int, scope: str = "all") -> AutoTagPreview:
+    if not auto_tag_preview_enabled():
+        raise ValueError("Auto-tag previews are currently disabled")
     if scope != "all":
         raise ValueError("Only all-history approval is supported")
     preview = db.get(AutoTagPreview, preview_id)
@@ -2012,6 +2112,7 @@ def approve_preview(db: Session, preview_id: int, scope: str = "all") -> AutoTag
 
     policy_version = _policy_version(db)
     approved_entry_ids: set[int] = set()
+    promotion_events: list[dict[str, Any]] = []
     for stored in stored_results:
         entry = locked_entries.get(int(stored["entry_id"]))
         if entry is None or entry.source_hash != stored.get("source_hash"):
@@ -2031,7 +2132,7 @@ def approve_preview(db: Session, preview_id: int, scope: str = "all") -> AutoTag
             )
             db.add(record)
             db.flush()
-        _apply_classification(db, record, entry, result, policy_version)
+        _apply_classification(db, record, entry, result, policy_version, promotion_events)
         approved_entry_ids.add(entry.id)
 
     ensure_auto_tag_queue(db)
@@ -2046,6 +2147,7 @@ def approve_preview(db: Session, preview_id: int, scope: str = "all") -> AutoTag
     _set_setting(db, "auto_tag_preview_required", "false")
     _set_setting(db, "auto_tag_enabled", "true")
     db.commit()
+    _log_promotions(promotion_events)
     return preview
 
 
@@ -2142,6 +2244,8 @@ def cleanup_preview(db: Session) -> dict[str, Any]:
 
 
 def _require_cleanup_review(db: Session) -> str:
+    if not legacy_auto_tag_cleanup_enabled():
+        return ""
     preview = cleanup_preview(db)
     if not preview["reviewed"]:
         raise ValueError(
@@ -2315,8 +2419,11 @@ def apply_cleanup(
     }
 
 
-def list_proposals(db: Session, offset: int = 0, limit: int = 100) -> dict[str, Any]:
-    total = int(db.scalar(select(func.count(TagProposal.id))) or 0)
+def list_proposals(
+    db: Session, offset: int = 0, limit: int = 100, *, status: str | None = None,
+) -> dict[str, Any]:
+    conditions = [TagProposal.status == status] if status is not None else []
+    total = int(db.scalar(select(func.count(TagProposal.id)).where(*conditions)) or 0)
     cutoff = _support_cutoff(db)
     current_supports = (
         select(
@@ -2344,6 +2451,7 @@ def list_proposals(db: Session, offset: int = 0, limit: int = 100) -> dict[str, 
                 current_supports,
                 current_supports.c.proposal_id == TagProposal.id,
             )
+            .where(*conditions)
             .order_by(
                 TagProposal.status,
                 support_count.desc(),
@@ -2398,6 +2506,8 @@ def merge_tags(db: Session, source_tag_id: int, target_tag_id: int) -> Tag:
         db.scalars(select(EntryTag).where(EntryTag.tag_id == source.id))
     ):
         target_link = _entry_tag(db, source_link.entry_id, target.id)
+        if source_link.weight is not None:
+            target_link.weight = max(target_link.weight or 0, source_link.weight)
         for source_row in list(
             db.scalars(
                 select(EntryTagSource).where(

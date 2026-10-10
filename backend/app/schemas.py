@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, PositiveInt, field_validator, model_validator
 
 from .topic_names import validate_normalized_topic_name
 
@@ -254,6 +254,10 @@ class StatePatch(BaseModel):
 class BulkState(BaseModel):
     entry_ids: list[int] = Field(min_length=1, max_length=1000)
     state: StatePatch
+
+
+class TagBulkDelete(BaseModel):
+    tag_ids: list[PositiveInt] = Field(min_length=1, max_length=10_000)
 
 
 class TagCreate(BaseModel):
@@ -526,6 +530,20 @@ class TagWithCountOut(TagOut):
     entry_count: int
 
 
+class EntryTagOut(TagOut):
+    weight: float
+
+
+class EntryTagOrder(BaseModel):
+    tag_ids: list[PositiveInt] = Field(min_length=1, max_length=1000)
+
+    @model_validator(mode="after")
+    def unique_tag_ids(self) -> Self:
+        if len(set(self.tag_ids)) != len(self.tag_ids):
+            raise ValueError("tag_ids must not contain duplicates")
+        return self
+
+
 class TagListOut(APIModel):
     items: list[TagWithCountOut]
 
@@ -547,11 +565,13 @@ class EntryOut(APIModel):
     doi: str | None
     announce_type: str | None
     published_at: datetime | None
+    source_updated_at: datetime | None
+    created_at: datetime
     updated_at: datetime
     feed_titles: list[str]
     feed_ids: list[int]
     state: EntryStateOut
-    tags: list[TagOut]
+    tags: list[EntryTagOut]
     translation_status: str | None
     translation_error: str | None
     translation_language: str | None = None

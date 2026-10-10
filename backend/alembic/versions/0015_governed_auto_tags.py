@@ -61,7 +61,15 @@ def _set_app_setting(
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("tags") as batch_op:
+    bind = op.get_bind()
+    created_at_default = sa.text("CURRENT_TIMESTAMP")
+    if bind.dialect.name == "sqlite":
+        # SQLite cannot ADD a column with CURRENT_TIMESTAMP. A migration-time
+        # literal fills legacy rows; new ORM tags supply their own timestamp.
+        # Never rebuild this referenced table: DROP would cascade through
+        # entry_tags and feed_tags while application foreign keys are enabled.
+        created_at_default = sa.text(f"'{_utcnow().isoformat(sep=' ')}'")
+    with op.batch_alter_table("tags", recreate="never") as batch_op:
         batch_op.add_column(
             sa.Column("normalized_name", sa.String(length=240), nullable=True)
         )
@@ -94,7 +102,7 @@ def upgrade() -> None:
                 "created_at",
                 sa.DateTime(),
                 nullable=False,
-                server_default=sa.text("CURRENT_TIMESTAMP"),
+                server_default=created_at_default,
             )
         )
         batch_op.create_index(
@@ -334,7 +342,6 @@ def upgrade() -> None:
         ["created_at"],
     )
 
-    bind = op.get_bind()
     tags = sa.table(
         "tags",
         sa.column("id", sa.Integer()),
